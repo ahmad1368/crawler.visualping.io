@@ -37,21 +37,28 @@ FetchResult / BrowserFetchResult
 │
 └── Extractors (planned)                        app/extractors/
     (one strategy class per password-hiding technique: html, css, js,
-     http_header, cookie, image_metadata, binary)
-    └── PasswordMatch                           app/models.py
-        (value, source_type, source_url, context_before, context_after, locator)
-        │
-        └── PageResult                          app/models.py
-            (url, status_code, fetched_at, matches[])
+     http_header, cookie, image_metadata, binary; each calls find_passwords()
+     on the text it pulls out of a fetch result)
+    │
+    └── find_passwords()                        app/matching.py
+        (regex: VISUALPING\{16 lowercase hex\}; slices before/after context)
+        └── RegexMatch
+            (value, context_before, context_after, start, end)
             │
-            └── CrawlSummary                    app/models.py
-                (pages_visited, resources_checked, unique_passwords_found, ...)
+            └── PasswordMatch                   app/models.py
+                (RegexMatch's value/context + source_type, source_url, locator)
                 │
-                ├── Storage (planned)            app/storage/
-                │   (SQLite repository -- durable store, gitignored *.db)
-                │
-                └── API (planned)                app/api/
-                    (REST + WebSocket -- surfaces results to the UI)
+                └── PageResult                  app/models.py
+                    (url, status_code, fetched_at, matches[])
+                    │
+                    └── CrawlSummary            app/models.py
+                        (pages_visited, resources_checked, unique_passwords_found, ...)
+                        │
+                        ├── Storage (planned)    app/storage/
+                        │   (SQLite repository -- durable store, gitignored *.db)
+                        │
+                        └── API (planned)        app/api/
+                            (REST + WebSocket -- surfaces results to the UI)
 ```
 
 Sensitive edges to keep an eye on: `Settings` → both fetchers (Basic Auth
@@ -162,3 +169,23 @@ becomes the durable/exposed copy of that secret).
 - **Outputs:** a FIFO queue of same-origin, deduped URLs, held in memory
   only. No credentials or extracted content pass through this component --
   it carries URLs, not page content or secrets.
+
+## Issue #7: password regex matcher + context extractor
+
+- **Inputs:** a text blob (page/resource content that an extractor has
+  pulled out of a fetch result, in later issues) plus `before`/`after`
+  context-length parameters (sourced from `Settings.context_chars`).
+- **Transformation:** `app/matching.py`'s `find_passwords()` scans the
+  content with `PASSWORD_PATTERN` (`VISUALPING\{[0-9a-f]{16}\}` -- exactly
+  16 lowercase hex chars between literal braces; wrong length, uppercase,
+  or malformed braces all fail to match) and, for every match, slices up to
+  `before`/`after` characters of surrounding text, clamped to the string's
+  bounds so a match at the very start or end never underflows/overflows.
+- **Outputs:** a list of in-memory `RegexMatch` objects (`value`,
+  `context_before`, `context_after`, `start`, `end`). **Data-flow note:**
+  this is the point where the plaintext secret and its surrounding text are
+  first extracted from raw content. `RegexMatch` isn't logged, persisted,
+  or returned by any API here -- it's a pure function's return value.
+  Whichever later issue turns a `RegexMatch` into a `PasswordMatch` (adding
+  `source_type`/`source_url`/`locator`) inherits responsibility for
+  everything downstream of that per the project's data-flow watchlist.
