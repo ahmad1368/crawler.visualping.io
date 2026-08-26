@@ -45,7 +45,13 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
     │
     └── Orchestrator.run()                      app/crawler/orchestrator.py
         (asyncio.Semaphore(concurrency)-bounded workers pop from the
-         frontier until max_pages resources are checked or it's empty)
+         frontier until max_pages resources are checked or it's empty;
+         on start, calls Repository.get_visited_urls() and
+         UrlFrontier.mark_visited() for each -- resumes a crashed prior
+         run against the same *.db without re-fetching; a single URL's
+         processing failure, e.g. the browser fetcher navigating into a
+         genuine HTTP redirect loop, is caught per-URL so it can't hang
+         or abort the rest of the crawl, issue #24)
         │
         ├── UrlFrontier                          app/crawler/frontier.py
         │   (queue + visited-set seeded from the request URL; normalizes
@@ -678,3 +684,36 @@ becomes the durable/exposed copy of that secret).
   consolidated pass builds on (and doesn't replace) the more granular
   per-extractor tests from issues #9-13, which also cover rejection/edge
   cases this pass doesn't re-test.
+
+## Issue #24: frontier & orchestrator behavior tests
+
+- **Inputs:** for resume, whatever URLs a `Repository` already has pages
+  for (from a prior, crashed run against the same `*.db` file); for the
+  redirect-loop case, a URL whose processing raises (in practice: the
+  browser fetcher's `page.goto()` failing on a genuine HTTP redirect loop
+  -- Chromium follows redirects as part of real navigation and errors out
+  with something like `net::ERR_TOO_MANY_REDIRECTS` rather than hanging).
+- **Transformation:** two small, deliberately minimal additions make both
+  behaviors real rather than just test scaffolding. `UrlFrontier` gained
+  `mark_visited(url)` (adds a normalized URL to the internal `seen` set
+  without queuing it) and `Repository` gained `get_visited_urls()`
+  (`SqliteRepository`: `SELECT url FROM pages`). `Orchestrator.run()` now
+  calls the latter and feeds it into the former at the very start of every
+  run, so a fresh `Orchestrator`/`UrlFrontier` pair pointed at a `*.db`
+  from a previous run automatically skips everything already
+  fetched -- this is "resume." Separately, each worker's call to
+  `_process_url()` is now wrapped in `try/except Exception: continue`, so
+  one URL's processing failing (redirect loop or otherwise) is skipped
+  rather than propagating out of `asyncio.gather()` and aborting the
+  entire crawl -- this is what actually prevents a redirect loop from
+  taking down (or hanging) the whole run. **Scope note:** `HttpFetcher`
+  itself was deliberately left unchanged -- it doesn't follow redirects
+  (httpx's default), so a 3xx response is just returned as-is and there is
+  nothing there that could chase a loop; enabling redirect-following there
+  would be a new crawler capability this test-focused issue doesn't call
+  for, not a fix this issue needs.
+- **Outputs:** `get_visited_urls()` returns plain URLs (no credentials or
+  extracted secrets) already public knowledge to anything with `*.db` file
+  access. **Data-flow note:** no new sensitive data or sink -- both
+  additions read/write only URL strings that were already being persisted
+  since issue #14.

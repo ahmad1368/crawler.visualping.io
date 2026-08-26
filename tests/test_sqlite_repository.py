@@ -172,3 +172,27 @@ def test_get_matches_includes_duplicate_values_for_count_aggregation():
     repo.save_page(page, snapshot=b"content")
 
     assert len(repo.get_matches()) == 2
+
+
+def test_get_visited_urls_returns_empty_list_when_none_stored():
+    repo = _repo()
+
+    assert repo.get_visited_urls() == []
+
+
+def test_get_visited_urls_returns_every_saved_page_url():
+    repo = _repo()
+    page1 = PageResult(
+        url="https://example.com/a", status_code=200, fetched_at=datetime.now(timezone.utc)
+    )
+    page2 = PageResult(
+        url="https://example.com/b", status_code=200, fetched_at=datetime.now(timezone.utc)
+    )
+
+    repo.save_page(page1, snapshot=b"a")
+    repo.save_page(page2, snapshot=b"b")
+
+    assert sorted(repo.get_visited_urls()) == [
+        "https://example.com/a",
+        "https://example.com/b",
+    ]

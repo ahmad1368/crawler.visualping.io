@@ -4,6 +4,9 @@ The `httpx.AsyncClient` is injected via the constructor so tests can supply
 a mock transport instead of hitting the network. Never log request headers
 or the constructor's credentials -- the Authorization header carries the
 target site's Basic Auth secret on every request this fetcher sends.
+
+Does not follow redirects (httpx's default): a 3xx response is returned
+as-is, so there is nothing here that could chase a redirect loop.
 """
 
 from __future__ import annotations
