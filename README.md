@@ -12,3 +12,4 @@ _Full documentation will be filled in by the docs issue._
 - **#4** `HttpFetcher`: async HTTP fetch with Basic Auth and retry/backoff (httpx).
 - **#5** `BrowserFetcher`: Playwright-based fetch with Basic Auth and network capture, for JS-rendered pages.
 - **#6** `UrlFrontier`: URL queue + visited-set with normalization, same-origin filter, and cycle-safe dedupe.
+- **#7** `find_passwords()`: `VISUALPING{16 hex}` regex matcher with before/after context extraction.
