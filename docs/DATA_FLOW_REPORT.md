@@ -57,8 +57,10 @@ FetchResult / BrowserFetchResult
     │   (image/* only; reads EXIF fields via Pillow -- UserComment,
     │    ImageDescription, etc.; locator is "exif:<field name>")
     │
-    ├── (planned) binary fallback extractor
-    │   -- same Extractor interface, not yet implemented
+    ├── BinaryFallbackExtractor                   app/extractors/binary_fallback.py
+    │   (any content type NOT handled above; decodes as latin-1 -- never
+    │    raises on non-UTF8 bytes -- and scans like `strings`;
+    │    locator is "offset:<byte offset>")
     │
     └── find_passwords()                        app/matching.py
         (regex: VISUALPING\{16 lowercase hex\}; slices before/after context)
@@ -308,3 +310,26 @@ becomes the durable/exposed copy of that secret).
   that looks innocuous (a plain image) at a glance. Nothing here logs,
   persists, or transmits the match further. Adds `Pillow==11.0.0` as a new
   dependency.
+
+## Issue #13: generic binary/string fallback scanner
+
+- **Inputs:** a fetched response's `content` (`bytes`), `content_type`, and
+  `url` (the `Extractor.extract()` signature from issue #8). Skips any
+  content type already handled by a more specific extractor (`text/html`,
+  `text/css`, the JS variants, `image/*`) to avoid duplicate matches when
+  run alongside them via `ExtractorRegistry`.
+- **Transformation:** `app/extractors/binary_fallback.py`'s
+  `BinaryFallbackExtractor` decodes the raw bytes with `latin-1` -- a 1:1
+  byte<->codepoint mapping that never raises, unlike `utf-8` -- so
+  arbitrary binary content (images without a recognized type, unknown
+  file types, etc.) never crashes the scan. The decoded text is passed
+  through `find_passwords()` like a `strings` dump, with `locator` set to
+  `offset:<byte offset>` of the match.
+- **Outputs:** a `list[PasswordMatch]` returned to the caller in memory
+  only, tagged `SourceType.BINARY`. **Data-flow note:** this is the last of
+  the five extractor issues (#9-13); together they mean every
+  `FetchResult`/`BrowserFetchResult` byte range and every response
+  header/cookie now has a code path that can turn it into a `PasswordMatch`.
+  Nothing in any of them logs, persists, or transmits a match -- they all
+  return plain in-memory values up the call stack, which is where the
+  still-`(planned)` storage/API layer picks up responsibility next.
