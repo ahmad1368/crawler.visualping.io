@@ -13,7 +13,8 @@ from pydantic import BaseModel
 
 
 class SourceType(str, Enum):
-    HTML = "html"
+    HTML_TEXT = "html_text"
+    HTML_COMMENT = "html_comment"
     CSS = "css"
     JS = "js"
     HTTP_HEADER = "http_header"

@@ -14,3 +14,4 @@ _Full documentation will be filled in by the docs issue._
 - **#6** `UrlFrontier`: URL queue + visited-set with normalization, same-origin filter, and cycle-safe dedupe.
 - **#7** `find_passwords()`: `VISUALPING{16 hex}` regex matcher with before/after context extraction.
 - **#8** `ExtractorRegistry`: strategy interface + registry for running all extractors against a fetch result.
+- **#9** `HtmlExtractor`: finds passwords in HTML visible text and comments, tagged `html_text`/`html_comment`.

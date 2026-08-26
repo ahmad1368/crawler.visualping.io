@@ -15,7 +15,7 @@ class DummyExtractor:
 def _match():
     return PasswordMatch(
         value="hunter2",
-        source_type=SourceType.HTML,
+        source_type=SourceType.HTML_TEXT,
         source_url="https://example.com",
         context_before="",
         context_after="",
