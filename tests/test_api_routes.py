@@ -36,7 +36,7 @@ class FakeOrchestrator:
 
 
 def _patch_orchestrator(monkeypatch, summary=None, error=None):
-    async def fake_build_orchestrator(request):
+    async def fake_build_orchestrator(request, event_bus):
         async def cleanup():
             return None
 

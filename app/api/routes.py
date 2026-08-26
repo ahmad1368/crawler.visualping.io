@@ -28,6 +28,7 @@ from app.extractors.css_js import CssJsExtractor
 from app.extractors.headers_cookies import HeaderCookieExtractor
 from app.extractors.html import HtmlExtractor
 from app.extractors.image_exif import ImageExifExtractor
+from app.events import CRAWL_FINISHED, EventBus
 from app.models import CrawlSummary
 from app.storage.sqlite import SqliteRepository
 
@@ -61,12 +62,13 @@ class _CrawlState:
         self.status = CrawlStatus.RUNNING
         self.report: CrawlSummary | None = None
         self.error: str | None = None
+        self.event_bus = EventBus()
 
 
 _crawls: dict[str, _CrawlState] = {}
 
 
-async def _build_orchestrator(request: CrawlRequest):
+async def _build_orchestrator(request: CrawlRequest, event_bus: EventBus):
     """Wire a real `Orchestrator` to live httpx/Playwright resources.
 
     Returns `(orchestrator, cleanup)`, where `cleanup()` releases those
@@ -91,6 +93,7 @@ async def _build_orchestrator(request: CrawlRequest):
         extractor_registry=registry,
         header_cookie_extractor=HeaderCookieExtractor(context_chars=request.context_chars),
         repository=SqliteRepository(sqlite3.connect(f"crawl_{uuid.uuid4().hex}.db")),
+        event_bus=event_bus,
     )
 
     async def cleanup() -> None:
@@ -104,7 +107,7 @@ async def _build_orchestrator(request: CrawlRequest):
 async def _run_crawl(crawl_id: str, request: CrawlRequest) -> None:
     state = _crawls[crawl_id]
     try:
-        orchestrator, cleanup = await _build_orchestrator(request)
+        orchestrator, cleanup = await _build_orchestrator(request, state.event_bus)
         try:
             state.report = await orchestrator.run()
             state.status = CrawlStatus.FINISHED
@@ -113,6 +116,7 @@ async def _run_crawl(crawl_id: str, request: CrawlRequest) -> None:
     except Exception as exc:
         state.status = CrawlStatus.FAILED
         state.error = str(exc)
+        state.event_bus.publish(CRAWL_FINISHED, None)
 
 
 @app.post("/crawls", response_model=CrawlCreatedResponse, status_code=202)

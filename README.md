@@ -21,5 +21,6 @@ _Full documentation will be filled in by the docs issue._
 - **#13** `BinaryFallbackExtractor`: catch-all scanner for any other content type, safe on arbitrary binary bytes.
 - **#14** `SqliteRepository`: persists pages, matches, and raw content snapshots; `get_report()`/`get_snapshot()` read them back.
 - **#15** `Orchestrator`: wires the frontier, fetchers, extractors, and repository into a concurrency-limited crawl loop.
-- **#16** `EventBus`: in-process `subscribe()`/`publish()` pub/sub for future `page_fetched`/`match_found`/`crawl_finished` events.
+- **#16** `EventBus`: in-process `subscribe()`/`publish()` pub/sub for `page_fetched`/`match_found`/`crawl_finished` events.
 - **#17** REST API: `POST /crawls`, `GET /crawls/{id}/status`, `GET /crawls/{id}/report` -- runs each crawl as a background task.
+- **#18** `WS /ws/crawls/{id}`: streams live crawl progress events as JSON, closing cleanly when the crawl finishes.

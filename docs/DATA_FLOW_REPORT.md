@@ -55,38 +55,40 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
                 └── PageResult(url, status_code, fetched_at, matches)
                     app/models.py
                     │
-                    └── Repository.save_page(page, snapshot=content)
-                        app/storage/ (SqliteRepository -- one *.db file per
-                        crawl_id, durable, gitignored)
-                        │
-                        ├── get_snapshot(url)     raw bytes back out, for
-                        │                         the (planned) UI's "jump
-                        │                         to location" viewer
-                        │
-                        └── Orchestrator.run()'s return value -> CrawlSummary
-                            for just this run, held in memory as
-                            _crawls[crawl_id].report
-                            │
-                            └── GET /crawls/{id}/report   app/api/routes.py
-                                (returns the in-memory report once
-                                finished; 409 while running, 500 if the
-                                crawl failed -- NOT the same as
-                                Repository.get_report(), a separate,
-                                DB-wide aggregate this endpoint doesn't use)
+                    ├── Repository.save_page(page, snapshot=content)
+                    │   app/storage/ (SqliteRepository -- one *.db file per
+                    │   crawl_id, durable, gitignored)
+                    │   │
+                    │   ├── get_snapshot(url)     raw bytes back out, for
+                    │   │                         the (planned) UI's "jump
+                    │   │                         to location" viewer
+                    │   │
+                    │   └── Orchestrator.run()'s return value -> CrawlSummary
+                    │       for just this run, held in memory as
+                    │       _crawls[crawl_id].report
+                    │       │
+                    │       └── GET /crawls/{id}/report   app/api/routes.py
+                    │           (returns the in-memory report once
+                    │           finished; 409 while running, 500 if the
+                    │           crawl failed -- NOT the same as
+                    │           Repository.get_report(), a separate,
+                    │           DB-wide aggregate this endpoint doesn't use)
+                    │
+                    └── EventBus.publish(PAGE_FETCHED, page) and, per match,
+                        publish(MATCH_FOUND, match)          app/events.py
+                        (wired into Orchestrator in issue #18; one EventBus
+                         per crawl, held on _CrawlState.event_bus)
+                        └── WebSocket /ws/crawls/{id}        app/api/websocket.py
+                            (subscribes to the crawl's EventBus, forwards
+                             each event as JSON over the socket in order;
+                             closes the socket on CRAWL_FINISHED, or
+                             immediately with a synthesized CRAWL_FINISHED
+                             message if the crawl already finished before
+                             the client connected; unknown crawl_id closes
+                             with code 4404)
 
 GET /crawls/{id}/status -> in-memory _crawls[id].status (running/finished/failed)
-WebSocket endpoint (planned)                   app/api/ (issue #18)
 ```
-
-`EventBus` (`app/events.py`, issue #16) is a standalone `subscribe()`/
-`publish()` component -- `page_fetched`/`match_found`/`crawl_finished`
-event types are defined, but `Orchestrator.run()` doesn't call `publish()`
-yet. That wiring is expected to land with the WebSocket issue (#18), which
-is the actual consumer of these events; not shown as a tree node above
-until it's actually connected. A `match_found` payload will carry a
-`PasswordMatch`, so any future subscriber (e.g. a WebSocket broadcaster)
-inherits the same sensitive-data handling responsibility as the rest of
-the pipeline.
 
 Sensitive edges to keep an eye on: `Settings` → both fetchers (Basic Auth
 credentials leave the process for the first time); `Extractors` →
@@ -457,3 +459,44 @@ becomes the durable/exposed copy of that secret).
   gitignore pattern) that is never cleaned up by this issue -- an operator
   running many crawls will accumulate one durable snapshot/match database
   per crawl indefinitely; worth a retention/cleanup policy in a later issue.
+
+## Issue #18: WebSocket endpoint for live progress
+
+- **Inputs:** a `crawl_id` path parameter on `/ws/crawls/{crawl_id}`; no
+  request body. Consumes `PAGE_FETCHED`/`MATCH_FOUND`/`CRAWL_FINISHED`
+  events published to that crawl's `EventBus` (`_CrawlState.event_bus`,
+  new field this issue adds).
+- **Transformation:** `Orchestrator` (issue #15) now takes an optional
+  `event_bus` -- `_build_orchestrator()` (issue #17) passes each crawl's
+  `EventBus` into it. During `_process_url()`, the orchestrator publishes
+  `PAGE_FETCHED` with the `PageResult` and `MATCH_FOUND` with each
+  `PasswordMatch` right after `Repository.save_page()`; `run()` publishes
+  `CRAWL_FINISHED` with the final `CrawlSummary` as its last action. If
+  `_run_crawl()`'s try block raises before `orchestrator.run()` can do
+  that, it publishes `CRAWL_FINISHED` with a `None` payload itself in the
+  `except` block, so a connected socket is never left waiting forever.
+  `app/api/websocket.py`'s `crawl_progress_websocket()` accepts the
+  connection, checks `crawl_id` (closes with code 4404 if unknown), checks
+  whether the crawl already finished (sends a synthesized `CRAWL_FINISHED`
+  message immediately if so -- there's no `await` between that check and
+  subscribing, so no event can be missed in between), then subscribes to
+  all three event types with handlers that `queue.put_nowait()` onto a
+  local `asyncio.Queue`, and a loop that dequeues and `send_json()`s each
+  message in order until it sees `CRAWL_FINISHED`, then closes.
+- **Outputs:** JSON messages `{"type": ..., "payload": ...}` sent directly
+  to the connected client -- `PasswordMatch`/`PageResult`/`CrawlSummary`
+  payloads are serialized via `model_dump(mode="json")`. **Data-flow
+  note:** a `match_found` message puts the plaintext secret + context on
+  the wire to whoever holds this socket, same as the REST report but
+  live and per-match rather than aggregated -- this endpoint should be
+  exposed under the same trust assumptions as the REST API (issue #17):
+  no auth of its own, operator-trusted networks only. **Testing note:**
+  Starlette's `BackgroundTasks` run to completion before a `TestClient`
+  call returns, so a REST-driven integration test can't observe a crawl
+  genuinely "in progress" while a socket is attached. True
+  live/in-order delivery is instead tested by invoking the websocket
+  coroutine directly against a fake `WebSocket` double in the same event
+  loop as the publishing code (avoiding unsafe cross-thread
+  `asyncio.Queue` access); a separate test still exercises the real
+  `TestClient.websocket_connect` transport for the "already finished" and
+  "unknown crawl" paths.
