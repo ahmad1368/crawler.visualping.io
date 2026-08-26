@@ -741,3 +741,36 @@ becomes the durable/exposed copy of that secret).
   new one.
 - **Outputs:** none -- test-only. **Data-flow note:** no new concerns;
   no production code changed and no new data path was introduced.
+
+## Issue #26: full crawl against a local fixture site (end-to-end)
+
+- **Inputs:** a real local `http.server` (`tests/test_e2e_crawl.py`'s
+  `FixtureSiteHandler`), requiring the same Basic Auth credentials the
+  crawler is configured with, serving five resources -- an HTML page
+  linking to a CSS file, a JS file, a JPEG, and a binary file -- with one
+  synthetic `VISUALPING{...}` password planted per source type (8 total:
+  `html_text`, `html_comment` in the page body; `css`; `js`;
+  `http_header`/`cookie` on the page's own response; `image_metadata` in
+  the JPEG's EXIF `UserComment`; `binary` in the raw file).
+- **Transformation:** unlike every other test in this suite, nothing here
+  is mocked except the target site itself. A real `Orchestrator` is wired
+  to a real `httpx.AsyncClient` (`HttpFetcher`), a real Playwright
+  `Browser` (`BrowserFetcher`), all four registered body extractors, a
+  real `HeaderCookieExtractor`, and a real `SqliteRepository`
+  (`:memory:`), then `run()` against the fixture server's base URL. This
+  exercises the full, real pipeline end-to-end: credential flow (Basic
+  Auth over real HTTP + a real browser context), link discovery
+  (`BrowserFetcher` finds the four `<a href>` links, `UrlFrontier` queues
+  them), every extractor's real content-type dispatch, and real
+  persistence.
+- **Outputs:** `repository.get_matches()` is compared against the exact
+  expected `{value: source_type}` mapping with a single dict equality
+  assertion -- this fails on either a missing password (a regression
+  somewhere in the pipeline) or an extra one (a false positive), which is
+  what "no false positives" actually requires proving, not just spot
+  checks. **Data-flow note:** no new concerns -- every credential and
+  password value here is synthetic and never leaves the local test
+  process (the repository is `:memory:`, never written to disk). This is
+  the first test that exercises credential flow and secret extraction
+  together in one real pipeline run, which is the concrete proof behind
+  every individual data-flow note from issues #1-25.
