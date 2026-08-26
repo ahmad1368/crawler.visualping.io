@@ -29,6 +29,7 @@ This is infrastructure, not an issue - don't open a PR for it.
 - Implement only what issue #<n>'s acceptance criteria ask for - no scope creep into later issues.
 - Append this issue's section to `docs/DATA_FLOW_REPORT.md` (inputs -> transformation -> outputs), per the issue's own acceptance criteria.
 - Update the "Data flow tree" ASCII overview near the top of `docs/DATA_FLOW_REPORT.md` to reflect this issue's new/changed components (mark not-yet-built downstream nodes `(planned)`).
+- Add a one-line entry for this issue to the "Implemented so far" list in `README.md` (create the section on first use). Keep it to a single line per issue; the full README rewrite happens in its own dedicated docs issue, not here.
 - Check the change against `crawler-data-flow-watchlist` - note any hits (credentials, password matches, snapshots, new sensitive DB columns, outbound calls) to report to the user.
 - Run whatever test/lint tooling already exists in the repo for touched code; skip silently if none exists yet for this early an issue.
 - Commit (`<type>: <title> (Refs #<n>)`), push the branch.
