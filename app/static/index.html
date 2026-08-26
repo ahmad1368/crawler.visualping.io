@@ -72,6 +72,31 @@
     background: #fafafa;
   }
   #log p { margin: 0 0 0.25rem 0; }
+  #summary-panel {
+    margin-top: 1.5rem;
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 0.75rem;
+  }
+  .summary-stat {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.6rem 0.75rem;
+    background: #fafafa;
+  }
+  .summary-stat .summary-label {
+    display: block;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: #666;
+  }
+  .summary-stat .summary-value {
+    display: block;
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--accent);
+  }
   table#results-table {
     margin-top: 1.5rem;
     width: 100%;
@@ -188,6 +213,24 @@
 
       <button id="run-button" type="submit">Run</button>
     </form>
+    <div id="summary-panel" style="display: none;" aria-live="polite">
+      <div class="summary-stat">
+        <span class="summary-label">Pages visited</span>
+        <span id="summary-pages-visited" class="summary-value">0</span>
+      </div>
+      <div class="summary-stat">
+        <span class="summary-label">Resources checked</span>
+        <span id="summary-resources-checked" class="summary-value">0</span>
+      </div>
+      <div class="summary-stat">
+        <span class="summary-label">Unique passwords found</span>
+        <span id="summary-passwords-found" class="summary-value">0</span>
+      </div>
+      <div class="summary-stat">
+        <span class="summary-label">Queue empty</span>
+        <span id="summary-queue-empty" class="summary-value">—</span>
+      </div>
+    </div>
     <div id="log" aria-live="polite"></div>
     <table id="results-table" style="display: none;">
       <thead>
@@ -219,6 +262,11 @@
     const log = document.getElementById("log");
     const resultsTable = document.getElementById("results-table");
     const resultsBody = document.getElementById("results-body");
+    const summaryPanel = document.getElementById("summary-panel");
+    const summaryPagesVisited = document.getElementById("summary-pages-visited");
+    const summaryResourcesChecked = document.getElementById("summary-resources-checked");
+    const summaryPasswordsFound = document.getElementById("summary-passwords-found");
+    const summaryQueueEmpty = document.getElementById("summary-queue-empty");
     const snapshotOverlay = document.getElementById("snapshot-overlay");
     const snapshotModalTitle = document.getElementById("snapshot-modal-title");
     const snapshotBody = document.getElementById("snapshot-body");
@@ -229,6 +277,28 @@
     const NON_TEXT_SOURCE_TYPES = new Set(["image_metadata", "binary"]);
 
     let currentCrawlId = null;
+    let liveResourcesChecked = 0;
+    let livePasswordValues = new Set();
+
+    function resetSummaryPanel() {
+      liveResourcesChecked = 0;
+      livePasswordValues = new Set();
+      summaryPagesVisited.textContent = "0";
+      summaryResourcesChecked.textContent = "0";
+      summaryPasswordsFound.textContent = "0";
+      summaryQueueEmpty.textContent = "…";
+      summaryPanel.style.display = "grid";
+    }
+
+    // Called once the final CrawlSummary is available (GET /crawls/{id}/report)
+    // -- overwrites the live, WebSocket-driven counters with the
+    // authoritative numbers.
+    function finalizeSummaryPanel(summary) {
+      summaryPagesVisited.textContent = summary.pages_visited;
+      summaryResourcesChecked.textContent = summary.resources_checked;
+      summaryPasswordsFound.textContent = summary.unique_passwords_found;
+      summaryQueueEmpty.textContent = summary.queue_empty ? "Yes" : "No";
+    }
 
     function escapeHtml(text) {
       const div = document.createElement("div");
@@ -358,6 +428,7 @@
       }
       const report = await response.json();
       renderResultsTable(report.matches);
+      finalizeSummaryPanel(report.summary);
     }
 
     form.addEventListener("submit", async (event) => {
@@ -367,6 +438,7 @@
       resultsBody.innerHTML = "";
       resultsTable.style.display = "none";
       closeSnapshotViewer();
+      resetSummaryPanel();
       appendLog("Starting crawl...");
 
       const body = {
@@ -404,8 +476,12 @@
         const message = JSON.parse(event.data);
         if (message.type === "page_fetched") {
           appendLog("Fetched " + message.payload.url + " (" + message.payload.status_code + ")");
+          liveResourcesChecked += 1;
+          summaryResourcesChecked.textContent = liveResourcesChecked;
         } else if (message.type === "match_found") {
           appendLog("Password found at " + message.payload.source_url);
+          livePasswordValues.add(message.payload.value);
+          summaryPasswordsFound.textContent = livePasswordValues.size;
         } else if (message.type === "crawl_finished") {
           appendLog("Crawl finished.");
           runButton.disabled = false;
