@@ -224,3 +224,65 @@ def test_get_snapshot_for_unknown_crawl_returns_404(client):
     response = client.get("/crawls/does-not-exist/snapshot", params={"url": "https://example.com"})
 
     assert response.status_code == 404
+
+
+def test_response_payload_shapes_match_the_full_contract(monkeypatch, client):
+    """Exhaustive key-set checks for every REST response shape -- the
+    other tests in this file spot-check individual fields; this one
+    confirms nothing is missing or unexpectedly added."""
+    match = PasswordMatch(
+        value="VISUALPING{abcdef1234567890}",
+        source_type=SourceType.HTML_TEXT,
+        source_url="https://example.com/page",
+        context_before="before",
+        context_after="after",
+        locator="line:1,col:0",
+    )
+
+    class RepositoryWithOneMatch:
+        def get_matches(self):
+            return [match]
+
+        def get_snapshot(self, url):
+            return b"<html>content</html>"
+
+    async def fake_build_orchestrator(request, event_bus):
+        async def cleanup():
+            return None
+
+        return FakeOrchestrator(summary=CANNED_SUMMARY), RepositoryWithOneMatch(), cleanup
+
+    monkeypatch.setattr(routes, "_build_orchestrator", fake_build_orchestrator)
+
+    start_response = client.post("/crawls", json=VALID_BODY)
+    assert set(start_response.json().keys()) == {"crawl_id"}
+    crawl_id = start_response.json()["crawl_id"]
+
+    status_response = client.get(f"/crawls/{crawl_id}/status")
+    assert set(status_response.json().keys()) == {"crawl_id", "status"}
+
+    report = client.get(f"/crawls/{crawl_id}/report").json()
+    assert set(report.keys()) == {"summary", "matches"}
+    assert set(report["summary"].keys()) == {
+        "pages_visited",
+        "resources_checked",
+        "unique_passwords_found",
+        "queue_empty",
+        "started_at",
+        "finished_at",
+    }
+    assert len(report["matches"]) == 1
+    assert set(report["matches"][0].keys()) == {
+        "page_url",
+        "source_type",
+        "value",
+        "context_before",
+        "context_after",
+        "count_in_page",
+        "locator",
+    }
+
+    snapshot_response = client.get(
+        f"/crawls/{crawl_id}/snapshot", params={"url": "https://example.com/page"}
+    )
+    assert set(snapshot_response.json().keys()) == {"url", "content"}

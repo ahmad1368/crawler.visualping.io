@@ -135,3 +135,70 @@ def test_real_websocket_transport_via_testclient_after_crawl_already_finished():
         message = websocket.receive_json()
         assert message["type"] == CRAWL_FINISHED
         assert message["payload"]["unique_passwords_found"] == 1
+
+
+def test_message_envelope_and_payload_shapes_match_the_full_contract():
+    """Exhaustive key-set checks for the WS message envelope and each
+    event type's payload -- the other tests in this file spot-check
+    individual fields; this one confirms nothing is missing or
+    unexpectedly added."""
+    routes._crawls.clear()
+    routes._crawls["c4"] = _CrawlState()
+    page = PageResult(
+        url="https://example.com/",
+        status_code=200,
+        fetched_at=datetime.now(timezone.utc),
+    )
+    match = PasswordMatch(
+        value="VISUALPING{abcdef1234567890}",
+        source_type=SourceType.HTML_TEXT,
+        source_url="https://example.com/",
+        context_before="",
+        context_after="",
+        locator="line:1,col:0",
+    )
+
+    async def scenario():
+        ws = FakeWebSocket()
+        task = asyncio.create_task(crawl_progress_websocket(ws, "c4"))
+        await asyncio.sleep(0)
+
+        state = routes._crawls["c4"]
+        state.event_bus.publish(PAGE_FETCHED, page)
+        await asyncio.sleep(0)
+        state.event_bus.publish(MATCH_FOUND, match)
+        await asyncio.sleep(0)
+        state.event_bus.publish(CRAWL_FINISHED, CANNED_SUMMARY)
+
+        await asyncio.wait_for(task, timeout=1)
+        return ws
+
+    ws = run(scenario())
+
+    for message in ws.sent:
+        assert set(message.keys()) == {"type", "payload"}
+
+    page_message, match_message, finished_message = ws.sent
+
+    assert set(page_message["payload"].keys()) == {
+        "url",
+        "status_code",
+        "fetched_at",
+        "matches",
+    }
+    assert set(match_message["payload"].keys()) == {
+        "value",
+        "source_type",
+        "source_url",
+        "context_before",
+        "context_after",
+        "locator",
+    }
+    assert set(finished_message["payload"].keys()) == {
+        "pages_visited",
+        "resources_checked",
+        "unique_passwords_found",
+        "queue_empty",
+        "started_at",
+        "finished_at",
+    }
