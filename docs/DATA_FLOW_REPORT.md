@@ -717,3 +717,27 @@ becomes the durable/exposed copy of that secret).
   access. **Data-flow note:** no new sensitive data or sink -- both
   additions read/write only URL strings that were already being persisted
   since issue #14.
+
+## Issue #25: integration tests for REST + WebSocket endpoints
+
+- **Inputs:** none new at runtime -- no production code changed. The REST
+  (`TestClient`, issues #17/#20/#21) and WebSocket (direct-coroutine +
+  `TestClient.websocket_connect`, issue #18) integration tests already
+  built incrementally across earlier issues already cover status codes,
+  the mocked-orchestrator contract, and the event stream -- this issue's
+  contribution is closing the one genuine gap: none of them exhaustively
+  checked a response/message's *complete* shape, only spot-checked
+  individual fields.
+- **Transformation:** added
+  `test_response_payload_shapes_match_the_full_contract`
+  (`tests/test_api_routes.py`) asserting the exact key set of every REST
+  response -- `POST /crawls`, `GET .../status`, `GET .../report`
+  (top-level, `summary`, and one `matches` row), and `GET .../snapshot` --
+  and `test_message_envelope_and_payload_shapes_match_the_full_contract`
+  (`tests/test_websocket.py`) asserting the exact key set of the `{type,
+  payload}` envelope and each of the three event payload shapes
+  (`PageResult`, `PasswordMatch`, `CrawlSummary`). Both reuse the existing
+  `FakeOrchestrator`/mocked-orchestrator pattern rather than introducing a
+  new one.
+- **Outputs:** none -- test-only. **Data-flow note:** no new concerns;
+  no production code changed and no new data path was introduced.
