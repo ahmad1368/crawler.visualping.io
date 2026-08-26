@@ -31,9 +31,9 @@ INDEX_HTML = """
 
 class BasicAuthHandler(http.server.BaseHTTPRequestHandler):
     def _authorized(self) -> bool:
-        expected = "Basic " + base64.b64encode(
-            f"{VALID_USERNAME}:{VALID_PASSWORD}".encode()
-        ).decode()
+        expected = (
+            "Basic " + base64.b64encode(f"{VALID_USERNAME}:{VALID_PASSWORD}".encode()).decode()
+        )
         return self.headers.get("Authorization") == expected
 
     def do_GET(self):

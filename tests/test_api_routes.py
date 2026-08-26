@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api import routes
-from app.api.routes import CrawlStatus, _CrawlState, app
+from app.api.routes import _CrawlState, app
 from app.models import CrawlSummary, PasswordMatch, SourceType
 
 VALID_BODY = {

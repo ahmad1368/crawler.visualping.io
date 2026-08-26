@@ -2,10 +2,10 @@ import asyncio
 import sqlite3
 from datetime import datetime, timezone
 
+from app.crawler.browser_fetcher import BrowserFetchResult
+from app.crawler.fetcher import FetchResult
 from app.crawler.frontier import UrlFrontier
 from app.crawler.orchestrator import Orchestrator
-from app.crawler.fetcher import FetchResult
-from app.crawler.browser_fetcher import BrowserFetchResult
 from app.extractors.base import ExtractorRegistry
 from app.models import PageResult, PasswordMatch, SourceType
 from app.storage.sqlite import SqliteRepository
@@ -39,7 +39,8 @@ class FakeBrowserFetcher:
 
     async def fetch(self, url: str) -> BrowserFetchResult:
         self.calls.append(url)
-        response = self._responses.get(url, BrowserFetchResult(html="", dom_links=[], network_urls=[]))
+        default = BrowserFetchResult(html="", dom_links=[], network_urls=[])
+        response = self._responses.get(url, default)
         if isinstance(response, Exception):
             raise response
         return response

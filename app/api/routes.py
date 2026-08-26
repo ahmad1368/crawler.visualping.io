@@ -24,13 +24,13 @@ from app.crawler.browser_fetcher import BrowserFetcher
 from app.crawler.fetcher import HttpFetcher
 from app.crawler.frontier import UrlFrontier
 from app.crawler.orchestrator import Orchestrator
+from app.events import CRAWL_FINISHED, EventBus
 from app.extractors.base import ExtractorRegistry
 from app.extractors.binary_fallback import BinaryFallbackExtractor
 from app.extractors.css_js import CssJsExtractor
 from app.extractors.headers_cookies import HeaderCookieExtractor
 from app.extractors.html import HtmlExtractor
 from app.extractors.image_exif import ImageExifExtractor
-from app.events import CRAWL_FINISHED, EventBus
 from app.models import CrawlSummary
 from app.storage.repository import Repository
 from app.storage.sqlite import SqliteRepository
@@ -180,6 +180,7 @@ async def get_crawl_report(crawl_id: str) -> CrawlReportResponse:
         raise HTTPException(status_code=409, detail="crawl not finished yet")
     if state.status is CrawlStatus.FAILED:
         raise HTTPException(status_code=500, detail=state.error or "crawl failed")
+    assert state.report is not None  # guaranteed once status is FINISHED
 
     return CrawlReportResponse(summary=state.report, matches=_build_match_rows(state))
 

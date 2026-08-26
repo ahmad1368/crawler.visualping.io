@@ -774,3 +774,38 @@ becomes the durable/exposed copy of that secret).
   the first test that exercises credential flow and secret extraction
   together in one real pipeline run, which is the concrete proof behind
   every individual data-flow note from issues #1-25.
+
+## Issue #27: GitHub Actions CI workflow (lint, type-check, test)
+
+- **Inputs:** none at runtime -- CI-only infrastructure. On every push to
+  `main` and every pull request into `main` or `staging` (the project's
+  actual integration branch, per the repo's branch workflow), GitHub
+  Actions checks out the repo and runs the pipeline below.
+- **Transformation:** `.github/workflows/ci.yml` installs the project via
+  `pip install -e ".[dev]"` (a new `dev` extra added to `pyproject.toml`:
+  `pytest-cov`, `ruff`, `black`, `mypy`, pinned the same way every other
+  dependency in this project is), then runs `ruff check`, `black --check`,
+  `mypy app`, and finally `pytest --cov=app` (Playwright's Chromium is
+  installed via `playwright install --with-deps chromium`, cached across
+  runs alongside pip's own cache). Any step failing fails the whole job.
+  **Scope note on rule selection:** `ruff` is configured with a
+  deliberately practical rule set (`E`, `F`, `I` -- pycodestyle errors,
+  pyflakes, import sorting) rather than an exhaustive one; this is the
+  first time linting was introduced to a 25-issue-old codebase, and
+  broader rule sets (pyupgrade's `datetime.UTC`-alias preference,
+  blanket "no broad except" rules that would flag the project's few
+  intentional, comment-documented `except Exception` clauses) would have
+  meant either a large unrelated cleanup pass or immediately suppressing
+  rules -- neither of which this CI-focused issue calls for. Fixed the
+  handful of genuine findings the chosen rule set + `black` + `mypy`
+  turned up (an unsorted import, an unused import, two long lines, one
+  reformatting pass, and one real type gap in `get_crawl_report()` where
+  `state.report` is `CrawlSummary | None` but is guaranteed non-`None`
+  once `state.status` is `FINISHED` -- now asserted explicitly).
+- **Outputs:** a pass/fail CI status on every push/PR; no runtime data
+  flow. **Data-flow note:** no new concerns -- this is tooling
+  infrastructure, touches no credentials, matches, or snapshots. Note for
+  operators: CI runs `pytest` against the same codebase covered by issue
+  #26's real end-to-end test, but that test only ever talks to a local
+  fixture server with synthetic data -- no real target site or real
+  credentials are ever involved in CI.

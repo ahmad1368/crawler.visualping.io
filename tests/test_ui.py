@@ -140,13 +140,11 @@ def test_run_button_disables_during_crawl_and_log_updates_live(live_server):
 
             page.wait_for_selector("#log p:has-text('Fetched')")
             assert run_button.is_disabled(), "button must stay disabled while crawl is in progress"
-            assert page.locator("#summary-resources-checked").inner_text() == "1", (
-                "resources-checked stat should update live from page_fetched events"
-            )
+            assert (
+                page.locator("#summary-resources-checked").inner_text() == "1"
+            ), "resources-checked stat should update live from page_fetched events"
 
-            page.wait_for_function(
-                "document.querySelectorAll('#log p').length >= 3", timeout=5000
-            )
+            page.wait_for_function("document.querySelectorAll('#log p').length >= 3", timeout=5000)
             log_lines = page.locator("#log p").all_inner_texts()
             fetched_lines = [line for line in log_lines if line.startswith("Fetched")]
             assert len(fetched_lines) == 2
@@ -163,7 +161,9 @@ def test_run_button_disables_during_crawl_and_log_updates_live(live_server):
             assert page.locator("#summary-resources-checked").inner_text() == "2"
             assert page.locator("#summary-queue-empty").inner_text() == "Yes"
 
-            page.wait_for_function("document.querySelectorAll('#results-table tbody tr').length >= 2")
+            page.wait_for_function(
+                "document.querySelectorAll('#results-table tbody tr').length >= 2"
+            )
             rows = page.locator("#results-table tbody tr")
             html_row = rows.filter(has_text="html_text")
             exif_row = rows.filter(has_text="image_metadata")

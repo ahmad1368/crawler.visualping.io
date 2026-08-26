@@ -32,3 +32,4 @@ _Full documentation will be filled in by the docs issue._
 - **#24** Orchestrator resumes a crashed crawl from the repository (`get_visited_urls`/`mark_visited`); a single URL's failure (e.g. a redirect loop) no longer hangs or aborts the crawl.
 - **#25** Full-contract tests for REST responses and the WebSocket event stream -- exact payload shapes, not just spot-checked fields.
 - **#26** End-to-end test: a real Orchestrator crawls a real local fixture site over Basic Auth and finds exactly the 8 planted passwords, one per source type.
+- **#27** CI (GitHub Actions): lint (ruff), format check (black), type-check (mypy), and `pytest --cov` on every push to main and PR into main/staging.
