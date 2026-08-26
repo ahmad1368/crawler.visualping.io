@@ -74,11 +74,17 @@ class MatchTableRow(BaseModel):
     context_before: str
     context_after: str
     count_in_page: int
+    locator: str
 
 
 class CrawlReportResponse(BaseModel):
     summary: CrawlSummary
     matches: list[MatchTableRow]
+
+
+class SnapshotResponse(BaseModel):
+    url: str
+    content: str
 
 
 class _CrawlState:
@@ -203,6 +209,22 @@ def _build_match_rows(state: _CrawlState) -> list[MatchTableRow]:
                 context_before=match.context_before,
                 context_after=match.context_after,
                 count_in_page=counts[key],
+                locator=match.locator,
             )
         )
     return rows
+
+
+@app.get("/crawls/{crawl_id}/snapshot", response_model=SnapshotResponse)
+async def get_crawl_snapshot(crawl_id: str, url: str) -> SnapshotResponse:
+    state = _crawls.get(crawl_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="crawl not found")
+    if state.repository is None:
+        raise HTTPException(status_code=404, detail="no snapshot data available")
+
+    content = state.repository.get_snapshot(url)
+    if content is None:
+        raise HTTPException(status_code=404, detail="snapshot not found for this url")
+
+    return SnapshotResponse(url=url, content=content.decode("utf-8", errors="replace"))
