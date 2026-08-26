@@ -15,17 +15,26 @@ yet -- they show where today's outputs are headed.
 └── Settings                                    app/settings.py
     (TARGET_URL, AUTH_USERNAME, AUTH_PASSWORD, CONTEXT_CHARS, CONCURRENCY, MAX_PAGES)
     │
-    ├── HttpFetcher                             app/crawler/fetcher.py
-    │   (httpx.AsyncClient + Basic Auth, retry/backoff)
-    │   └── FetchResult
-    │       (content, content_type, status_code, headers, cookies)
-    │
-    └── BrowserFetcher                          app/crawler/browser_fetcher.py
-        (Playwright Chromium + http_credentials, network capture)
-        └── BrowserFetchResult
-            (html, dom_links, network_urls)
+    └── UrlFrontier                              app/crawler/frontier.py
+        (queue + visited-set seeded from TARGET_URL; normalizes URLs,
+         same-origin filter, dedupe prevents cyclic-link loops)
+        │
+        ├── HttpFetcher                          app/crawler/fetcher.py
+        │   (httpx.AsyncClient + Basic Auth, retry/backoff)
+        │   └── FetchResult
+        │       (content, content_type, status_code, headers, cookies)
+        │
+        └── BrowserFetcher                       app/crawler/browser_fetcher.py
+            (Playwright Chromium + http_credentials, network capture)
+            └── BrowserFetchResult
+                (html, dom_links, network_urls)
 
 FetchResult / BrowserFetchResult
+├── UrlFrontier.add_many(...)                    discovered links (dom_links,
+│                                                 network_urls) feed back into the
+│                                                 frontier's queue -- same-origin +
+│                                                 dedup keeps the crawl bounded
+│
 └── Extractors (planned)                        app/extractors/
     (one strategy class per password-hiding technique: html, css, js,
      http_header, cookie, image_metadata, binary)
@@ -136,3 +145,20 @@ becomes the durable/exposed copy of that secret).
   `html` and `network_urls` are the rendered page content and every URL
   Chromium touched -- both should be treated as sensitive input once
   extractors (later issues) start scanning them for exposed passwords.
+
+## Issue #6: URL frontier (queue + visited-set, same-origin filter)
+
+- **Inputs:** a seed URL (the crawl's `TARGET_URL`), plus links discovered
+  later from `FetchResult`/`BrowserFetchResult` (e.g. `dom_links`,
+  `network_urls`).
+- **Transformation:** `app/crawler/frontier.py`'s `UrlFrontier` normalizes
+  each URL (strips fragments, collapses trailing-slash variants, lowercases
+  scheme/host) before checking it against a `seen` set, so trivial variants
+  of the same URL dedupe together. `add()` also rejects any URL outside the
+  seed's origin (scheme + host). Because a normalized URL is only ever
+  added to the queue once, feeding the same link back in repeatedly (a
+  cyclic link) is a no-op after the first time -- this is what keeps the
+  crawl from looping forever.
+- **Outputs:** a FIFO queue of same-origin, deduped URLs, held in memory
+  only. No credentials or extracted content pass through this component --
+  it carries URLs, not page content or secrets.
