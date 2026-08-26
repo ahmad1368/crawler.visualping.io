@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Visualping Password Crawler</title>
+<style>
+  :root {
+    --accent: #da532c;
+    --accent-disabled: #f0b7a2;
+    --bg: #ffffff;
+    --text: #1a1a1a;
+    --border: #e5e5e5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 2rem;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .card {
+    max-width: 640px;
+    margin: 0 auto;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  }
+  h1 {
+    font-size: 1.25rem;
+    margin-top: 0;
+  }
+  label {
+    display: block;
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin-top: 1rem;
+    margin-bottom: 0.25rem;
+  }
+  input {
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 0.95rem;
+  }
+  button {
+    margin-top: 1.5rem;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 0.6rem 1.25rem;
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled {
+    background: var(--accent-disabled);
+    cursor: not-allowed;
+  }
+  #log {
+    margin-top: 1.5rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.75rem;
+    height: 220px;
+    overflow-y: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.8rem;
+    background: #fafafa;
+  }
+  #log p { margin: 0 0 0.25rem 0; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Visualping Password Crawler</h1>
+    <form id="crawl-form">
+      <label for="url">Target URL</label>
+      <input id="url" name="url" type="url" required placeholder="https://example.com" />
+
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" required autocomplete="off" />
+
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" required autocomplete="off" />
+
+      <label for="context_chars">Context length</label>
+      <input id="context_chars" name="context_chars" type="number" min="0" value="80" />
+
+      <button id="run-button" type="submit">Run</button>
+    </form>
+    <div id="log" aria-live="polite"></div>
+  </div>
+
+  <script>
+    const form = document.getElementById("crawl-form");
+    const runButton = document.getElementById("run-button");
+    const log = document.getElementById("log");
+
+    function appendLog(text) {
+      const line = document.createElement("p");
+      line.textContent = text;
+      log.appendChild(line);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      runButton.disabled = true;
+      log.innerHTML = "";
+      appendLog("Starting crawl...");
+
+      const body = {
+        url: document.getElementById("url").value,
+        username: document.getElementById("username").value,
+        password: document.getElementById("password").value,
+        context_chars: Number(document.getElementById("context_chars").value || 80),
+      };
+
+      let response;
+      try {
+        response = await fetch("/crawls", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      } catch (err) {
+        appendLog("Failed to start crawl: " + err);
+        runButton.disabled = false;
+        return;
+      }
+
+      if (!response.ok) {
+        appendLog("Failed to start crawl (status " + response.status + ")");
+        runButton.disabled = false;
+        return;
+      }
+
+      const { crawl_id } = await response.json();
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const socket = new WebSocket(protocol + "//" + window.location.host + "/ws/crawls/" + crawl_id);
+
+      socket.addEventListener("message", (event) => {
+        const message = JSON.parse(event.data);
+        if (message.type === "page_fetched") {
+          appendLog("Fetched " + message.payload.url + " (" + message.payload.status_code + ")");
+        } else if (message.type === "match_found") {
+          appendLog("Password found at " + message.payload.source_url);
+        } else if (message.type === "crawl_finished") {
+          appendLog("Crawl finished.");
+          runButton.disabled = false;
+          socket.close();
+        }
+      });
+
+      socket.addEventListener("error", () => {
+        appendLog("WebSocket error.");
+        runButton.disabled = false;
+      });
+    });
+  </script>
+</body>
+</html>

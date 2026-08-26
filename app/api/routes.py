@@ -12,9 +12,11 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from enum import Enum
+from pathlib import Path
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from playwright.async_api import async_playwright
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -33,6 +35,13 @@ from app.models import CrawlSummary
 from app.storage.sqlite import SqliteRepository
 
 app = FastAPI()
+
+_STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index() -> str:
+    return (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
 
 class CrawlStatus(str, Enum):

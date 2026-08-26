@@ -24,3 +24,4 @@ _Full documentation will be filled in by the docs issue._
 - **#16** `EventBus`: in-process `subscribe()`/`publish()` pub/sub for `page_fetched`/`match_found`/`crawl_finished` events.
 - **#17** REST API: `POST /crawls`, `GET /crawls/{id}/status`, `GET /crawls/{id}/report` -- runs each crawl as a background task.
 - **#18** `WS /ws/crawls/{id}`: streams live crawl progress events as JSON, closing cleanly when the crawl finishes.
+- **#19** Web UI (`GET /`): Visualping-branded input form + Run button + live progress log, wired to the REST/WebSocket API.
