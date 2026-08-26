@@ -15,81 +15,51 @@ yet -- they show where today's outputs are headed.
 └── Settings                                    app/settings.py
     (TARGET_URL, AUTH_USERNAME, AUTH_PASSWORD, CONTEXT_CHARS, CONCURRENCY, MAX_PAGES)
     │
-    └── UrlFrontier                              app/crawler/frontier.py
-        (queue + visited-set seeded from TARGET_URL; normalizes URLs,
-         same-origin filter, dedupe prevents cyclic-link loops)
+    └── Orchestrator.run()                      app/crawler/orchestrator.py
+        (asyncio.Semaphore(concurrency)-bounded workers pop from the
+         frontier until max_pages resources are checked or it's empty)
         │
-        ├── HttpFetcher                          app/crawler/fetcher.py
-        │   (httpx.AsyncClient + Basic Auth, retry/backoff)
-        │   └── FetchResult
-        │       (content, content_type, status_code, headers, cookies)
+        ├── UrlFrontier                          app/crawler/frontier.py
+        │   (queue + visited-set seeded from TARGET_URL; normalizes URLs,
+        │    same-origin filter, dedupe prevents cyclic-link loops)
         │
-        └── BrowserFetcher                       app/crawler/browser_fetcher.py
-            (Playwright Chromium + http_credentials, network capture)
-            └── BrowserFetchResult
-                (html, dom_links, network_urls)
-
-FetchResult / BrowserFetchResult
-├── UrlFrontier.add_many(...)                    discovered links (dom_links,
-│                                                 network_urls) feed back into the
-│                                                 frontier's queue -- same-origin +
-│                                                 dedup keeps the crawl bounded
-│
-├── HeaderCookieExtractor                        app/extractors/headers_cookies.py
-│   (takes FetchResult.headers/.cookies directly -- not routed through
-│    ExtractorRegistry.run_all(), since its input isn't a body blob; also
-│    calls find_passwords() internally; tags matches http_header / cookie,
-│    locator is "header:<name>"/"cookie:<name>")
-│
-└── ExtractorRegistry                            app/extractors/base.py
-    (register() + run_all(content, content_type, url); dispatches to
-     every registered body-content Extractor)
-    │
-    ├── HtmlExtractor                            app/extractors/html.py
-    │   (text/html only; html.parser walks text nodes + <!-- --> comments,
-    │    skips <script>/<style>; tags matches html_text / html_comment)
-    │
-    ├── CssJsExtractor                            app/extractors/css_js.py
-    │   (text/css, application|text/javascript; scans the whole body as
-    │    plain text -- content:, string literals, // and /* */ comments)
-    │
-    ├── ImageExifExtractor                        app/extractors/image_exif.py
-    │   (image/* only; reads EXIF fields via Pillow -- UserComment,
-    │    ImageDescription, etc.; locator is "exif:<field name>")
-    │
-    ├── BinaryFallbackExtractor                   app/extractors/binary_fallback.py
-    │   (any content type NOT handled above; decodes as latin-1 -- never
-    │    raises on non-UTF8 bytes -- and scans like `strings`;
-    │    locator is "offset:<byte offset>")
-    │
-    └── find_passwords()                        app/matching.py
-        (regex: VISUALPING\{16 lowercase hex\}; slices before/after context)
-        └── RegexMatch
-            (value, context_before, context_after, start, end)
-            │
-            └── PasswordMatch                   app/models.py
-                (RegexMatch's value/context + source_type, source_url, locator)
+        └── per URL popped: HttpFetcher.fetch(url)   app/crawler/fetcher.py
+            (httpx.AsyncClient + Basic Auth, retry/backoff)
+            └── FetchResult (content, content_type, status_code, headers, cookies)
                 │
-                └── PageResult                  app/models.py
-                    (url, status_code, fetched_at, matches[])
+                ├── ExtractorRegistry.run_all(content, content_type, url)
+                │   app/extractors/base.py -- dispatches to HtmlExtractor,
+                │   CssJsExtractor, ImageExifExtractor, BinaryFallbackExtractor
+                │   (each calls find_passwords() from app/matching.py)
+                │
+                ├── HeaderCookieExtractor.extract(headers, cookies, url)
+                │   app/extractors/headers_cookies.py (not routed through
+                │   ExtractorRegistry -- different input shape, see issue #11)
+                │
+                ├── if content_type is text/html:
+                │   BrowserFetcher.fetch(url)     app/crawler/browser_fetcher.py
+                │   └── BrowserFetchResult (dom_links, network_urls)
+                │       └── UrlFrontier.add_many(...) -- feeds discovered
+                │           links back into the queue (same-origin + dedup
+                │           keeps the crawl bounded)
+                │
+                └── PageResult(url, status_code, fetched_at, matches)
+                    app/models.py
                     │
-                    └── Repository / SqliteRepository   app/storage/
-                        (save_page(page, snapshot) persists the page row + its
-                         matches + a raw content snapshot; save_match() persists
-                         a standalone match with no page/snapshot, e.g. from
-                         HeaderCookieExtractor; durable SQLite *.db, gitignored)
+                    └── Repository.save_page(page, snapshot=content)
+                        app/storage/ (SqliteRepository -- durable *.db,
+                        gitignored)
                         │
-                        ├── get_snapshot(url)     raw bytes back out, for the
-                        │                         (planned) UI's "jump to
-                        │                         location" viewer
+                        ├── get_snapshot(url)     raw bytes back out, for
+                        │                         the (planned) UI's "jump
+                        │                         to location" viewer
                         │
-                        ├── get_report()          app/models.py CrawlSummary
-                        │   (pages_visited, resources_checked, unique_passwords_found,
-                        │    started_at/finished_at -- aggregated from stored rows)
-                        │
-                        └── API (planned)        app/api/
-                            (REST + WebSocket -- surfaces get_report()/
-                             get_snapshot() to the UI)
+                        └── get_report()          CrawlSummary aggregated
+                            from all stored rows (DB-wide, separate from
+                            the CrawlSummary Orchestrator.run() returns for
+                            just the current run)
+                            │
+                            └── API (planned)     app/api/ (REST + WebSocket)
 ```
 
 Sensitive edges to keep an eye on: `Settings` → both fetchers (Basic Auth
@@ -371,3 +341,35 @@ becomes the durable/exposed copy of that secret).
   one) now persists to disk. Nothing here adds logging, telemetry, or any
   network call; the database is the only sink. This is exactly the file
   operators must keep secured and out of version control.
+
+## Issue #15: async orchestrator wiring frontier + fetchers + extractors + repository
+
+- **Inputs:** a seeded `UrlFrontier`, an `HttpFetcher`, a `BrowserFetcher`,
+  an `ExtractorRegistry`, a `HeaderCookieExtractor`, and a `Repository` --
+  all injected via the constructor (each already independently tested in
+  issues #6, #4, #5, #8-13, #11, #14) -- plus `concurrency` and `max_pages`
+  limits.
+- **Transformation:** `app/crawler/orchestrator.py`'s `Orchestrator.run()`
+  starts `concurrency` worker tasks bounded by an `asyncio.Semaphore`. Each
+  worker pops a URL from the frontier, fetches it via `HttpFetcher`, runs
+  `ExtractorRegistry.run_all()` and `HeaderCookieExtractor.extract()`
+  against the result, and -- only for `text/html` responses -- also fetches
+  it via `BrowserFetcher` and feeds `dom_links`/`network_urls` back into the
+  frontier via `add_many()`. Every fetched URL becomes a `PageResult` saved
+  through `Repository.save_page()`. The loop stops once `max_pages`
+  resources have been checked or the frontier is empty, whichever comes
+  first. `pages_visited` counts HTML responses specifically;
+  `resources_checked` counts everything fetched; `unique_passwords_found`
+  is deduped by match value across the whole run. **Scope note:** the
+  frontier (issue #6) has no depth concept and `Settings` has no
+  `MAX_DEPTH`, so only `max_pages` is enforced here -- depth-limiting was
+  left out rather than adding an untested concept to the frontier under
+  this issue.
+- **Outputs:** a `CrawlSummary` for this run (in memory, returned to the
+  caller) plus everything `Repository.save_page()` already persists per
+  issue #14. **Data-flow note:** no new sink is introduced here -- this
+  issue only wires together components that were each already reviewed for
+  where credentials/matches/snapshots travel. The one new behavior worth
+  flagging: `BrowserFetcher` (which also carries Basic Auth credentials via
+  `http_credentials`) now runs automatically for every HTML page during a
+  real crawl, not just in isolated tests.
