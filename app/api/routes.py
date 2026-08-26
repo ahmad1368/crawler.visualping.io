@@ -32,6 +32,7 @@ from app.extractors.html import HtmlExtractor
 from app.extractors.image_exif import ImageExifExtractor
 from app.events import CRAWL_FINISHED, EventBus
 from app.models import CrawlSummary
+from app.storage.repository import Repository
 from app.storage.sqlite import SqliteRepository
 
 app = FastAPI()
@@ -66,12 +67,27 @@ class CrawlStatusResponse(BaseModel):
     status: CrawlStatus
 
 
+class MatchTableRow(BaseModel):
+    page_url: str
+    source_type: str
+    value: str
+    context_before: str
+    context_after: str
+    count_in_page: int
+
+
+class CrawlReportResponse(BaseModel):
+    summary: CrawlSummary
+    matches: list[MatchTableRow]
+
+
 class _CrawlState:
     def __init__(self) -> None:
         self.status = CrawlStatus.RUNNING
         self.report: CrawlSummary | None = None
         self.error: str | None = None
         self.event_bus = EventBus()
+        self.repository: Repository | None = None
 
 
 _crawls: dict[str, _CrawlState] = {}
@@ -80,9 +96,10 @@ _crawls: dict[str, _CrawlState] = {}
 async def _build_orchestrator(request: CrawlRequest, event_bus: EventBus):
     """Wire a real `Orchestrator` to live httpx/Playwright resources.
 
-    Returns `(orchestrator, cleanup)`, where `cleanup()` releases those
-    resources. This is the single seam integration tests replace to avoid
-    launching a real browser or making real network calls.
+    Returns `(orchestrator, repository, cleanup)`, where `cleanup()`
+    releases the httpx/Playwright resources. This is the single seam
+    integration tests replace to avoid launching a real browser or making
+    real network calls.
     """
     client = httpx.AsyncClient()
     playwright = await async_playwright().start()
@@ -95,13 +112,14 @@ async def _build_orchestrator(request: CrawlRequest, event_bus: EventBus):
     registry.register(ImageExifExtractor(context_chars=request.context_chars))
     registry.register(BinaryFallbackExtractor(context_chars=request.context_chars))
 
+    repository = SqliteRepository(sqlite3.connect(f"crawl_{uuid.uuid4().hex}.db"))
     orchestrator = Orchestrator(
         frontier=frontier,
         http_fetcher=HttpFetcher(client, request.username, request.password),
         browser_fetcher=BrowserFetcher(browser, request.username, request.password),
         extractor_registry=registry,
         header_cookie_extractor=HeaderCookieExtractor(context_chars=request.context_chars),
-        repository=SqliteRepository(sqlite3.connect(f"crawl_{uuid.uuid4().hex}.db")),
+        repository=repository,
         event_bus=event_bus,
     )
 
@@ -110,13 +128,14 @@ async def _build_orchestrator(request: CrawlRequest, event_bus: EventBus):
         await playwright.stop()
         await client.aclose()
 
-    return orchestrator, cleanup
+    return orchestrator, repository, cleanup
 
 
 async def _run_crawl(crawl_id: str, request: CrawlRequest) -> None:
     state = _crawls[crawl_id]
     try:
-        orchestrator, cleanup = await _build_orchestrator(request, state.event_bus)
+        orchestrator, repository, cleanup = await _build_orchestrator(request, state.event_bus)
+        state.repository = repository
         try:
             state.report = await orchestrator.run()
             state.status = CrawlStatus.FINISHED
@@ -146,8 +165,8 @@ async def get_crawl_status(crawl_id: str) -> CrawlStatusResponse:
     return CrawlStatusResponse(crawl_id=crawl_id, status=state.status)
 
 
-@app.get("/crawls/{crawl_id}/report", response_model=CrawlSummary)
-async def get_crawl_report(crawl_id: str) -> CrawlSummary:
+@app.get("/crawls/{crawl_id}/report", response_model=CrawlReportResponse)
+async def get_crawl_report(crawl_id: str) -> CrawlReportResponse:
     state = _crawls.get(crawl_id)
     if state is None:
         raise HTTPException(status_code=404, detail="crawl not found")
@@ -155,4 +174,35 @@ async def get_crawl_report(crawl_id: str) -> CrawlSummary:
         raise HTTPException(status_code=409, detail="crawl not finished yet")
     if state.status is CrawlStatus.FAILED:
         raise HTTPException(status_code=500, detail=state.error or "crawl failed")
-    return state.report
+
+    return CrawlReportResponse(summary=state.report, matches=_build_match_rows(state))
+
+
+def _build_match_rows(state: _CrawlState) -> list[MatchTableRow]:
+    if state.repository is None:
+        return []
+
+    matches = state.repository.get_matches()
+    counts: dict[tuple[str, str], int] = {}
+    for match in matches:
+        key = (match.source_url, match.value)
+        counts[key] = counts.get(key, 0) + 1
+
+    rows: list[MatchTableRow] = []
+    seen: set[tuple[str, str]] = set()
+    for match in matches:
+        key = (match.source_url, match.value)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            MatchTableRow(
+                page_url=match.source_url,
+                source_type=match.source_type.value,
+                value=match.value,
+                context_before=match.context_before,
+                context_after=match.context_after,
+                count_in_page=counts[key],
+            )
+        )
+    return rows

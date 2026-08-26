@@ -125,3 +125,50 @@ def test_save_page_upserts_on_repeated_url():
 
     assert repo.get_snapshot("https://example.com/a") == b"new"
     assert repo.get_report().pages_visited == 1
+
+
+def test_get_matches_returns_empty_list_when_none_stored():
+    repo = _repo()
+
+    assert repo.get_matches() == []
+
+
+def test_get_matches_returns_matches_from_pages_and_standalone_in_order():
+    repo = _repo()
+    page_match = _match(value="VISUALPING{aaaaaaaaaaaaaaaa}", locator="line:1,col:0")
+    page = PageResult(
+        url="https://example.com/page",
+        status_code=200,
+        fetched_at=datetime.now(timezone.utc),
+        matches=[page_match],
+    )
+    repo.save_page(page, snapshot=b"content")
+
+    standalone_match = _match(
+        value="VISUALPING{bbbbbbbbbbbbbbbb}",
+        source_type=SourceType.HTTP_HEADER,
+        locator="header:X-Debug",
+    )
+    repo.save_match(standalone_match)
+
+    matches = repo.get_matches()
+
+    assert [m.value for m in matches] == [page_match.value, standalone_match.value]
+    assert matches[0].source_type == SourceType.HTML_TEXT
+    assert matches[1].source_type == SourceType.HTTP_HEADER
+    assert matches[1].locator == "header:X-Debug"
+
+
+def test_get_matches_includes_duplicate_values_for_count_aggregation():
+    repo = _repo()
+    match = _match()
+    page = PageResult(
+        url="https://example.com/page",
+        status_code=200,
+        fetched_at=datetime.now(timezone.utc),
+        matches=[match, match],
+    )
+
+    repo.save_page(page, snapshot=b"content")
+
+    assert len(repo.get_matches()) == 2

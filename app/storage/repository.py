@@ -31,3 +31,8 @@ class Repository(ABC):
     def get_snapshot(self, url: str) -> bytes | None:
         """Return the raw content snapshot stored for a URL, or None if
         none was stored."""
+
+    @abstractmethod
+    def get_matches(self) -> list[PasswordMatch]:
+        """Return every password match persisted so far, in insertion
+        order (for the UI's results table, issue #20)."""

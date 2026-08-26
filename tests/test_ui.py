@@ -12,13 +12,27 @@ from app.api import routes
 from app.api import websocket as _websocket_module  # noqa: F401  (registers /ws/crawls/{id})
 from app.api.routes import app
 from app.events import CRAWL_FINISHED, PAGE_FETCHED
-from app.models import CrawlSummary, PageResult
+from app.models import CrawlSummary, PageResult, PasswordMatch, SourceType
 
 
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+class _FakeRepository:
+    def get_matches(self):
+        return [
+            PasswordMatch(
+                value="VISUALPING{abcdef1234567890}",
+                source_type=SourceType.HTML_TEXT,
+                source_url="https://example.com",
+                context_before="secret is ",
+                context_after=" for now",
+                locator="line:1,col:0",
+            )
+        ]
 
 
 class _FakeOrchestrator:
@@ -66,7 +80,7 @@ def live_server(monkeypatch):
         async def cleanup() -> None:
             return None
 
-        return orchestrator, cleanup
+        return orchestrator, _FakeRepository(), cleanup
 
     monkeypatch.setattr(routes, "_build_orchestrator", fake_build_orchestrator)
 
@@ -121,5 +135,22 @@ def test_run_button_disables_during_crawl_and_log_updates_live(live_server):
             )
             final_lines = page.locator("#log p").all_inner_texts()
             assert any("Crawl finished" in line for line in final_lines)
+
+            page.wait_for_selector("#results-table tbody tr")
+            row = page.locator("#results-table tbody tr").first
+            assert row.locator("td").nth(0).inner_text() == "https://example.com"
+            assert row.locator("td").nth(1).inner_text() == "html_text"
+            password_button = row.locator("button.password-cell")
+            assert password_button.inner_text() == "VISUALPING{abcdef1234567890}"
+            assert row.locator("td").nth(4).inner_text() == "1"
+
+            page.evaluate(
+                "window.__clickedRow = null;"
+                "window.addEventListener('password-cell-click', "
+                "(e) => { window.__clickedRow = e.detail; });"
+            )
+            password_button.click()
+            clicked_page_url = page.evaluate("window.__clickedRow.page_url")
+            assert clicked_page_url == "https://example.com"
         finally:
             browser.close()
