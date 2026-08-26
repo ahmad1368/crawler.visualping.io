@@ -43,8 +43,12 @@ FetchResult / BrowserFetchResult
     │   (text/html only; html.parser walks text nodes + <!-- --> comments,
     │    skips <script>/<style>; tags matches html_text / html_comment)
     │
-    ├── (planned) css/js, http_header, cookie, image_metadata, binary
-    │   extractors -- same Extractor interface, not yet implemented
+    ├── CssJsExtractor                            app/extractors/css_js.py
+    │   (text/css, application|text/javascript; scans the whole body as
+    │    plain text -- content:, string literals, // and /* */ comments)
+    │
+    ├── (planned) http_header, cookie, image_metadata, binary extractors
+    │   -- same Extractor interface, not yet implemented
     │
     └── find_passwords()                        app/matching.py
         (regex: VISUALPING\{16 lowercase hex\}; slices before/after context)
@@ -235,3 +239,20 @@ becomes the durable/exposed copy of that secret).
   constructed from live crawl content. Nothing here logs, persists, or
   transmits it; it's returned up the call stack for a later issue's
   storage/API layer to handle per the data-flow watchlist.
+
+## Issue #10: CSS & JS file content extractor
+
+- **Inputs:** a fetched response's `content` (`bytes`), `content_type`, and
+  `url` (same `Extractor.extract()` signature).
+- **Transformation:** `app/extractors/css_js.py`'s `CssJsExtractor` maps
+  `content_type` to `SourceType.CSS` (`text/css`) or `SourceType.JS`
+  (`application/javascript`, `text/javascript`, `application/x-javascript`;
+  any other content type is skipped). Unlike the HTML extractor, there's no
+  DOM to walk -- a password can be hidden anywhere (a `content:` property,
+  a string literal, a `//`/`/* */` comment) -- so the whole decoded body is
+  scanned as plain text through `find_passwords()`. `locator` is a
+  `line:col` position computed by counting newlines up to the match offset.
+- **Outputs:** a `list[PasswordMatch]` returned to the caller in memory
+  only, tagged `CSS` or `JS`. **Data-flow note:** same as issue #9 -- this
+  constructs real `PasswordMatch` objects from live crawl content; nothing
+  here logs, persists, or transmits them.
