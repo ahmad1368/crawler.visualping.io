@@ -9,9 +9,8 @@ import uvicorn
 from playwright.sync_api import sync_playwright
 
 from app.api import routes
-from app.api import websocket as _websocket_module  # noqa: F401  (registers /ws/crawls/{id})
-from app.api.routes import app
 from app.events import CRAWL_FINISHED, PAGE_FETCHED
+from app.main import app  # imports app.api.websocket for /ws/crawls/{id} too
 from app.models import CrawlSummary, PageResult, PasswordMatch, SourceType
 
 
