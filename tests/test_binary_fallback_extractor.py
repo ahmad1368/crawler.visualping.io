@@ -55,6 +55,10 @@ def test_skips_content_types_handled_by_other_extractors():
 def test_no_match_returns_empty_list():
     extractor = BinaryFallbackExtractor()
 
-    matches = extractor.extract(b"\x00\x01\x02no password here\xff", "application/octet-stream", "https://example.com/file.bin")
+    matches = extractor.extract(
+        b"\x00\x01\x02no password here\xff",
+        "application/octet-stream",
+        "https://example.com/file.bin",
+    )
 
     assert matches == []

@@ -23,13 +23,9 @@ class HeaderCookieExtractor:
     ) -> list[PasswordMatch]:
         matches: list[PasswordMatch] = []
         for name, value in headers.items():
-            matches.extend(
-                self._matches_for(value, url, SourceType.HTTP_HEADER, f"header:{name}")
-            )
+            matches.extend(self._matches_for(value, url, SourceType.HTTP_HEADER, f"header:{name}"))
         for name, value in cookies.items():
-            matches.extend(
-                self._matches_for(value, url, SourceType.COOKIE, f"cookie:{name}")
-            )
+            matches.extend(self._matches_for(value, url, SourceType.COOKIE, f"cookie:{name}"))
         return matches
 
     def _matches_for(
@@ -44,7 +40,5 @@ class HeaderCookieExtractor:
                 context_after=match.context_after,
                 locator=locator,
             )
-            for match in find_passwords(
-                text, before=self._context_chars, after=self._context_chars
-            )
+            for match in find_passwords(text, before=self._context_chars, after=self._context_chars)
         ]

@@ -41,7 +41,9 @@ def test_extracts_password_from_js_string_and_comment():
 def test_accepts_text_javascript_content_type_variant():
     extractor = CssJsExtractor()
 
-    matches = extractor.extract(JS_FIXTURE, "text/javascript; charset=utf-8", "https://example.com/app.js")
+    matches = extractor.extract(
+        JS_FIXTURE, "text/javascript; charset=utf-8", "https://example.com/app.js"
+    )
 
     assert len(matches) == 2
     assert all(m.source_type == SourceType.JS for m in matches)

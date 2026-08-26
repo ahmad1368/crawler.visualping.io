@@ -45,7 +45,5 @@ class BinaryFallbackExtractor:
                 context_after=match.context_after,
                 locator=f"offset:{match.start}",
             )
-            for match in find_passwords(
-                text, before=self._context_chars, after=self._context_chars
-            )
+            for match in find_passwords(text, before=self._context_chars, after=self._context_chars)
         ]

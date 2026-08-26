@@ -92,9 +92,7 @@ class SqliteRepository(Repository):
         )
 
     def get_snapshot(self, url: str) -> bytes | None:
-        row = self._conn.execute(
-            "SELECT content FROM snapshots WHERE url = ?", (url,)
-        ).fetchone()
+        row = self._conn.execute("SELECT content FROM snapshots WHERE url = ?", (url,)).fetchone()
         return row[0] if row is not None else None
 
     def get_report(self) -> CrawlSummary:

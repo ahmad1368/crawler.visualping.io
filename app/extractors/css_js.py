@@ -54,7 +54,5 @@ class CssJsExtractor:
                 context_after=match.context_after,
                 locator=_locator_for(text, match.start),
             )
-            for match in find_passwords(
-                text, before=self._context_chars, after=self._context_chars
-            )
+            for match in find_passwords(text, before=self._context_chars, after=self._context_chars)
         ]

@@ -51,9 +51,7 @@ class HttpFetcher:
 
         for attempt in range(self._max_retries):
             try:
-                response = await self._client.get(
-                    url, auth=self._auth, timeout=self._timeout
-                )
+                response = await self._client.get(url, auth=self._auth, timeout=self._timeout)
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_error = exc
             else:

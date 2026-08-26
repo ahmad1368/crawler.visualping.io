@@ -70,7 +70,5 @@ class ImageExifExtractor:
                 context_after=match.context_after,
                 locator=locator,
             )
-            for match in find_passwords(
-                text, before=self._context_chars, after=self._context_chars
-            )
+            for match in find_passwords(text, before=self._context_chars, after=self._context_chars)
         ]

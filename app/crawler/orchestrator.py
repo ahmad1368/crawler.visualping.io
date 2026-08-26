@@ -112,13 +112,9 @@ class Orchestrator:
         fetch_result = await self._http_fetcher.fetch(url)
         content_type = fetch_result.content_type or ""
 
-        matches = list(
-            self._extractor_registry.run_all(fetch_result.content, content_type, url)
-        )
+        matches = list(self._extractor_registry.run_all(fetch_result.content, content_type, url))
         matches.extend(
-            self._header_cookie_extractor.extract(
-                fetch_result.headers, fetch_result.cookies, url
-            )
+            self._header_cookie_extractor.extract(fetch_result.headers, fetch_result.cookies, url)
         )
 
         is_html = content_type.startswith("text/html")
