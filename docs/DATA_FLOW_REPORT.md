@@ -53,7 +53,11 @@ FetchResult / BrowserFetchResult
     │   (text/css, application|text/javascript; scans the whole body as
     │    plain text -- content:, string literals, // and /* */ comments)
     │
-    ├── (planned) image_metadata, binary extractors
+    ├── ImageExifExtractor                        app/extractors/image_exif.py
+    │   (image/* only; reads EXIF fields via Pillow -- UserComment,
+    │    ImageDescription, etc.; locator is "exif:<field name>")
+    │
+    ├── (planned) binary fallback extractor
     │   -- same Extractor interface, not yet implemented
     │
     └── find_passwords()                        app/matching.py
@@ -282,3 +286,25 @@ becomes the durable/exposed copy of that secret).
   where that risk becomes concrete: any secret an operator's server leaks
   in a header or `Set-Cookie` value now gets extracted the same as a
   body-content match. Nothing here logs, persists, or transmits it further.
+
+## Issue #12: image EXIF metadata extractor
+
+- **Inputs:** a fetched response's `content` (`bytes`), `content_type`, and
+  `url` (the `Extractor.extract()` signature from issue #8). Only acts on
+  `image/*` content types.
+- **Transformation:** `app/extractors/image_exif.py`'s `ImageExifExtractor`
+  opens the image bytes with Pillow and reads its EXIF tags (e.g.
+  `UserComment`, `ImageDescription`). `UserComment` values carry an 8-byte
+  charset prefix (`ASCII\x00\x00\x00`, `UNICODE\x00`, ...) per the EXIF
+  spec, which is stripped before decoding. Each decoded tag value is passed
+  through `find_passwords()`, and matches are tagged
+  `SourceType.IMAGE_METADATA` with `locator` set to `exif:<field name>`.
+  Unparseable image bytes (corrupt/non-image content) return no matches
+  rather than raising.
+- **Outputs:** a `list[PasswordMatch]` returned to the caller in memory
+  only. **Data-flow note:** operators sometimes stash debug notes --
+  including credentials -- in EXIF fields without realizing they ship with
+  the image; this is another place a secret gets extracted from content
+  that looks innocuous (a plain image) at a glance. Nothing here logs,
+  persists, or transmits the match further. Adds `Pillow==11.0.0` as a new
+  dependency.
