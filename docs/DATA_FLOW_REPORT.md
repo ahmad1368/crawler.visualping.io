@@ -50,3 +50,23 @@ focus on where credentials or extracted secrets travel.
   constructs, stores, or serializes a `PasswordMatch` must be checked
   against how far that value travels (DB row, log line, API/WebSocket
   payload) per the project's data-flow watchlist.
+
+## Issue #4: HTTP fetcher with Basic Auth (httpx)
+
+- **Inputs:** a target URL, plus the operator's Basic Auth credentials
+  (`Settings.auth_username` / `auth_password` from issue #2) supplied to
+  `HttpFetcher`'s constructor, and an injected `httpx.AsyncClient`.
+- **Transformation:** `app/crawler/fetcher.py`'s `HttpFetcher.fetch()`
+  builds an `httpx.BasicAuth` from the credentials and attaches it to every
+  request it sends. Transient failures (5xx responses, timeouts, transport
+  errors) are retried with exponential backoff up to a configurable
+  `max_retries`; non-5xx responses and exhausted retries return/raise
+  immediately.
+- **Outputs:** a `FetchResult` (raw `bytes`, `content_type`, `status_code`,
+  response `headers`, `cookies`) returned to the caller in memory only.
+  **Data-flow note:** the Authorization header carrying the Basic Auth
+  credentials is attached to outgoing requests but is never logged, and
+  `FetchResult` does not echo the request headers back -- only the
+  *response* headers/cookies from the target site, which themselves could
+  contain secrets and should be treated as sensitive once extractors (later
+  issues) start scanning them.
