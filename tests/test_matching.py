@@ -1,4 +1,4 @@
-from app.matching import find_passwords
+from app.matching import KNOWN_EXAMPLE, find_passwords
 
 VALID = "VISUALPING{0123456789abcdef}"
 
@@ -62,3 +62,17 @@ def test_handles_multiple_matches_in_one_blob():
     assert matches[0].value == VALID
     assert matches[1].value == second_value
     assert matches[0].end <= matches[1].start
+
+
+def test_known_example_value_is_never_reported():
+    content = f"real: {VALID}, worked example: {KNOWN_EXAMPLE}, also real"
+
+    matches = find_passwords(content, before=10, after=10)
+
+    values = [m.value for m in matches]
+    assert KNOWN_EXAMPLE not in values
+    assert values == [VALID]
+
+
+def test_known_example_alone_yields_no_matches():
+    assert find_passwords(KNOWN_EXAMPLE, before=10, after=10) == []

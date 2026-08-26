@@ -57,3 +57,17 @@ def test_empty_headers_and_cookies_return_no_matches():
     extractor = HeaderCookieExtractor()
 
     assert extractor.extract({}, {}, "https://example.com/page") == []
+
+
+def test_scans_every_header_name_not_a_fixed_allowlist():
+    # Every response header is scanned by value, regardless of name --
+    # there's no allowlist of "known" header names to check against.
+    password = "VISUALPING{abcdef1234567890}"
+    headers = {"X-Totally-Unexpected-Header-Name": password}
+    extractor = HeaderCookieExtractor()
+
+    matches = extractor.extract(headers, {}, "https://example.com/page")
+
+    assert len(matches) == 1
+    assert matches[0].value == password
+    assert matches[0].locator == "header:X-Totally-Unexpected-Header-Name"

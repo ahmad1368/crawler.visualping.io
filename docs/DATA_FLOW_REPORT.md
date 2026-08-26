@@ -854,5 +854,82 @@ becomes the durable/exposed copy of that secret).
   `app/main.py` is now the thing that makes every WebSocket-dependent data
   path described in issues #18/#19/#21/#22 actually reachable when the app
   is run the way the README instructs. **Data-flow note:** no new
-  concerns. This closes out the project: all 28 issues implemented, this
-  report and the README both reviewed end-to-end for consistency.
+  concerns. This closes out the original 28-issue backlog, this report and
+  the README both reviewed end-to-end for consistency.
+
+## Issue #61: false positive, header/attribute extractor fixes, query-param dedup, raise page limit to 1000
+
+Filed after a diagnostic crawl against a real target surfaced five
+concrete gaps. Fixed in the order listed.
+
+- **Inputs/Transformation, per fix:**
+  1. **False positive:** `app/matching.py` gained `KNOWN_EXAMPLE =
+     "VISUALPING{0000deadbeef0000}"`; `find_passwords()` now skips any
+     match equal to it before building a `RegexMatch`. Since every
+     extractor funnels through `find_passwords()`, this is filtered once,
+     centrally -- not left to each extractor's own regex hoping to be
+     stricter.
+  2. **HTTP header extractor:** audited `HeaderCookieExtractor` and
+     `HttpFetcher`/`FetchResult` end-to-end. Found no allowlist bug (it
+     already iterates every `headers.items()` unconditionally) and no
+     header-merging bug (`dict(httpx.Response.headers)` already joins
+     repeated header names with `", "` rather than silently dropping
+     earlier values -- verified directly against httpx's actual
+     behavior). No code change made here. The likely real cause of the
+     "missing" header on the live site is fix #3/#5 below: the page
+     carrying it was probably never reached because the crawl exploded on
+     decorative query params and hit the old page cap first.
+  3. **Query-param crawl explosion:** `UrlFrontier.normalize_url()` now
+     strips a fixed set of decorative/tracking query params (`ref`,
+     `utm_source`, `utm_medium`, `utm_campaign`, `utm_term`,
+     `utm_content`, `v`, `hl`, `fbclid`, `gclid`, `source`) from the
+     dedupe key via `parse_qsl`/`urlencode`, while keeping any other query
+     param untouched (so semantically meaningful params like `?id=5`
+     still distinguish pages). Two links differing only by a stripped
+     param now normalize to the same URL and dedupe in the frontier.
+  4. **`html_text` missing attribute values:** `HtmlExtractor` no longer
+     walks the DOM via `html.parser.HTMLParser` for visible text nodes
+     only (which never sees attribute values at all, since they aren't
+     text nodes). It now regex-scans the raw HTML source directly via the
+     same `find_passwords()` every other extractor uses, tagging a match
+     `HTML_COMMENT` if its offset falls inside a `<!-- -->` span (found
+     via a separate regex pass) and `HTML_TEXT` otherwise. This is a
+     deliberate broadening: attribute values, inline `data-*` attributes,
+     and inline `<script>`/`<style>` content (previously skipped) are now
+     all covered by the same pass and tagged `HTML_TEXT` -- per the
+     issue's explicit instruction to cover "any other markup content" in
+     one pass, not just attributes narrowly. Extracted the shared
+     `line:N,col:M` locator math (previously duplicated in `css_js.py`)
+     into `app.matching.locator_for_offset()`.
+  5. **Raise page limit to 1000:** `Settings.max_pages`, `.env.example`'s
+     `MAX_PAGES`, and `Orchestrator.__init__`'s `max_pages` parameter
+     default all changed from `100` to `1000`. Also found and closed a
+     real gap while doing this: `CrawlRequest` (the REST API's request
+     body) had no `max_pages` field at all, so every API/UI-driven crawl
+     silently used `Orchestrator`'s hardcoded default regardless of
+     `Settings`/`.env` -- meaning bumping only `Settings.max_pages` would
+     have had zero effect on the actual running app. Added
+     `CrawlRequest.max_pages: int = 1000` and threaded it through
+     `_build_orchestrator()` into `Orchestrator(...)`, so there is now
+     one real default (1000) instead of several that could drift, and
+     operators can still override it per crawl via the REST body if
+     needed (no new UI field was added -- the UI's POST body simply omits
+     the key and gets the schema default, which is what "the UI's
+     assumed default" agreeing with everything else means here).
+- **Outputs:** no new persisted data shape -- these are matching/dedup/
+  config fixes, not new fields on `PasswordMatch` or `CrawlSummary`.
+  **Data-flow note:** fix #4 means `HTML_TEXT` matches can now come from
+  a wider slice of the raw page source (attributes, inline scripts) than
+  before -- still the same sensitivity level as any other `HTML_TEXT`
+  match, just more of them. Fix #5 means a real crawl can now visit up to
+  10x more pages by default, which means proportionally more snapshot
+  data and match rows accumulate in a crawl's `*.db` file -- the
+  data-flow watchlist's existing snapshot-storage concern from issue #1
+  scales with this change, though the storage model itself (one
+  gitignored local file per crawl) is unchanged. **Not verified:**
+  criterion 5's own acceptance criteria asks to re-run a full crawl
+  against the real target with the new limit and record whether it
+  actually finds more passwords or whether `queue_empty` was already
+  reached well under 1000. This requires the real target's URL and Basic
+  Auth credentials, which weren't available in this session -- flagged to
+  the user to run and report back, rather than fabricated here.

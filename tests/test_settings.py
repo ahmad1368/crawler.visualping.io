@@ -34,7 +34,7 @@ def test_settings_use_defaults_when_optional_vars_missing(monkeypatch):
 
     assert settings.context_chars == 80
     assert settings.concurrency == 4
-    assert settings.max_pages == 100
+    assert settings.max_pages == 1000
 
 
 def test_settings_missing_required_var_raises_clear_error(monkeypatch):
