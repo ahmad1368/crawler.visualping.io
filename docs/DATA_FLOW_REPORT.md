@@ -5,12 +5,26 @@ issue that touches the crawl, extraction, storage, or API layers appends its
 own section below describing: inputs -> transformation -> outputs, with a
 focus on where credentials or extracted secrets travel.
 
+All 28 issues are implemented as of issue #28. This file's tree and every
+section below it were reviewed end-to-end for consistency as part of that
+issue; see its own section at the bottom for what that review found. The
+`README.md` "Architecture" section explains the *why* behind the
+Strategy/Registry, Repository, and Observer patterns this tree's nodes
+implement -- this document stays focused on the *what travels where*.
+
 ## Data flow tree (overview)
 
 Updated as each issue lands. Nodes marked `(planned)` don't exist in code
 yet -- they show where today's outputs are headed.
 
 ```
+uvicorn app.main:app                          app/main.py (issue #28)
+(the real entrypoint -- imports app.api.websocket for its side effect of
+registering /ws/crawls/{id} on the shared app instance from app.api.routes,
+then exposes that same app; running `uvicorn app.api.routes:app` directly
+would silently never register the WebSocket route)
+│
+▼
 Browser: GET /                                app/api/routes.py + app/static/index.html
 (operator fills in url/username/password/context_chars in an HTML form)
 │
@@ -809,3 +823,36 @@ becomes the durable/exposed copy of that secret).
   #26's real end-to-end test, but that test only ever talks to a local
   fixture server with synthetic data -- no real target site or real
   credentials are ever involved in CI.
+
+## Issue #28: README + architecture overview + finalize data-flow report
+
+- **Inputs:** the finished, 27-issue codebase and this document's own
+  27 prior sections -- reviewed end-to-end, not just appended to.
+- **Transformation:** rewrote `README.md` in full: setup/run/test/lint
+  instructions, a project-structure map, an Architecture section
+  explaining *why* the Strategy+Registry (`extractors/`),
+  Repository (`storage/`), and Observer (`events.py`) patterns exist (not
+  just that they do -- `docs/DATA_FLOW_REPORT.md` already covers the
+  latter in detail), and a Security Considerations section consolidating
+  the recurring themes from this report's watchlist (no API auth, durable
+  per-crawl `*.db` files, credential handling) into operator-facing
+  guidance. While writing the "how to run it" instructions, found that
+  nothing in `app/` ever imports `app.api.websocket` -- meaning `uvicorn
+  app.api.routes:app` would serve the REST API and the UI, but
+  `/ws/crawls/{id}` would never exist, silently breaking every UI feature
+  downstream of it (issues #19, #21, #22). Added `app/main.py` as the real
+  entrypoint (imports both `app.api.routes` and `app.api.websocket`,
+  verified via a route listing and a live `uvicorn` smoke test that both
+  REST and WebSocket routes register) and pointed the README at it instead
+  of `app.api.routes:app`. Reviewed this report's tree and all 27 prior
+  sections for stale `(planned)` markers or drift from current code --
+  found none beyond the intentional, point-in-time historical narration in
+  earlier sections (e.g. issue #13 correctly describing storage/API as
+  still-planned *as of issue #13*) -- and added the new entrypoint as this
+  tree's top node.
+- **Outputs:** documentation only -- no runtime data flow, except that
+  `app/main.py` is now the thing that makes every WebSocket-dependent data
+  path described in issues #18/#19/#21/#22 actually reachable when the app
+  is run the way the README instructs. **Data-flow note:** no new
+  concerns. This closes out the project: all 28 issues implemented, this
+  report and the README both reviewed end-to-end for consistency.
