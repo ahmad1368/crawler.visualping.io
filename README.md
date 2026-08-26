@@ -18,3 +18,4 @@ _Full documentation will be filled in by the docs issue._
 - **#10** `CssJsExtractor`: finds passwords in downloaded CSS/JS file bodies.
 - **#11** `HeaderCookieExtractor`: finds passwords in HTTP response headers (including custom `X-*`) and cookies.
 - **#12** `ImageExifExtractor`: finds passwords in image EXIF fields (e.g. `UserComment`) via Pillow.
+- **#13** `BinaryFallbackExtractor`: catch-all scanner for any other content type, safe on arbitrary binary bytes.
