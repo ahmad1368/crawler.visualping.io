@@ -32,3 +32,21 @@ focus on where credentials or extracted secrets travel.
   credentials first enter the system. Nothing here logs, persists, or
   serializes `Settings` — the real `.env` stays local and gitignored, and
   `.env.example` never contains real values.
+
+## Issue #3: core data models (PasswordMatch, PageResult, CrawlSummary)
+
+- **Inputs:** none directly -- this issue defines the pydantic schemas that
+  later crawler/extractor/storage/API issues will construct and pass
+  around; no runtime data flows through it yet.
+- **Transformation:** `app/models.py` now defines `SourceType` (the enum of
+  password-hiding techniques extractors can find: html, css, js,
+  http_header, cookie, image_metadata, binary), `PasswordMatch` (the
+  extracted secret plus its context and locator), `PageResult` (one
+  crawled page and its matches), and `CrawlSummary` (aggregate crawl
+  stats). Required fields are validated at construction time.
+- **Outputs:** none yet -- these are shapes, not a live data path. Flagging
+  ahead: `PasswordMatch.value`, `context_before`, and `context_after` are
+  the plaintext secret and its surrounding text. Every later issue that
+  constructs, stores, or serializes a `PasswordMatch` must be checked
+  against how far that value travels (DB row, log line, API/WebSocket
+  payload) per the project's data-flow watchlist.
