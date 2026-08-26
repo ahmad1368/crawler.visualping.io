@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Visualping Password Crawler</title>
+<style>
+  :root {
+    --accent: #da532c;
+    --accent-disabled: #f0b7a2;
+    --bg: #ffffff;
+    --text: #1a1a1a;
+    --border: #e5e5e5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 2rem;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .card {
+    max-width: 640px;
+    margin: 0 auto;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  }
+  h1 {
+    font-size: 1.25rem;
+    margin-top: 0;
+  }
+  label {
+    display: block;
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin-top: 1rem;
+    margin-bottom: 0.25rem;
+  }
+  input {
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 0.95rem;
+  }
+  button {
+    margin-top: 1.5rem;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 0.6rem 1.25rem;
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled {
+    background: var(--accent-disabled);
+    cursor: not-allowed;
+  }
+  #log {
+    margin-top: 1.5rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.75rem;
+    height: 220px;
+    overflow-y: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.8rem;
+    background: #fafafa;
+  }
+  #log p { margin: 0 0 0.25rem 0; }
+  #summary-panel {
+    margin-top: 1.5rem;
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 0.75rem;
+  }
+  .summary-stat {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.6rem 0.75rem;
+    background: #fafafa;
+  }
+  .summary-stat .summary-label {
+    display: block;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: #666;
+  }
+  .summary-stat .summary-value {
+    display: block;
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  table#results-table {
+    margin-top: 1.5rem;
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+  }
+  #results-table th, #results-table td {
+    text-align: left;
+    padding: 0.5rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  #results-table th {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: #666;
+  }
+  button.password-cell {
+    margin: 0;
+    padding: 0.2rem 0.5rem;
+    font-size: 0.8rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: #fff;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+  }
+  button.password-cell:hover {
+    background: var(--accent);
+    color: #fff;
+  }
+  #snapshot-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    align-items: center;
+    justify-content: center;
+    z-index: 10;
+  }
+  #snapshot-modal {
+    background: #fff;
+    border-radius: 12px;
+    max-width: 720px;
+    width: 90%;
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+  }
+  #snapshot-modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+  }
+  #snapshot-modal-title {
+    font-size: 0.9rem;
+    font-weight: 600;
+    word-break: break-all;
+    margin-right: 1rem;
+  }
+  #snapshot-close {
+    margin: 0;
+    padding: 0.2rem 0.6rem;
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  #snapshot-close:hover {
+    background: #f0f0f0;
+    color: var(--text);
+  }
+  #snapshot-body {
+    padding: 1rem 1.25rem;
+    overflow: auto;
+  }
+  #snapshot-body pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.8rem;
+    margin: 0;
+  }
+  #snapshot-body mark {
+    background: var(--accent);
+    color: #fff;
+    border-radius: 3px;
+    padding: 0 0.1rem;
+  }
+  #snapshot-locator {
+    font-size: 0.85rem;
+    margin: 0 0 0.75rem 0;
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Visualping Password Crawler</h1>
+    <form id="crawl-form">
+      <label for="url">Target URL</label>
+      <input id="url" name="url" type="url" required placeholder="https://example.com" />
+
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" required autocomplete="off" />
+
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" required autocomplete="off" />
+
+      <label for="context_chars">Context length</label>
+      <input id="context_chars" name="context_chars" type="number" min="0" value="80" />
+
+      <button id="run-button" type="submit">Run</button>
+    </form>
+    <div id="summary-panel" style="display: none;" aria-live="polite">
+      <div class="summary-stat">
+        <span class="summary-label">Pages visited</span>
+        <span id="summary-pages-visited" class="summary-value">0</span>
+      </div>
+      <div class="summary-stat">
+        <span class="summary-label">Resources checked</span>
+        <span id="summary-resources-checked" class="summary-value">0</span>
+      </div>
+      <div class="summary-stat">
+        <span class="summary-label">Unique passwords found</span>
+        <span id="summary-passwords-found" class="summary-value">0</span>
+      </div>
+      <div class="summary-stat">
+        <span class="summary-label">Queue empty</span>
+        <span id="summary-queue-empty" class="summary-value">—</span>
+      </div>
+    </div>
+    <div id="log" aria-live="polite"></div>
+    <table id="results-table" style="display: none;">
+      <thead>
+        <tr>
+          <th>Page URL</th>
+          <th>Source Type</th>
+          <th>Password</th>
+          <th>Context</th>
+          <th>Count</th>
+        </tr>
+      </thead>
+      <tbody id="results-body"></tbody>
+    </table>
+  </div>
+
+  <div id="snapshot-overlay">
+    <div id="snapshot-modal">
+      <div id="snapshot-modal-header">
+        <span id="snapshot-modal-title"></span>
+        <button id="snapshot-close" type="button">Close</button>
+      </div>
+      <div id="snapshot-body"></div>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById("crawl-form");
+    const runButton = document.getElementById("run-button");
+    const log = document.getElementById("log");
+    const resultsTable = document.getElementById("results-table");
+    const resultsBody = document.getElementById("results-body");
+    const summaryPanel = document.getElementById("summary-panel");
+    const summaryPagesVisited = document.getElementById("summary-pages-visited");
+    const summaryResourcesChecked = document.getElementById("summary-resources-checked");
+    const summaryPasswordsFound = document.getElementById("summary-passwords-found");
+    const summaryQueueEmpty = document.getElementById("summary-queue-empty");
+    const snapshotOverlay = document.getElementById("snapshot-overlay");
+    const snapshotModalTitle = document.getElementById("snapshot-modal-title");
+    const snapshotBody = document.getElementById("snapshot-body");
+    const snapshotClose = document.getElementById("snapshot-close");
+
+    // Source types with no meaningful text body to search/highlight --
+    // shown as a readable locator + context fallback instead.
+    const NON_TEXT_SOURCE_TYPES = new Set(["image_metadata", "binary"]);
+
+    let currentCrawlId = null;
+    let liveResourcesChecked = 0;
+    let livePasswordValues = new Set();
+
+    function resetSummaryPanel() {
+      liveResourcesChecked = 0;
+      livePasswordValues = new Set();
+      summaryPagesVisited.textContent = "0";
+      summaryResourcesChecked.textContent = "0";
+      summaryPasswordsFound.textContent = "0";
+      summaryQueueEmpty.textContent = "…";
+      summaryPanel.style.display = "grid";
+    }
+
+    // Called once the final CrawlSummary is available (GET /crawls/{id}/report)
+    // -- overwrites the live, WebSocket-driven counters with the
+    // authoritative numbers.
+    function finalizeSummaryPanel(summary) {
+      summaryPagesVisited.textContent = summary.pages_visited;
+      summaryResourcesChecked.textContent = summary.resources_checked;
+      summaryPasswordsFound.textContent = summary.unique_passwords_found;
+      summaryQueueEmpty.textContent = summary.queue_empty ? "Yes" : "No";
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement("div");
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    function renderContextFallback(row) {
+      snapshotBody.innerHTML =
+        '<p id="snapshot-locator"><strong>Locator:</strong> ' + escapeHtml(row.locator) + "</p>" +
+        "<pre>" + escapeHtml(row.context_before) +
+        "<mark>" + escapeHtml(row.value) + "</mark>" +
+        escapeHtml(row.context_after) + "</pre>";
+    }
+
+    function renderSnapshotWithHighlight(content, row) {
+      const index = content.indexOf(row.value);
+      if (index === -1) {
+        renderContextFallback(row);
+        return;
+      }
+      const before = escapeHtml(content.slice(0, index));
+      const matchText = escapeHtml(content.slice(index, index + row.value.length));
+      const after = escapeHtml(content.slice(index + row.value.length));
+      snapshotBody.innerHTML =
+        "<pre>" + before + '<mark id="snapshot-mark">' + matchText + "</mark>" + after + "</pre>";
+      const markEl = document.getElementById("snapshot-mark");
+      if (markEl) {
+        markEl.scrollIntoView({ block: "center" });
+      }
+    }
+
+    async function openSnapshotViewer(row) {
+      snapshotModalTitle.textContent = row.page_url + " (" + row.source_type + ")";
+      snapshotBody.innerHTML = "<p>Loading…</p>";
+      snapshotOverlay.style.display = "flex";
+
+      if (NON_TEXT_SOURCE_TYPES.has(row.source_type)) {
+        renderContextFallback(row);
+        return;
+      }
+
+      let response;
+      try {
+        response = await fetch(
+          "/crawls/" + currentCrawlId + "/snapshot?url=" + encodeURIComponent(row.page_url)
+        );
+      } catch (err) {
+        renderContextFallback(row);
+        return;
+      }
+      if (!response.ok) {
+        renderContextFallback(row);
+        return;
+      }
+      const { content } = await response.json();
+      renderSnapshotWithHighlight(content, row);
+    }
+
+    function closeSnapshotViewer() {
+      snapshotOverlay.style.display = "none";
+    }
+
+    snapshotClose.addEventListener("click", closeSnapshotViewer);
+    snapshotOverlay.addEventListener("click", (event) => {
+      if (event.target === snapshotOverlay) {
+        closeSnapshotViewer();
+      }
+    });
+    window.addEventListener("password-cell-click", (event) => {
+      openSnapshotViewer(event.detail);
+    });
+
+    function appendLog(text) {
+      const line = document.createElement("p");
+      line.textContent = text;
+      log.appendChild(line);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    // Emits a "password-cell-click" event on window with the row's data --
+    // the snapshot viewer above listens for it to jump to the match.
+    function renderResultsTable(matches) {
+      resultsBody.innerHTML = "";
+      for (const row of matches) {
+        const tr = document.createElement("tr");
+
+        const pageCell = document.createElement("td");
+        pageCell.textContent = row.page_url;
+
+        const typeCell = document.createElement("td");
+        typeCell.textContent = row.source_type;
+
+        const passwordCell = document.createElement("td");
+        const passwordButton = document.createElement("button");
+        passwordButton.type = "button";
+        passwordButton.className = "password-cell";
+        passwordButton.textContent = row.value;
+        passwordButton.addEventListener("click", () => {
+          window.dispatchEvent(new CustomEvent("password-cell-click", { detail: row }));
+        });
+        passwordCell.appendChild(passwordButton);
+
+        const contextCell = document.createElement("td");
+        contextCell.textContent = row.context_before + " … " + row.context_after;
+
+        const countCell = document.createElement("td");
+        countCell.textContent = row.count_in_page;
+
+        tr.append(pageCell, typeCell, passwordCell, contextCell, countCell);
+        resultsBody.appendChild(tr);
+      }
+      resultsTable.style.display = matches.length ? "table" : "none";
+    }
+
+    async function loadReport(crawlId) {
+      let response;
+      try {
+        response = await fetch("/crawls/" + crawlId + "/report");
+      } catch (err) {
+        appendLog("Failed to load report: " + err);
+        return;
+      }
+      if (!response.ok) {
+        appendLog("Failed to load report (status " + response.status + ")");
+        return;
+      }
+      const report = await response.json();
+      renderResultsTable(report.matches);
+      finalizeSummaryPanel(report.summary);
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      runButton.disabled = true;
+      log.innerHTML = "";
+      resultsBody.innerHTML = "";
+      resultsTable.style.display = "none";
+      closeSnapshotViewer();
+      resetSummaryPanel();
+      appendLog("Starting crawl...");
+
+      const body = {
+        url: document.getElementById("url").value,
+        username: document.getElementById("username").value,
+        password: document.getElementById("password").value,
+        context_chars: Number(document.getElementById("context_chars").value || 80),
+      };
+
+      let response;
+      try {
+        response = await fetch("/crawls", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      } catch (err) {
+        appendLog("Failed to start crawl: " + err);
+        runButton.disabled = false;
+        return;
+      }
+
+      if (!response.ok) {
+        appendLog("Failed to start crawl (status " + response.status + ")");
+        runButton.disabled = false;
+        return;
+      }
+
+      const { crawl_id } = await response.json();
+      currentCrawlId = crawl_id;
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const socket = new WebSocket(protocol + "//" + window.location.host + "/ws/crawls/" + crawl_id);
+
+      socket.addEventListener("message", (event) => {
+        const message = JSON.parse(event.data);
+        if (message.type === "page_fetched") {
+          appendLog("Fetched " + message.payload.url + " (" + message.payload.status_code + ")");
+          liveResourcesChecked += 1;
+          summaryResourcesChecked.textContent = liveResourcesChecked;
+        } else if (message.type === "match_found") {
+          appendLog("Password found at " + message.payload.source_url);
+          livePasswordValues.add(message.payload.value);
+          summaryPasswordsFound.textContent = livePasswordValues.size;
+        } else if (message.type === "crawl_finished") {
+          appendLog("Crawl finished.");
+          runButton.disabled = false;
+          socket.close();
+          loadReport(crawl_id);
+        }
+      });
+
+      socket.addEventListener("error", () => {
+        appendLog("WebSocket error.");
+        runButton.disabled = false;
+      });
+    });
+  </script>
+</body>
+</html>
