@@ -73,14 +73,23 @@ FetchResult / BrowserFetchResult
                 └── PageResult                  app/models.py
                     (url, status_code, fetched_at, matches[])
                     │
-                    └── CrawlSummary            app/models.py
-                        (pages_visited, resources_checked, unique_passwords_found, ...)
+                    └── Repository / SqliteRepository   app/storage/
+                        (save_page(page, snapshot) persists the page row + its
+                         matches + a raw content snapshot; save_match() persists
+                         a standalone match with no page/snapshot, e.g. from
+                         HeaderCookieExtractor; durable SQLite *.db, gitignored)
                         │
-                        ├── Storage (planned)    app/storage/
-                        │   (SQLite repository -- durable store, gitignored *.db)
+                        ├── get_snapshot(url)     raw bytes back out, for the
+                        │                         (planned) UI's "jump to
+                        │                         location" viewer
+                        │
+                        ├── get_report()          app/models.py CrawlSummary
+                        │   (pages_visited, resources_checked, unique_passwords_found,
+                        │    started_at/finished_at -- aggregated from stored rows)
                         │
                         └── API (planned)        app/api/
-                            (REST + WebSocket -- surfaces results to the UI)
+                            (REST + WebSocket -- surfaces get_report()/
+                             get_snapshot() to the UI)
 ```
 
 Sensitive edges to keep an eye on: `Settings` → both fetchers (Basic Auth
@@ -333,3 +342,32 @@ becomes the durable/exposed copy of that secret).
   Nothing in any of them logs, persists, or transmits a match -- they all
   return plain in-memory values up the call stack, which is where the
   still-`(planned)` storage/API layer picks up responsibility next.
+
+## Issue #14: Repository interface + SQLite implementation
+
+- **Inputs:** a `PageResult` plus its raw content `snapshot` (`bytes`), for
+  `save_page()`; a standalone `PasswordMatch`, for `save_match()` (used
+  when there's no full page/snapshot to attach it to -- e.g. a match from
+  `HeaderCookieExtractor`, issue #11). `get_snapshot(url)` and `get_report()`
+  take no crawl data as input; they read back what's already stored.
+- **Transformation:** `app/storage/repository.py` defines the `Repository`
+  ABC (`save_page`, `save_match`, `get_report`, `get_snapshot`).
+  `app/storage/sqlite.py`'s `SqliteRepository` implements it against a
+  `sqlite3.Connection`, creating its schema (`pages`, `matches`,
+  `snapshots` tables) on first use if not already present. `save_page()`
+  upserts the page row, upserts its raw content into `snapshots`, and
+  inserts a `matches` row for every match in `page.matches` -- all in one
+  transaction. `get_report()` aggregates `CrawlSummary` fields from stored
+  rows (`pages_visited`/`resources_checked` from the page count,
+  `unique_passwords_found` from `COUNT(DISTINCT value)`,
+  `started_at`/`finished_at` from `MIN`/`MAX(fetched_at)`); `queue_empty`
+  and the pages-vs-resources distinction are placeholders (`True` / same
+  count) until the orchestrator (issue #15) tracks real frontier state.
+- **Outputs:** durable rows in a SQLite `*.db` file (gitignored per issue
+  #1). **Data-flow note:** this is the durable store the project's
+  data-flow watchlist has been anticipating since issue #1 -- every
+  `PasswordMatch.value`/`context_before`/`context_after` and every raw
+  page/resource `snapshot` (which can contain secrets beyond the matched
+  one) now persists to disk. Nothing here adds logging, telemetry, or any
+  network call; the database is the only sink. This is exactly the file
+  operators must keep secured and out of version control.
