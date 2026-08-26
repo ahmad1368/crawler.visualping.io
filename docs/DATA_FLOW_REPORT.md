@@ -11,17 +11,26 @@ Updated as each issue lands. Nodes marked `(planned)` don't exist in code
 yet -- they show where today's outputs are headed.
 
 ```
-.env / environment variables
-└── Settings                                    app/settings.py
-    (TARGET_URL, AUTH_USERNAME, AUTH_PASSWORD, CONTEXT_CHARS, CONCURRENCY, MAX_PAGES)
+POST /crawls (CrawlRequest: url, username, password, context_chars)
+app/api/routes.py -- validated by pydantic (HttpUrl, non-empty credentials);
+returns {crawl_id} immediately, runs the crawl in a FastAPI BackgroundTask.
+(`Settings`, app/settings.py issue #2, still exists for a future non-API
+entry point, but the REST API takes url/credentials per request instead --
+it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
+│
+└── _build_orchestrator(request)                app/api/routes.py
+    (constructs a fresh httpx.AsyncClient + Playwright browser +
+     ExtractorRegistry + HeaderCookieExtractor + a per-crawl
+     SqliteRepository -- the single seam integration tests replace with a
+     fake Orchestrator, per issue #17's acceptance criteria)
     │
     └── Orchestrator.run()                      app/crawler/orchestrator.py
         (asyncio.Semaphore(concurrency)-bounded workers pop from the
          frontier until max_pages resources are checked or it's empty)
         │
         ├── UrlFrontier                          app/crawler/frontier.py
-        │   (queue + visited-set seeded from TARGET_URL; normalizes URLs,
-        │    same-origin filter, dedupe prevents cyclic-link loops)
+        │   (queue + visited-set seeded from the request URL; normalizes
+        │    URLs, same-origin filter, dedupe prevents cyclic-link loops)
         │
         └── per URL popped: HttpFetcher.fetch(url)   app/crawler/fetcher.py
             (httpx.AsyncClient + Basic Auth, retry/backoff)
@@ -47,19 +56,26 @@ yet -- they show where today's outputs are headed.
                     app/models.py
                     │
                     └── Repository.save_page(page, snapshot=content)
-                        app/storage/ (SqliteRepository -- durable *.db,
-                        gitignored)
+                        app/storage/ (SqliteRepository -- one *.db file per
+                        crawl_id, durable, gitignored)
                         │
                         ├── get_snapshot(url)     raw bytes back out, for
                         │                         the (planned) UI's "jump
                         │                         to location" viewer
                         │
-                        └── get_report()          CrawlSummary aggregated
-                            from all stored rows (DB-wide, separate from
-                            the CrawlSummary Orchestrator.run() returns for
-                            just the current run)
+                        └── Orchestrator.run()'s return value -> CrawlSummary
+                            for just this run, held in memory as
+                            _crawls[crawl_id].report
                             │
-                            └── API (planned)     app/api/ (REST + WebSocket)
+                            └── GET /crawls/{id}/report   app/api/routes.py
+                                (returns the in-memory report once
+                                finished; 409 while running, 500 if the
+                                crawl failed -- NOT the same as
+                                Repository.get_report(), a separate,
+                                DB-wide aggregate this endpoint doesn't use)
+
+GET /crawls/{id}/status -> in-memory _crawls[id].status (running/finished/failed)
+WebSocket endpoint (planned)                   app/api/ (issue #18)
 ```
 
 `EventBus` (`app/events.py`, issue #16) is a standalone `subscribe()`/
@@ -406,3 +422,38 @@ becomes the durable/exposed copy of that secret).
   WebSocket broadcaster relaying to the local operator's own UI, but any
   future subscriber added to this bus should be checked against the
   data-flow watchlist the same as the storage/API layers are.
+
+## Issue #17: REST endpoints (start crawl, get status, get report)
+
+- **Inputs:** `POST /crawls` takes a `CrawlRequest` body -- `url`
+  (pydantic `HttpUrl`, so a malformed URL is rejected with 422),
+  `username`/`password` (`Field(min_length=1)`, so empty credentials are
+  rejected), and `context_chars`. This is the first point Basic Auth
+  credentials enter the system from an untrusted HTTP client rather than a
+  local `.env` file.
+- **Transformation:** `app/api/routes.py`'s `start_crawl()` generates a
+  `crawl_id`, records `_CrawlState(status=RUNNING)` in an in-memory dict,
+  and schedules `_run_crawl()` as a `BackgroundTasks` job -- the endpoint
+  returns `{crawl_id}` immediately (202) without waiting for the crawl.
+  `_run_crawl()` calls `_build_orchestrator()`, which wires a real
+  `httpx.AsyncClient`, a real Playwright browser, the four registry
+  extractors, `HeaderCookieExtractor`, and a **new `SqliteRepository` per
+  crawl** (`crawl_<uuid>.db`) into an `Orchestrator`, then awaits
+  `orchestrator.run()`. `_build_orchestrator()` is the single seam the
+  integration tests replace with a fake orchestrator, per this issue's
+  acceptance criteria -- no test launches a real browser or hits the
+  network. `GET /crawls/{id}/status` and `GET /crawls/{id}/report` just
+  read the in-memory `_CrawlState` (404 if unknown, 409 if still running,
+  500 if it failed).
+- **Outputs:** the `{crawl_id}` and status responses never echo the
+  request's `username`/`password` back. The `CrawlSummary` report exposes
+  aggregate counts only (`pages_visited`, `unique_passwords_found`, etc.) --
+  not the `PasswordMatch` values themselves; those stay in the per-crawl
+  SQLite file. **Data-flow notes:** (1) credentials now arrive over HTTP
+  from whoever can reach this API, not just from a trusted local `.env` --
+  this API has no auth/rate-limiting of its own, so it should only be
+  exposed to trusted operators/networks. (2) Every crawl now creates its
+  own `crawl_<uuid>.db` file on disk (matched by the existing `*.db`
+  gitignore pattern) that is never cleaned up by this issue -- an operator
+  running many crawls will accumulate one durable snapshot/match database
+  per crawl indefinitely; worth a retention/cleanup policy in a later issue.
