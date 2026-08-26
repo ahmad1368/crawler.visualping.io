@@ -175,3 +175,107 @@ def test_fetch_raises_after_exhausting_retries_on_persistent_timeout():
         pass
 
     assert calls["count"] == 2
+
+
+def test_fetch_follows_a_redirect_on_a_clean_path():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/docs":
+            return httpx.Response(301, headers={"location": "/docs/index"})
+        return httpx.Response(200, content=b"real docs content")
+
+    async def scenario():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            fetcher = HttpFetcher(client, username="alice", password="s3cret")
+            return await fetcher.fetch("https://example.com/docs")
+        finally:
+            await client.aclose()
+
+    result = run(scenario())
+
+    assert result.content == b"real docs content"
+    assert result.status_code == 200
+
+
+def test_fetch_follows_a_redirect_on_a_url_with_a_query_string():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/report" and request.url.params.get("page") == "1":
+            return httpx.Response(301, headers={"location": "/report/1"})
+        return httpx.Response(200, content=b"report page 1 content")
+
+    async def scenario():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            fetcher = HttpFetcher(client, username="alice", password="s3cret")
+            return await fetcher.fetch("https://example.com/report?page=1")
+        finally:
+            await client.aclose()
+
+    result = run(scenario())
+
+    assert result.content == b"report page 1 content"
+    assert result.status_code == 200
+
+
+def test_fetch_raises_transient_error_on_redirect_loop_without_hanging():
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        target = "/b" if request.url.path == "/a" else "/a"
+        return httpx.Response(302, headers={"location": target})
+
+    async def scenario():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            fetcher = HttpFetcher(
+                client,
+                username="alice",
+                password="s3cret",
+                max_retries=1,
+                backoff_factor=0.001,
+            )
+            await fetcher.fetch("https://example.com/a")
+        finally:
+            await client.aclose()
+
+    try:
+        run(asyncio.wait_for(scenario(), timeout=5))
+        assert False, "expected TransientFetchError"
+    except TransientFetchError:
+        pass
+
+    assert calls["count"] > 0
+
+
+def test_fetch_reuses_a_session_cookie_across_requests():
+    # One AsyncClient is created per crawl (app/api/routes.py) and reused for
+    # every HttpFetcher.fetch() call -- issue #63 item 7 asks us to confirm
+    # httpx's own cookie jar on that shared client carries a session cookie
+    # set on an early request into the Cookie header of later ones, since a
+    # site gating real content behind a session (e.g. after a login-style
+    # redirect) would otherwise look logged-out on every request after the
+    # first.
+    received_cookie = {"value": None}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/login":
+            return httpx.Response(
+                200, content=b"logged in", headers={"set-cookie": "session=abc123"}
+            )
+        received_cookie["value"] = request.headers.get("cookie")
+        return httpx.Response(200, content=b"secret content")
+
+    async def scenario():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            fetcher = HttpFetcher(client, username="alice", password="s3cret")
+            await fetcher.fetch("https://example.com/login")
+            return await fetcher.fetch("https://example.com/dashboard")
+        finally:
+            await client.aclose()
+
+    result = run(scenario())
+
+    assert received_cookie["value"] == "session=abc123"
+    assert result.content == b"secret content"

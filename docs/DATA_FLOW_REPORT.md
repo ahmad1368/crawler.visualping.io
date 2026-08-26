@@ -933,3 +933,116 @@ concrete gaps. Fixed in the order listed.
   reached well under 1000. This requires the real target's URL and Basic
   Auth credentials, which weren't available in this session -- flagged to
   the user to run and report back, rather than fabricated here.
+
+## Issue #63: comprehensive fixes after #61 still only found 1/8 real passwords
+
+Filed immediately after #61 merged, citing a second diagnostic crawl
+against the same real target that still only surfaced 1 of 8 known
+passwords, with 9 concrete items. This section covers the items fixable
+without the real target itself; items requiring a live re-crawl are
+called out explicitly, not fabricated.
+
+- **Inputs/Transformation, per fix:**
+  1. **[BLOCKING] `HttpFetcher` never followed redirects:** reversed a
+     deliberate decision from issue #24 (made speculatively, "nothing
+     here could chase a redirect loop") that #63 shows was wrong in
+     practice -- most of the target's real content sits behind a 301/302,
+     and redirects on URLs carrying a query string specifically were
+     never being resolved at all. `app/crawler/fetcher.py`'s
+     `HttpFetcher.fetch()` now calls `self._client.get(url, ...,
+     follow_redirects=True)` and widened its retry-catch from
+     `(httpx.TimeoutException, httpx.TransportError)` to the common base
+     `httpx.RequestError`, which also covers `httpx.TooManyRedirects` --
+     a redirect loop now surfaces as the same `TransientFetchError` any
+     other transient failure does, after httpx's own internal hop limit,
+     rather than hanging. Covered by three new tests in
+     `tests/test_fetcher.py`: a clean-path redirect, a redirect on a URL
+     with a query string (the exact reported bug), and a redirect loop
+     proven to terminate via `asyncio.wait_for(..., timeout=5)`.
+  5. **Query-param dedup switched from denylist to allowlist:** #61's
+     `_TRACKING_PARAMS` denylist (11 named params) is replaced in
+     `app/crawler/frontier.py` by `_IGNORED_QUERY_PARAMS = {"ref",
+     "utm_source", "v", "hl"}` -- a much smaller explicit allowlist, per
+     #63's instruction that guessing at a denylist is unsafe by default
+     (a real, content-distinguishing param the denylist didn't know about
+     gets silently collapsed and its content lost). Any query param not
+     on the allowlist is now kept as URL-distinguishing by default
+     (including `page`, and former denylist entries like `utm_campaign`/
+     `fbclid`), and a `logging.getLogger(__name__).debug(...)` call
+     records which unrecognized param triggered that decision -- silent
+     by default, visible when an operator enables verbose logging to
+     audit the choice. `tests/test_frontier.py` renamed/extended
+     accordingly, including new tests proving `?page=1`/`?page=2` no
+     longer collapse and formerly-denylisted params no longer strip.
+  6. **Pagination trap defense:** the same diagnostic crawl found a
+     `?page=N` family running past 500 pages against the real target with
+     no end in sight -- indistinguishable from a deliberate crawl-budget
+     trap, and now that fix #5 stops collapsing `page` values, such a
+     family can enqueue unboundedly. New module
+     `app/crawler/pagination_guard.py` adds `PaginationGuard`: it
+     recognizes a URL as belonging to a pagination family only when it
+     has exactly one, purely-numeric query param (`pagination_family_key`
+     returns e.g. `"/report?page"`), tracks a per-family streak of
+     consecutive pages that yielded neither a new frontier link nor a new
+     password match, and stops enqueuing further URLs in that family once
+     the streak hits `max_unproductive` (default 10, tunable via
+     `Orchestrator(pagination_family_limit=...)`) -- logging why at
+     `INFO`. Wired into `app/crawler/orchestrator.py`: `worker()` skips a
+     URL the guard has already stopped, and `_process_url()` calls
+     `guard.record(url, new_links=..., new_matches=...)` using the actual
+     count of newly-enqueued links and matches found on that page. Covered
+     by 9 unit tests in `tests/test_pagination_guard.py` plus an
+     orchestrator-level integration test proving a runaway 50-page family
+     is cut off after 3 unproductive pages while real content elsewhere
+     in the same crawl is still found.
+  7. **Cookie/session reuse across requests (confirmed, no code change):**
+     `_build_orchestrator()` in `app/api/routes.py` already creates
+     exactly one `httpx.AsyncClient()` per crawl and injects it into a
+     single `HttpFetcher` instance reused for every `fetch()` call, so
+     httpx's own client-level cookie jar already persists a `Set-Cookie`
+     from an early response into the `Cookie` header of later requests on
+     that same client -- no per-request client was ever being created.
+     Added a regression test,
+     `test_fetch_reuses_a_session_cookie_across_requests` in
+     `tests/test_fetcher.py`, to lock this behavior in rather than leave
+     it as an unverified assumption about httpx's defaults.
+  8. **Browser fetcher networkidle/rendered-DOM/network-capture (confirmed,
+     no code change):** re-read `app/crawler/browser_fetcher.py` against
+     all three of #63's criteria: `page.goto(url, wait_until="networkidle")`
+     already waits for network idle before extracting anything;
+     `page.eval_on_selector_all("a[href]", ...)` already reads the
+     rendered DOM post-JS-execution, not raw HTML source; and
+     `page.on("request", ...)`/`page.on("response", ...)` listeners
+     already capture every network request and response URL seen during
+     the page load into `network_urls`, which the orchestrator already
+     feeds into `UrlFrontier.add_many()` alongside `dom_links`. This
+     confirms the behavior #63 asked for was already correct since issue
+     #5 -- no gap found.
+  9. **`MAX_PAGES` re-evaluation:** left at 1000 (already raised in #61).
+     Not changed further here -- see Not verified below.
+- **Outputs:** no new persisted data shape. `PasswordMatch`/`CrawlSummary`
+  are unaffected; these are crawl-completeness and dedup-correctness
+  fixes.
+  **Data-flow/security note (per the data-flow watchlist):** fix #1
+  means `HttpFetcher` now follows redirects while still attaching
+  `httpx.BasicAuth` via the `auth=` parameter on every `.get()` call.
+  httpx re-derives whether to (re-)send `Authorization` on each hop from
+  the request/response pair rather than blindly repeating the original
+  header, and strips it on a cross-origin redirect (a redirect to a
+  different host) -- so Basic Auth creds are not leaked to a third-party
+  host purely as a side effect of this change. They are still sent to
+  same-host redirect targets, same as any other same-origin request this
+  fetcher already made before #63. No new sensitive column, credential
+  path, or outbound destination was introduced by fixes #5/#6/#7/#8.
+  **Not verified against the real target (flagged, not fabricated):**
+  - Item 1's own acceptance criterion, and item 9, both ask to re-run a
+    full crawl against the real target post-fix and record how many of
+    the 8 known passwords are now found, and whether `MAX_PAGES` needs
+    further adjustment. Requires the real target's URL and Basic Auth
+    credentials, not available in this session.
+  - Item 6's guidance to "review real pagination content and decide if
+    it's worth crawling fully" needs an actual sample of that content,
+    which likewise requires the real target.
+  - Item 8's confirmation is based on re-reading the existing
+    implementation and its existing test coverage; it was not re-verified
+    by driving a real browser against the real target's JS.

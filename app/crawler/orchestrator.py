@@ -18,7 +18,10 @@ already has a page for (from a previous, crashed run against the same
 database) is marked visited on the frontier so it isn't re-fetched. A
 single URL's processing failing (e.g. a genuine HTTP redirect loop that
 makes the browser fetcher's navigation fail) is caught and skipped rather
-than aborting or hanging the whole crawl.
+than aborting or hanging the whole crawl. A `PaginationGuard` stops
+following a `?page=N`-style URL family once it's gone several consecutive
+pages with no new links or matches, so a runaway/trap pagination family
+can't burn the entire `max_pages` budget on its own.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from datetime import datetime, timezone
 from app.crawler.browser_fetcher import BrowserFetcher
 from app.crawler.fetcher import HttpFetcher
 from app.crawler.frontier import UrlFrontier
+from app.crawler.pagination_guard import PaginationGuard
 from app.events import CRAWL_FINISHED, MATCH_FOUND, PAGE_FETCHED, EventBus
 from app.extractors.base import ExtractorRegistry
 from app.extractors.headers_cookies import HeaderCookieExtractor
@@ -47,6 +51,7 @@ class Orchestrator:
         repository: Repository,
         concurrency: int = 4,
         max_pages: int = 1000,
+        pagination_family_limit: int = 10,
         event_bus: EventBus | None = None,
     ) -> None:
         self._frontier = frontier
@@ -57,6 +62,7 @@ class Orchestrator:
         self._repository = repository
         self._concurrency = concurrency
         self._max_pages = max_pages
+        self._pagination_guard = PaginationGuard(max_unproductive=pagination_family_limit)
         self._event_bus = event_bus
 
     async def run(self) -> CrawlSummary:
@@ -77,6 +83,8 @@ class Orchestrator:
                     if not self._frontier.has_next():
                         return
                     url = self._frontier.next()
+                    if self._pagination_guard.is_stopped(url):
+                        continue
 
                 async with semaphore:
                     try:
@@ -118,10 +126,13 @@ class Orchestrator:
         )
 
         is_html = content_type.startswith("text/html")
+        new_links = 0
         if is_html:
             browser_result = await self._browser_fetcher.fetch(url)
-            self._frontier.add_many(browser_result.dom_links)
-            self._frontier.add_many(browser_result.network_urls)
+            new_links += self._frontier.add_many(browser_result.dom_links)
+            new_links += self._frontier.add_many(browser_result.network_urls)
+
+        self._pagination_guard.record(url, new_links=new_links, new_matches=len(matches))
 
         page = PageResult(
             url=url,
