@@ -21,18 +21,36 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+HTML_MATCH_VALUE = "VISUALPING{abcdef1234567890}"
+EXIF_MATCH_VALUE = "VISUALPING{0123456789abcdef}"
+PAGE_SNAPSHOT = "<html><body>the secret is VISUALPING{abcdef1234567890} right there</body></html>"
+
+
 class _FakeRepository:
     def get_matches(self):
         return [
             PasswordMatch(
-                value="VISUALPING{abcdef1234567890}",
+                value=HTML_MATCH_VALUE,
                 source_type=SourceType.HTML_TEXT,
                 source_url="https://example.com",
                 context_before="secret is ",
                 context_after=" for now",
                 locator="line:1,col:0",
-            )
+            ),
+            PasswordMatch(
+                value=EXIF_MATCH_VALUE,
+                source_type=SourceType.IMAGE_METADATA,
+                source_url="https://example.com/photo.jpg",
+                context_before="note: ",
+                context_after=" -end",
+                locator="exif:UserComment",
+            ),
         ]
+
+    def get_snapshot(self, url):
+        if url == "https://example.com":
+            return PAGE_SNAPSHOT.encode()
+        return None
 
 
 class _FakeOrchestrator:
@@ -136,21 +154,37 @@ def test_run_button_disables_during_crawl_and_log_updates_live(live_server):
             final_lines = page.locator("#log p").all_inner_texts()
             assert any("Crawl finished" in line for line in final_lines)
 
-            page.wait_for_selector("#results-table tbody tr")
-            row = page.locator("#results-table tbody tr").first
-            assert row.locator("td").nth(0).inner_text() == "https://example.com"
-            assert row.locator("td").nth(1).inner_text() == "html_text"
-            password_button = row.locator("button.password-cell")
-            assert password_button.inner_text() == "VISUALPING{abcdef1234567890}"
-            assert row.locator("td").nth(4).inner_text() == "1"
+            page.wait_for_function("document.querySelectorAll('#results-table tbody tr').length >= 2")
+            rows = page.locator("#results-table tbody tr")
+            html_row = rows.filter(has_text="html_text")
+            exif_row = rows.filter(has_text="image_metadata")
 
-            page.evaluate(
-                "window.__clickedRow = null;"
-                "window.addEventListener('password-cell-click', "
-                "(e) => { window.__clickedRow = e.detail; });"
+            html_password_button = html_row.locator("button.password-cell")
+            assert html_password_button.inner_text() == HTML_MATCH_VALUE
+            assert html_row.locator("td").nth(4).inner_text() == "1"
+
+            # html_text: opens the real snapshot, highlights the match, and
+            # scrolls it into view.
+            html_password_button.click()
+            page.wait_for_selector("#snapshot-overlay[style*='flex']")
+            mark = page.locator("#snapshot-body mark#snapshot-mark")
+            page.wait_for_function(
+                "document.querySelector('#snapshot-body mark#snapshot-mark') !== null"
             )
-            password_button.click()
-            clicked_page_url = page.evaluate("window.__clickedRow.page_url")
-            assert clicked_page_url == "https://example.com"
+            assert mark.inner_text() == HTML_MATCH_VALUE
+            assert HTML_MATCH_VALUE in page.locator("#snapshot-body pre").inner_text()
+
+            page.click("#snapshot-close")
+            page.wait_for_selector("#snapshot-overlay", state="hidden")
+
+            # image_metadata: non-text source, shows the locator + context
+            # fallback instead of trying to fetch/scroll a snapshot.
+            exif_password_button = exif_row.locator("button.password-cell")
+            assert exif_password_button.inner_text() == EXIF_MATCH_VALUE
+            exif_password_button.click()
+            page.wait_for_selector("#snapshot-locator")
+            assert "exif:UserComment" in page.locator("#snapshot-locator").inner_text()
+            fallback_mark = page.locator("#snapshot-body mark")
+            assert fallback_mark.inner_text() == EXIF_MATCH_VALUE
         finally:
             browser.close()

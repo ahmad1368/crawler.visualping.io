@@ -26,3 +26,4 @@ _Full documentation will be filled in by the docs issue._
 - **#18** `WS /ws/crawls/{id}`: streams live crawl progress events as JSON, closing cleanly when the crawl finishes.
 - **#19** Web UI (`GET /`): Visualping-branded input form + Run button + live progress log, wired to the REST/WebSocket API.
 - **#20** Results table: renders `GET /crawls/{id}/report`'s matches (page, source type, password, context, count), with a clickable password cell.
+- **#21** Snapshot viewer: clicking a password opens the raw page/resource with the match highlighted and scrolled into view (locator fallback for EXIF/binary).

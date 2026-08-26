@@ -104,6 +104,70 @@
     background: var(--accent);
     color: #fff;
   }
+  #snapshot-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    align-items: center;
+    justify-content: center;
+    z-index: 10;
+  }
+  #snapshot-modal {
+    background: #fff;
+    border-radius: 12px;
+    max-width: 720px;
+    width: 90%;
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+  }
+  #snapshot-modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+  }
+  #snapshot-modal-title {
+    font-size: 0.9rem;
+    font-weight: 600;
+    word-break: break-all;
+    margin-right: 1rem;
+  }
+  #snapshot-close {
+    margin: 0;
+    padding: 0.2rem 0.6rem;
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  #snapshot-close:hover {
+    background: #f0f0f0;
+    color: var(--text);
+  }
+  #snapshot-body {
+    padding: 1rem 1.25rem;
+    overflow: auto;
+  }
+  #snapshot-body pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.8rem;
+    margin: 0;
+  }
+  #snapshot-body mark {
+    background: var(--accent);
+    color: #fff;
+    border-radius: 3px;
+    padding: 0 0.1rem;
+  }
+  #snapshot-locator {
+    font-size: 0.85rem;
+    margin: 0 0 0.75rem 0;
+  }
 </style>
 </head>
 <body>
@@ -139,12 +203,104 @@
     </table>
   </div>
 
+  <div id="snapshot-overlay">
+    <div id="snapshot-modal">
+      <div id="snapshot-modal-header">
+        <span id="snapshot-modal-title"></span>
+        <button id="snapshot-close" type="button">Close</button>
+      </div>
+      <div id="snapshot-body"></div>
+    </div>
+  </div>
+
   <script>
     const form = document.getElementById("crawl-form");
     const runButton = document.getElementById("run-button");
     const log = document.getElementById("log");
     const resultsTable = document.getElementById("results-table");
     const resultsBody = document.getElementById("results-body");
+    const snapshotOverlay = document.getElementById("snapshot-overlay");
+    const snapshotModalTitle = document.getElementById("snapshot-modal-title");
+    const snapshotBody = document.getElementById("snapshot-body");
+    const snapshotClose = document.getElementById("snapshot-close");
+
+    // Source types with no meaningful text body to search/highlight --
+    // shown as a readable locator + context fallback instead.
+    const NON_TEXT_SOURCE_TYPES = new Set(["image_metadata", "binary"]);
+
+    let currentCrawlId = null;
+
+    function escapeHtml(text) {
+      const div = document.createElement("div");
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    function renderContextFallback(row) {
+      snapshotBody.innerHTML =
+        '<p id="snapshot-locator"><strong>Locator:</strong> ' + escapeHtml(row.locator) + "</p>" +
+        "<pre>" + escapeHtml(row.context_before) +
+        "<mark>" + escapeHtml(row.value) + "</mark>" +
+        escapeHtml(row.context_after) + "</pre>";
+    }
+
+    function renderSnapshotWithHighlight(content, row) {
+      const index = content.indexOf(row.value);
+      if (index === -1) {
+        renderContextFallback(row);
+        return;
+      }
+      const before = escapeHtml(content.slice(0, index));
+      const matchText = escapeHtml(content.slice(index, index + row.value.length));
+      const after = escapeHtml(content.slice(index + row.value.length));
+      snapshotBody.innerHTML =
+        "<pre>" + before + '<mark id="snapshot-mark">' + matchText + "</mark>" + after + "</pre>";
+      const markEl = document.getElementById("snapshot-mark");
+      if (markEl) {
+        markEl.scrollIntoView({ block: "center" });
+      }
+    }
+
+    async function openSnapshotViewer(row) {
+      snapshotModalTitle.textContent = row.page_url + " (" + row.source_type + ")";
+      snapshotBody.innerHTML = "<p>Loading…</p>";
+      snapshotOverlay.style.display = "flex";
+
+      if (NON_TEXT_SOURCE_TYPES.has(row.source_type)) {
+        renderContextFallback(row);
+        return;
+      }
+
+      let response;
+      try {
+        response = await fetch(
+          "/crawls/" + currentCrawlId + "/snapshot?url=" + encodeURIComponent(row.page_url)
+        );
+      } catch (err) {
+        renderContextFallback(row);
+        return;
+      }
+      if (!response.ok) {
+        renderContextFallback(row);
+        return;
+      }
+      const { content } = await response.json();
+      renderSnapshotWithHighlight(content, row);
+    }
+
+    function closeSnapshotViewer() {
+      snapshotOverlay.style.display = "none";
+    }
+
+    snapshotClose.addEventListener("click", closeSnapshotViewer);
+    snapshotOverlay.addEventListener("click", (event) => {
+      if (event.target === snapshotOverlay) {
+        closeSnapshotViewer();
+      }
+    });
+    window.addEventListener("password-cell-click", (event) => {
+      openSnapshotViewer(event.detail);
+    });
 
     function appendLog(text) {
       const line = document.createElement("p");
@@ -154,7 +310,7 @@
     }
 
     // Emits a "password-cell-click" event on window with the row's data --
-    // the snapshot viewer (issue #21) hooks into this to jump to the match.
+    // the snapshot viewer above listens for it to jump to the match.
     function renderResultsTable(matches) {
       resultsBody.innerHTML = "";
       for (const row of matches) {
@@ -210,6 +366,7 @@
       log.innerHTML = "";
       resultsBody.innerHTML = "";
       resultsTable.style.display = "none";
+      closeSnapshotViewer();
       appendLog("Starting crawl...");
 
       const body = {
@@ -239,6 +396,7 @@
       }
 
       const { crawl_id } = await response.json();
+      currentCrawlId = crawl_id;
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const socket = new WebSocket(protocol + "//" + window.location.host + "/ws/crawls/" + crawl_id);
 

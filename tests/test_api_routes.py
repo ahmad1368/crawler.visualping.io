@@ -36,8 +36,14 @@ class FakeOrchestrator:
 
 
 class FakeRepository:
+    def __init__(self, snapshots=None):
+        self._snapshots = snapshots or {}
+
     def get_matches(self):
         return []
+
+    def get_snapshot(self, url):
+        return self._snapshots.get(url)
 
 
 def _patch_orchestrator(monkeypatch, summary=None, error=None):
@@ -175,3 +181,46 @@ def test_failed_crawl_status_and_report(monkeypatch, client):
 
     report_response = client.get(f"/crawls/{crawl_id}/report")
     assert report_response.status_code == 500
+
+
+def test_get_snapshot_returns_decoded_content(monkeypatch, client):
+    async def fake_build_orchestrator(request, event_bus):
+        async def cleanup():
+            return None
+
+        repository = FakeRepository(snapshots={"https://example.com/page": b"<html>hi</html>"})
+        return FakeOrchestrator(summary=CANNED_SUMMARY), repository, cleanup
+
+    monkeypatch.setattr(routes, "_build_orchestrator", fake_build_orchestrator)
+
+    response = client.post("/crawls", json=VALID_BODY)
+    crawl_id = response.json()["crawl_id"]
+
+    snapshot_response = client.get(
+        f"/crawls/{crawl_id}/snapshot", params={"url": "https://example.com/page"}
+    )
+
+    assert snapshot_response.status_code == 200
+    assert snapshot_response.json() == {
+        "url": "https://example.com/page",
+        "content": "<html>hi</html>",
+    }
+
+
+def test_get_snapshot_returns_404_when_not_found(monkeypatch, client):
+    _patch_orchestrator(monkeypatch, summary=CANNED_SUMMARY)
+
+    response = client.post("/crawls", json=VALID_BODY)
+    crawl_id = response.json()["crawl_id"]
+
+    snapshot_response = client.get(
+        f"/crawls/{crawl_id}/snapshot", params={"url": "https://example.com/missing"}
+    )
+
+    assert snapshot_response.status_code == 404
+
+
+def test_get_snapshot_for_unknown_crawl_returns_404(client):
+    response = client.get("/crawls/does-not-exist/snapshot", params={"url": "https://example.com"})
+
+    assert response.status_code == 404

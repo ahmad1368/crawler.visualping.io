@@ -15,13 +15,16 @@ Browser: GET /                                app/api/routes.py + app/static/ind
 (operator fills in url/username/password/context_chars in an HTML form)
 │
 └── JS: fetch POST /crawls, then WebSocket /ws/crawls/{id}, then
-    fetch GET /crawls/{id}/report on crawl_finished
+    fetch GET /crawls/{id}/report on crawl_finished, then (on a password
+    cell click) fetch GET /crawls/{id}/snapshot?url=...
     app/static/index.html -- credentials leave the browser only in the
     POST body (JSON over the page's own origin); the Run button is
     disabled from click until a crawl_finished message arrives; the
     report's `matches` render into a results table with a clickable
-    password cell (dispatches a "password-cell-click" DOM event -- the
-    hook the (planned) snapshot viewer, issue #21, will use)
+    password cell (dispatches a "password-cell-click" DOM event) that
+    opens a modal showing the raw snapshot with the match `<mark>`ed and
+    scrolled into view -- or, for image_metadata/binary, a locator +
+    context fallback instead of trying to search a non-text body
 
 POST /crawls (CrawlRequest: url, username, password, context_chars)
 app/api/routes.py -- validated by pydantic (HttpUrl, non-empty credentials);
@@ -71,9 +74,13 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
                     │   app/storage/ (SqliteRepository -- one *.db file per
                     │   crawl_id, durable, gitignored)
                     │   │
-                    │   ├── get_snapshot(url)     raw bytes back out, for
-                    │   │                         the (planned) UI's "jump
-                    │   │                         to location" viewer
+                    │   ├── get_snapshot(url)     raw bytes back out
+                    │   │   │
+                    │   │   └── GET /crawls/{id}/snapshot?url=...
+                    │   │       app/api/routes.py (issue #21) -- decodes as
+                    │   │       utf-8 (errors="replace") and returns the
+                    │   │       full raw page/resource content to the UI's
+                    │   │       "jump to location" snapshot viewer
                     │   │
                     │   ├── get_matches()          every stored PasswordMatch,
                     │   │   app/storage/ (issue #20) -- routes.py groups
@@ -581,3 +588,37 @@ becomes the durable/exposed copy of that secret).
   exposed counts only). Same trust assumption as issues #17-19 applies: no
   auth of its own, so this endpoint (and therefore every found password)
   is only as protected as the network this API runs on.
+
+## Issue #21: snapshot viewer -- jump to match location
+
+- **Inputs:** a `page_url` and `source_type` from a clicked `MatchTableRow`
+  (issue #20), plus `MatchTableRow.locator` (new field this issue adds).
+- **Transformation:** `MatchTableRow` gained a `locator` field, populated
+  from the first grouped match's `.locator` in `_build_match_rows()`. A
+  new `GET /crawls/{id}/snapshot?url=...` endpoint calls
+  `Repository.get_snapshot(url)` and returns the decoded content as JSON.
+  In `app/static/index.html`, clicking a password cell opens a modal:
+  for `html_text`/`html_comment`/`css`/`js`/`http_header`/`cookie`, it
+  fetches that snapshot, searches the decoded text for the exact match
+  `value`, wraps the first occurrence in `<mark id="snapshot-mark">`, and
+  scrolls it into view. If the value isn't found in the fetched text
+  (expected for `http_header`/`cookie`, whose value lives in a header, not
+  the page body -- there's nothing to search for) it falls back to a
+  locator + context view instead of failing silently. For `image_metadata`
+  and `binary`, the fallback view is used directly, skipping the snapshot
+  fetch entirely -- per the issue's acceptance criteria, these aren't
+  meaningfully searchable/scrollable as text.
+- **Outputs:** the full raw content of a crawled page/resource -- not just
+  the matched value and its N characters of context, but the *entire*
+  snapshot -- now travels from the per-crawl SQLite file to the browser on
+  demand. **Data-flow note:** per the project's data-flow watchlist,
+  snapshot storage was flagged since issue #1 as potentially containing
+  secrets beyond the one matched; this issue is where that risk becomes
+  concrete over HTTP -- `GET /crawls/{id}/snapshot` will return the whole
+  page (e.g. other passwords, tokens, or PII that happen to be on it) to
+  anyone who can reach this endpoint with a valid `crawl_id` and `url`,
+  not just the specific match being viewed. Same trust assumption as
+  issues #17-20: no auth of its own, operator-trusted networks only -- but
+  worth flagging explicitly since this endpoint's blast radius per request
+  is larger than the report endpoint's (a whole page vs. one match's
+  context).
