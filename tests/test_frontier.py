@@ -110,3 +110,37 @@ def test_mark_visited_normalizes_before_marking():
     added = frontier.add("https://example.com/page#fragment")
 
     assert added is False
+
+
+def test_normalize_strips_tracking_query_params():
+    assert normalize_url("https://example.com/page?ref=email") == normalize_url(
+        "https://example.com/page"
+    )
+    assert normalize_url("https://example.com/page?utm_source=x&utm_campaign=y") == normalize_url(
+        "https://example.com/page"
+    )
+    assert normalize_url("https://example.com/page?v=2&hl=en") == normalize_url(
+        "https://example.com/page"
+    )
+
+
+def test_normalize_keeps_non_tracking_query_params():
+    assert normalize_url("https://example.com/page?id=5") == "https://example.com/page?id=5"
+
+
+def test_normalize_keeps_non_tracking_params_while_dropping_tracking_ones():
+    normalized = normalize_url("https://example.com/page?id=5&ref=email")
+    assert "id=5" in normalized
+    assert "ref" not in normalized
+
+
+def test_add_dedupes_urls_differing_only_by_tracking_query_params():
+    frontier = UrlFrontier("https://example.com/")
+    frontier.next()
+
+    added_first = frontier.add("https://example.com/page?ref=email")
+    added_second = frontier.add("https://example.com/page?utm_source=newsletter&hl=en")
+
+    assert added_first is True
+    assert added_second is False
+    assert len(frontier) == 1

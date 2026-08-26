@@ -1,18 +1,37 @@
 """Tracks the queue of URLs to crawl and those already visited.
 
 Normalizes URLs before dedupe so trivial variants (a trailing slash, a
-fragment) don't get queued twice, restricts the frontier to the seed URL's
-origin, and never re-queues a URL once seen -- which is what keeps cyclic
-links (and redirect loops discovered as links) from looping forever.
-`mark_visited()` lets a caller pre-seed already-completed URLs (e.g. from
-a `Repository`, on resume) without enqueuing them for a re-fetch.
+fragment, or a decorative tracking query param) don't get queued twice,
+restricts the frontier to the seed URL's origin, and never re-queues a URL
+once seen -- which is what keeps cyclic links (and redirect loops
+discovered as links) from looping forever. `mark_visited()` lets a caller
+pre-seed already-completed URLs (e.g. from a `Repository`, on resume)
+without enqueuing them for a re-fetch.
 """
 
 from __future__ import annotations
 
 from collections import deque
 from collections.abc import Iterable
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+# Common decorative/tracking query params that link to the same underlying
+# page under different values -- without stripping these, sites that tag
+# every internal link with e.g. ?utm_source=... explode the frontier into
+# one "distinct" URL per link, and the crawl never reaches queue_empty.
+_TRACKING_PARAMS = {
+    "ref",
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_term",
+    "utm_content",
+    "v",
+    "hl",
+    "fbclid",
+    "gclid",
+    "source",
+}
 
 
 def normalize_url(url: str) -> str:
@@ -22,7 +41,15 @@ def normalize_url(url: str) -> str:
     path = parsed.path or "/"
     if len(path) > 1 and path.endswith("/"):
         path = path.rstrip("/")
-    return urlunsplit((scheme, netloc, path, parsed.query, ""))
+
+    kept_params = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() not in _TRACKING_PARAMS
+    ]
+    query = urlencode(kept_params)
+
+    return urlunsplit((scheme, netloc, path, query, ""))
 
 
 def _origin(url: str) -> tuple[str, str]:

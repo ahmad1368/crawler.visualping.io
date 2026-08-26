@@ -56,6 +56,7 @@ class CrawlRequest(BaseModel):
     username: str = Field(min_length=1)
     password: str = Field(min_length=1)
     context_chars: int = 80
+    max_pages: int = 1000
 
 
 class CrawlCreatedResponse(BaseModel):
@@ -126,6 +127,7 @@ async def _build_orchestrator(request: CrawlRequest, event_bus: EventBus):
         extractor_registry=registry,
         header_cookie_extractor=HeaderCookieExtractor(context_chars=request.context_chars),
         repository=repository,
+        max_pages=request.max_pages,
         event_bus=event_bus,
     )
 

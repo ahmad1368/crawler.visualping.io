@@ -46,7 +46,7 @@ class Orchestrator:
         header_cookie_extractor: HeaderCookieExtractor,
         repository: Repository,
         concurrency: int = 4,
-        max_pages: int = 100,
+        max_pages: int = 1000,
         event_bus: EventBus | None = None,
     ) -> None:
         self._frontier = frontier

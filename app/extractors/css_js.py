@@ -8,7 +8,7 @@ plain text.
 
 from __future__ import annotations
 
-from app.matching import find_passwords
+from app.matching import find_passwords, locator_for_offset
 from app.models import PasswordMatch, SourceType
 
 _CSS_CONTENT_TYPES = {"text/css"}
@@ -28,13 +28,6 @@ def _source_type_for(content_type: str) -> SourceType | None:
     return None
 
 
-def _locator_for(text: str, offset: int) -> str:
-    line = text.count("\n", 0, offset) + 1
-    last_newline = text.rfind("\n", 0, offset)
-    column = offset - last_newline - 1 if last_newline != -1 else offset
-    return f"line:{line},col:{column}"
-
-
 class CssJsExtractor:
     def __init__(self, context_chars: int = 80) -> None:
         self._context_chars = context_chars
@@ -52,7 +45,7 @@ class CssJsExtractor:
                 source_url=url,
                 context_before=match.context_before,
                 context_after=match.context_after,
-                locator=_locator_for(text, match.start),
+                locator=locator_for_offset(text, match.start),
             )
             for match in find_passwords(text, before=self._context_chars, after=self._context_chars)
         ]

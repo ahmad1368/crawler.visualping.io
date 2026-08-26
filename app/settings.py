@@ -16,4 +16,4 @@ class Settings(BaseSettings):
     auth_password: str = Field(alias="AUTH_PASSWORD")
     context_chars: int = Field(default=80, alias="CONTEXT_CHARS")
     concurrency: int = Field(default=4, alias="CONCURRENCY")
-    max_pages: int = Field(default=100, alias="MAX_PAGES")
+    max_pages: int = Field(default=1000, alias="MAX_PAGES")

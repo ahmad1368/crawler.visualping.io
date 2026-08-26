@@ -1,10 +1,12 @@
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.api import routes
-from app.api.routes import _CrawlState, app
+from app.api.routes import CrawlRequest, _CrawlState, app
+from app.events import EventBus
 from app.models import CrawlSummary, PasswordMatch, SourceType
 
 VALID_BODY = {
@@ -286,3 +288,39 @@ def test_response_payload_shapes_match_the_full_contract(monkeypatch, client):
         f"/crawls/{crawl_id}/snapshot", params={"url": "https://example.com/page"}
     )
     assert set(snapshot_response.json().keys()) == {"url", "content"}
+
+
+def test_crawl_request_max_pages_defaults_to_1000():
+    request = CrawlRequest(url="https://example.com", username="alice", password="s3cret")
+
+    assert request.max_pages == 1000
+
+
+def test_crawl_request_max_pages_is_overridable():
+    request = CrawlRequest(
+        url="https://example.com", username="alice", password="s3cret", max_pages=5
+    )
+
+    assert request.max_pages == 5
+
+
+def test_build_orchestrator_passes_request_max_pages_through(monkeypatch):
+    captured_kwargs = {}
+
+    class CapturingOrchestrator:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+    monkeypatch.setattr(routes, "Orchestrator", CapturingOrchestrator)
+
+    request = CrawlRequest(
+        url="https://example.com", username="alice", password="s3cret", max_pages=42
+    )
+
+    async def scenario():
+        _orchestrator, _repository, cleanup = await routes._build_orchestrator(request, EventBus())
+        await cleanup()
+
+    asyncio.run(scenario())
+
+    assert captured_kwargs["max_pages"] == 42
