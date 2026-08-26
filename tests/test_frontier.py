@@ -89,3 +89,24 @@ def test_queue_is_fifo():
 
     assert frontier.next() == "https://example.com/first"
     assert frontier.next() == "https://example.com/second"
+
+
+def test_mark_visited_prevents_future_add():
+    frontier = UrlFrontier("https://example.com/")
+    frontier.next()
+
+    frontier.mark_visited("https://example.com/already-done")
+    added = frontier.add("https://example.com/already-done")
+
+    assert added is False
+    assert len(frontier) == 0
+
+
+def test_mark_visited_normalizes_before_marking():
+    frontier = UrlFrontier("https://example.com/")
+    frontier.next()
+
+    frontier.mark_visited("https://example.com/page/")
+    added = frontier.add("https://example.com/page#fragment")
+
+    assert added is False

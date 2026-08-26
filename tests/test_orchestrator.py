@@ -1,12 +1,13 @@
 import asyncio
 import sqlite3
+from datetime import datetime, timezone
 
 from app.crawler.frontier import UrlFrontier
 from app.crawler.orchestrator import Orchestrator
 from app.crawler.fetcher import FetchResult
 from app.crawler.browser_fetcher import BrowserFetchResult
 from app.extractors.base import ExtractorRegistry
-from app.models import PasswordMatch, SourceType
+from app.models import PageResult, PasswordMatch, SourceType
 from app.storage.sqlite import SqliteRepository
 
 SEED = "https://example.com/"
@@ -25,7 +26,10 @@ class FakeHttpFetcher:
 
     async def fetch(self, url: str) -> FetchResult:
         self.calls.append(url)
-        return self._responses[url]
+        response = self._responses[url]
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class FakeBrowserFetcher:
@@ -35,7 +39,10 @@ class FakeBrowserFetcher:
 
     async def fetch(self, url: str) -> BrowserFetchResult:
         self.calls.append(url)
-        return self._responses.get(url, BrowserFetchResult(html="", dom_links=[], network_urls=[]))
+        response = self._responses.get(url, BrowserFetchResult(html="", dom_links=[], network_urls=[]))
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class ConstantValueExtractor:
@@ -172,3 +179,69 @@ def test_pages_are_persisted_to_repository():
 
     assert repository.get_snapshot(SEED) == b"<html></html>"
     assert repository.get_report().unique_passwords_found == 1
+
+
+def test_orchestrator_resumes_from_repository_and_skips_already_visited_urls():
+    repository = SqliteRepository(sqlite3.connect(":memory:"))
+    # Simulate a previous, crashed run that already fetched PAGE_A.
+    repository.save_page(
+        PageResult(url=PAGE_A, status_code=200, fetched_at=datetime.now(timezone.utc)),
+        snapshot=b"<html>already done</html>",
+    )
+
+    frontier = UrlFrontier(SEED)
+    # Deliberately no entry for PAGE_A -- if the orchestrator tried to
+    # re-fetch it, this raises KeyError and fails the test.
+    fetch_responses = {SEED: _html_response(), PAGE_B: _html_response()}
+    http_fetcher = FakeHttpFetcher(fetch_responses)
+    browser_responses = {
+        SEED: BrowserFetchResult(html="", dom_links=[PAGE_A, PAGE_B], network_urls=[]),
+        PAGE_B: BrowserFetchResult(html="", dom_links=[], network_urls=[]),
+    }
+    browser_fetcher = FakeBrowserFetcher(browser_responses)
+    registry = ExtractorRegistry()
+    registry.register(ConstantValueExtractor("VISUALPING{abcdef1234567890}"))
+
+    orchestrator = Orchestrator(
+        frontier=frontier,
+        http_fetcher=http_fetcher,
+        browser_fetcher=browser_fetcher,
+        extractor_registry=registry,
+        header_cookie_extractor=NoOpHeaderCookieExtractor(),
+        repository=repository,
+    )
+
+    summary = run(orchestrator.run())
+
+    assert PAGE_A not in http_fetcher.calls
+    assert sorted(http_fetcher.calls) == sorted([SEED, PAGE_B])
+    assert summary.resources_checked == 2
+    assert summary.queue_empty is True
+
+
+def test_redirect_loop_does_not_hang_or_abort_the_crawl():
+    # PAGE_A is a genuine HTTP redirect loop: HttpFetcher never follows
+    # redirects (a 3xx just comes back as-is), but the browser fetcher's
+    # page.goto() is a real navigation and *does* follow redirects, so a
+    # loop surfaces there -- Chromium fails navigation (e.g.
+    # net::ERR_TOO_MANY_REDIRECTS) rather than hanging forever.
+    fetch_responses = {
+        SEED: _html_response(),
+        PAGE_A: _html_response(),
+        PAGE_B: _html_response(),
+    }
+    browser_responses = {
+        SEED: BrowserFetchResult(html="", dom_links=[PAGE_A, PAGE_B], network_urls=[]),
+        PAGE_A: RuntimeError("net::ERR_TOO_MANY_REDIRECTS"),
+        PAGE_B: BrowserFetchResult(html="", dom_links=[], network_urls=[]),
+    }
+    orchestrator, http_fetcher, browser_fetcher, _ = _build_orchestrator(
+        fetch_responses, browser_responses
+    )
+
+    summary = run(asyncio.wait_for(orchestrator.run(), timeout=2))
+
+    assert sorted(http_fetcher.calls) == sorted([SEED, PAGE_A, PAGE_B])
+    assert PAGE_A in browser_fetcher.calls
+    assert summary.resources_checked == 2
+    assert summary.queue_empty is True

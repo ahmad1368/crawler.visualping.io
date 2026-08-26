@@ -12,6 +12,13 @@ comes first.
 If an `EventBus` is supplied, publishes `PAGE_FETCHED` after each page is
 saved, `MATCH_FOUND` for each match found on it, and `CRAWL_FINISHED` with
 the final `CrawlSummary` once the run completes -- see issue #16.
+
+Resumes automatically: at the start of `run()`, every URL the `Repository`
+already has a page for (from a previous, crashed run against the same
+database) is marked visited on the frontier so it isn't re-fetched. A
+single URL's processing failing (e.g. a genuine HTTP redirect loop that
+makes the browser fetcher's navigation fail) is caught and skipped rather
+than aborting or hanging the whole crawl.
 """
 
 from __future__ import annotations
@@ -59,6 +66,9 @@ class Orchestrator:
         state = {"resources_checked": 0, "pages_visited": 0}
         unique_values: set[str] = set()
 
+        for visited_url in self._repository.get_visited_urls():
+            self._frontier.mark_visited(visited_url)
+
         async def worker() -> None:
             while True:
                 async with lock:
@@ -69,7 +79,13 @@ class Orchestrator:
                     url = self._frontier.next()
 
                 async with semaphore:
-                    is_html, match_values = await self._process_url(url)
+                    try:
+                        is_html, match_values = await self._process_url(url)
+                    except Exception:
+                        # A single URL failing (e.g. the browser fetcher's
+                        # navigation erroring out on a genuine HTTP
+                        # redirect loop) must not abort or hang the crawl.
+                        continue
 
                 async with lock:
                     state["resources_checked"] += 1

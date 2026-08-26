@@ -3,7 +3,9 @@
 Normalizes URLs before dedupe so trivial variants (a trailing slash, a
 fragment) don't get queued twice, restricts the frontier to the seed URL's
 origin, and never re-queues a URL once seen -- which is what keeps cyclic
-links from looping forever.
+links (and redirect loops discovered as links) from looping forever.
+`mark_visited()` lets a caller pre-seed already-completed URLs (e.g. from
+a `Repository`, on resume) without enqueuing them for a re-fetch.
 """
 
 from __future__ import annotations
@@ -52,6 +54,11 @@ class UrlFrontier:
 
     def add_many(self, urls: Iterable[str]) -> int:
         return sum(1 for url in urls if self.add(url))
+
+    def mark_visited(self, url: str) -> None:
+        """Mark a URL as already handled without queuing it -- for
+        resuming a crawl from a Repository's previously-persisted pages."""
+        self._seen.add(normalize_url(url))
 
     def has_next(self) -> bool:
         return bool(self._queue)

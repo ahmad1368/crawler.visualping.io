@@ -36,3 +36,8 @@ class Repository(ABC):
     def get_matches(self) -> list[PasswordMatch]:
         """Return every password match persisted so far, in insertion
         order (for the UI's results table, issue #20)."""
+
+    @abstractmethod
+    def get_visited_urls(self) -> list[str]:
+        """Return every URL already fully fetched and saved -- lets an
+        Orchestrator resume a crashed crawl without re-fetching them."""

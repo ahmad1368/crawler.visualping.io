@@ -133,3 +133,7 @@ class SqliteRepository(Repository):
             )
             for value, source_type, source_url, context_before, context_after, locator in rows
         ]
+
+    def get_visited_urls(self) -> list[str]:
+        rows = self._conn.execute("SELECT url FROM pages").fetchall()
+        return [url for (url,) in rows]
