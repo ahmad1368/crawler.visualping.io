@@ -11,6 +11,14 @@ Updated as each issue lands. Nodes marked `(planned)` don't exist in code
 yet -- they show where today's outputs are headed.
 
 ```
+Browser: GET /                                app/api/routes.py + app/static/index.html
+(operator fills in url/username/password/context_chars in an HTML form)
+│
+└── JS: fetch POST /crawls, then WebSocket /ws/crawls/{id}
+    app/static/index.html -- credentials leave the browser only in the
+    POST body (JSON over the page's own origin); the Run button is
+    disabled from click until a crawl_finished message arrives
+
 POST /crawls (CrawlRequest: url, username, password, context_chars)
 app/api/routes.py -- validated by pydantic (HttpUrl, non-empty credentials);
 returns {crawl_id} immediately, runs the crawl in a FastAPI BackgroundTask.
@@ -500,3 +508,34 @@ becomes the durable/exposed copy of that secret).
   `asyncio.Queue` access); a separate test still exercises the real
   `TestClient.websocket_connect` transport for the "already finished" and
   "unknown crawl" paths.
+
+## Issue #19: input form + Run button + live log (Visualping-branded)
+
+- **Inputs:** operator-typed form fields in the browser: target URL,
+  username, password, context length. No new backend input -- this issue
+  is a static frontend consuming the REST/WebSocket API from issues
+  #17-18.
+- **Transformation:** `app/static/index.html` (plain HTML/CSS/vanilla JS,
+  no build step) is served at `GET /` by a new route in
+  `app/api/routes.py`. On submit, its script disables the Run button,
+  `fetch()`s `POST /crawls` with the form values as JSON, then opens a
+  `WebSocket` to `/ws/crawls/{crawl_id}` and appends one log line per
+  `page_fetched`/`match_found` message it receives; on `crawl_finished` it
+  appends a final line, closes the socket, and re-enables the Run button.
+  Styled with Visualping's palette (`#da532c` accent, white background,
+  rounded cards, system font stack) per the issue's design note.
+  Username/password inputs are marked `autocomplete="off"` so the browser
+  doesn't offer to save a third-party site's credentials.
+- **Outputs:** the only data this page sends anywhere is the `POST
+  /crawls` body (to this same app's own `/crawls` endpoint) -- no
+  third-party requests, no analytics, nothing written to
+  `localStorage`/cookies. **Data-flow note:** this is the first place an
+  operator's typed credentials are held in browser memory (a page
+  variable) before being sent over HTTP to `/crawls`, same trust
+  assumptions already flagged for issues #17-18 (no auth of its own,
+  trusted operators/networks only). **Testing note:** verified end-to-end
+  with Playwright (already a project dependency, issue #5) driving a real
+  Chromium against a real `uvicorn` server with `_build_orchestrator`
+  mocked to a two-page crawl with an artificial delay -- this proves the
+  Run button stays disabled while genuinely in progress and the log
+  updates live, not just that the static markup looks right.
