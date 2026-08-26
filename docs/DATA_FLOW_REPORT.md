@@ -35,9 +35,15 @@ FetchResult / BrowserFetchResult
 │                                                 frontier's queue -- same-origin +
 │                                                 dedup keeps the crawl bounded
 │
+├── HeaderCookieExtractor                        app/extractors/headers_cookies.py
+│   (takes FetchResult.headers/.cookies directly -- not routed through
+│    ExtractorRegistry.run_all(), since its input isn't a body blob; also
+│    calls find_passwords() internally; tags matches http_header / cookie,
+│    locator is "header:<name>"/"cookie:<name>")
+│
 └── ExtractorRegistry                            app/extractors/base.py
     (register() + run_all(content, content_type, url); dispatches to
-     every registered Extractor)
+     every registered body-content Extractor)
     │
     ├── HtmlExtractor                            app/extractors/html.py
     │   (text/html only; html.parser walks text nodes + <!-- --> comments,
@@ -47,7 +53,7 @@ FetchResult / BrowserFetchResult
     │   (text/css, application|text/javascript; scans the whole body as
     │    plain text -- content:, string literals, // and /* */ comments)
     │
-    ├── (planned) http_header, cookie, image_metadata, binary extractors
+    ├── (planned) image_metadata, binary extractors
     │   -- same Extractor interface, not yet implemented
     │
     └── find_passwords()                        app/matching.py
@@ -256,3 +262,23 @@ becomes the durable/exposed copy of that secret).
   only, tagged `CSS` or `JS`. **Data-flow note:** same as issue #9 -- this
   constructs real `PasswordMatch` objects from live crawl content; nothing
   here logs, persists, or transmits them.
+
+## Issue #11: HTTP response headers & cookies extractor
+
+- **Inputs:** a fetched response's `headers` and `cookies`
+  (`dict[str, str]`, as already carried on `FetchResult` from issue #4) and
+  the page `url`. This extractor's natural input is name/value maps, not a
+  body blob, so its `extract()` doesn't match the `Extractor` Protocol's
+  `(content, content_type, url)` shape from issue #8 -- it isn't routed
+  through `ExtractorRegistry`.
+- **Transformation:** `app/extractors/headers_cookies.py`'s
+  `HeaderCookieExtractor` runs `find_passwords()` (issue #7) against every
+  header value (including custom `X-*` headers) and every cookie value,
+  tagging matches `SourceType.HTTP_HEADER` or `SourceType.COOKIE` with a
+  `header:<name>` / `cookie:<name>` locator.
+- **Outputs:** a `list[PasswordMatch]` returned to the caller in memory
+  only. **Data-flow note:** response headers/cookies were already flagged
+  as potentially sensitive back in issue #4's report section -- this is
+  where that risk becomes concrete: any secret an operator's server leaks
+  in a header or `Set-Cookie` value now gets extracted the same as a
+  body-content match. Nothing here logs, persists, or transmits it further.
