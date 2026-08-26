@@ -26,7 +26,7 @@ class _HtmlChunkCollector(HTMLParser):
         self.comment_chunks: list[tuple[str, tuple[int, int]]] = []
         self._skip_depth = 0
 
-    def handle_starttag(self, tag: str, attrs) -> None:
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in _SKIPPED_TAGS:
             self._skip_depth += 1
 
