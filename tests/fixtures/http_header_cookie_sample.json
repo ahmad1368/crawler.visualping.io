@@ -1,0 +1,10 @@
+{
+  "headers": {
+    "Content-Type": "text/html",
+    "X-Debug-Password": "leaked=VISUALPING{7777777777777777}"
+  },
+  "cookies": {
+    "session_id": "abc123",
+    "session_backup": "token=VISUALPING{8888888888888888}"
+  }
+}

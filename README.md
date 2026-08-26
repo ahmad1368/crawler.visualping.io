@@ -28,3 +28,4 @@ _Full documentation will be filled in by the docs issue._
 - **#20** Results table: renders `GET /crawls/{id}/report`'s matches (page, source type, password, context, count), with a clickable password cell.
 - **#21** Snapshot viewer: clicking a password opens the raw page/resource with the match highlighted and scrolled into view (locator fallback for EXIF/binary).
 - **#22** Completeness summary panel: pages visited, resources checked, unique passwords found, queue empty -- live during the crawl, finalized from the report.
+- **#23** `tests/fixtures/`: one sample per source type, with a parametrized test confirming every extractor finds its embedded password.
