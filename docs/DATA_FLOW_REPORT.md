@@ -62,6 +62,16 @@ yet -- they show where today's outputs are headed.
                             └── API (planned)     app/api/ (REST + WebSocket)
 ```
 
+`EventBus` (`app/events.py`, issue #16) is a standalone `subscribe()`/
+`publish()` component -- `page_fetched`/`match_found`/`crawl_finished`
+event types are defined, but `Orchestrator.run()` doesn't call `publish()`
+yet. That wiring is expected to land with the WebSocket issue (#18), which
+is the actual consumer of these events; not shown as a tree node above
+until it's actually connected. A `match_found` payload will carry a
+`PasswordMatch`, so any future subscriber (e.g. a WebSocket broadcaster)
+inherits the same sensitive-data handling responsibility as the rest of
+the pipeline.
+
 Sensitive edges to keep an eye on: `Settings` → both fetchers (Basic Auth
 credentials leave the process for the first time); `Extractors` →
 `PasswordMatch` (the extracted secret + context is created); and
@@ -373,3 +383,26 @@ becomes the durable/exposed copy of that secret).
   flagging: `BrowserFetcher` (which also carries Basic Auth credentials via
   `http_credentials`) now runs automatically for every HTML page during a
   real crawl, not just in isolated tests.
+
+## Issue #16: progress event bus (Observer pattern)
+
+- **Inputs:** an `event_type` string and an arbitrary `payload`, passed to
+  `publish()`; a handler function and `event_type`, passed to `subscribe()`.
+- **Transformation:** `app/events.py`'s `EventBus` keeps a
+  `dict[event_type, list[handler]]`. `subscribe()` appends a handler to
+  that event type's list; `publish()` calls every subscribed handler for
+  that event type, in subscription order, with the payload. Three event
+  type constants are defined for the orchestrator's future use:
+  `PAGE_FETCHED`, `MATCH_FOUND`, `CRAWL_FINISHED`. **Scope note:**
+  `Orchestrator.run()` (issue #15) does not call `publish()` yet -- this
+  issue only builds the bus itself, per its acceptance criteria
+  (`subscribe()`/`publish()` API + an ordered-delivery test). Wiring it
+  into the orchestrator is left for whichever issue actually needs to
+  consume these events (the WebSocket endpoint, issue #18).
+- **Outputs:** handler calls happen synchronously, in-process, in memory --
+  no new storage or network sink. **Data-flow note:** once wired up, a
+  `MATCH_FOUND` payload will carry a `PasswordMatch` (the plaintext secret
+  + context) directly to every subscriber. That's fine for an in-process
+  WebSocket broadcaster relaying to the local operator's own UI, but any
+  future subscriber added to this bus should be checked against the
+  data-flow watchlist the same as the storage/API layers are.
