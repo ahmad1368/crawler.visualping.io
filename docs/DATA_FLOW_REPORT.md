@@ -24,7 +24,11 @@ Browser: GET /                                app/api/routes.py + app/static/ind
     password cell (dispatches a "password-cell-click" DOM event) that
     opens a modal showing the raw snapshot with the match `<mark>`ed and
     scrolled into view -- or, for image_metadata/binary, a locator +
-    context fallback instead of trying to search a non-text body
+    context fallback instead of trying to search a non-text body. A
+    completeness summary panel (pages visited, resources checked, unique
+    passwords found, queue empty) updates live from page_fetched/
+    match_found events during the crawl, then is overwritten with the
+    authoritative CrawlSummary once GET /crawls/{id}/report loads
 
 POST /crawls (CrawlRequest: url, username, password, context_chars)
 app/api/routes.py -- validated by pydantic (HttpUrl, non-empty credentials);
@@ -622,3 +626,30 @@ becomes the durable/exposed copy of that secret).
   worth flagging explicitly since this endpoint's blast radius per request
   is larger than the report endpoint's (a whole page vs. one match's
   context).
+
+## Issue #22: crawl completeness summary panel
+
+- **Inputs:** `page_fetched`/`match_found` WebSocket messages (issues
+  #16/#18) received during the crawl, and the final `CrawlSummary` from
+  `GET /crawls/{id}/report` (issue #17/#20) once it finishes. No new
+  backend endpoint or data -- purely a frontend consumer of data already
+  reviewed in earlier issues.
+- **Transformation:** `app/static/index.html` adds a summary panel with
+  four stats (pages visited, resources checked, unique passwords found,
+  queue empty). During the crawl, `resources_checked` increments on every
+  `page_fetched` message and `unique_passwords_found` is the size of a
+  client-side `Set` of `match_found` payload values -- both are things the
+  client can track accurately from the event stream alone.
+  `pages_visited`/`queue_empty` have no equivalent live signal (the
+  client can't tell HTML pages from other resources from a `page_fetched`
+  payload alone, and doesn't know the frontier's state), so they stay at
+  placeholder values until `crawl_finished` triggers `GET
+  .../report`, at which point `finalizeSummaryPanel()` overwrites all four
+  stats with the authoritative `CrawlSummary` -- satisfying the issue's
+  "updates live via the WebSocket, finalizes when the crawl completes"
+  acceptance criterion honestly rather than faking numbers the client
+  can't actually know yet.
+- **Outputs:** aggregate counts only, rendered directly in the DOM --
+  no new data leaves or enters the system beyond what issues #17/#18/#20
+  already expose. **Data-flow note:** no new concerns; this panel doesn't
+  touch `PasswordMatch` values, snapshots, or credentials.
