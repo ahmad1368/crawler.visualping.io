@@ -16,3 +16,4 @@ _Full documentation will be filled in by the docs issue._
 - **#8** `ExtractorRegistry`: strategy interface + registry for running all extractors against a fetch result.
 - **#9** `HtmlExtractor`: finds passwords in HTML visible text and comments, tagged `html_text`/`html_comment`.
 - **#10** `CssJsExtractor`: finds passwords in downloaded CSS/JS file bodies.
+- **#11** `HeaderCookieExtractor`: finds passwords in HTTP response headers (including custom `X-*`) and cookies.
