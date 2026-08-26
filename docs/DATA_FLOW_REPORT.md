@@ -35,10 +35,10 @@ FetchResult / BrowserFetchResult
 │                                                 frontier's queue -- same-origin +
 │                                                 dedup keeps the crawl bounded
 │
-└── Extractors (planned)                        app/extractors/
-    (one strategy class per password-hiding technique: html, css, js,
-     http_header, cookie, image_metadata, binary; each calls find_passwords()
-     on the text it pulls out of a fetch result)
+└── ExtractorRegistry                            app/extractors/base.py
+    (register() + run_all(content, content_type, url); dispatches to
+     every registered Extractor -- concrete strategies are (planned):
+     html, css, js, http_header, cookie, image_metadata, binary)
     │
     └── find_passwords()                        app/matching.py
         (regex: VISUALPING\{16 lowercase hex\}; slices before/after context)
@@ -189,3 +189,21 @@ becomes the durable/exposed copy of that secret).
   Whichever later issue turns a `RegexMatch` into a `PasswordMatch` (adding
   `source_type`/`source_url`/`locator`) inherits responsibility for
   everything downstream of that per the project's data-flow watchlist.
+
+## Issue #8: Extractor strategy interface + registry
+
+- **Inputs:** none directly -- this issue defines the interface concrete
+  extractors (later issues) will implement, plus the registry that will
+  invoke them; no runtime data flows through it yet.
+- **Transformation:** `app/extractors/base.py` defines `Extractor`, a
+  runtime-checkable `Protocol` with a single method,
+  `extract(content: bytes, content_type: str, url: str) -> list[PasswordMatch]`,
+  and `ExtractorRegistry`, which holds registered extractors (`register()`)
+  and runs all of them against one fetched response, aggregating their
+  results (`run_all()`).
+- **Outputs:** none yet -- no concrete extractor exists to construct a real
+  `PasswordMatch`. **Data-flow note:** once concrete extractors land (issues
+  #9-13), every one of them returns `PasswordMatch` objects through this
+  same registry, so `ExtractorRegistry.run_all()` becomes the single
+  chokepoint where every extracted secret in the system passes through --
+  worth keeping an eye on if logging/instrumentation is ever added here.
