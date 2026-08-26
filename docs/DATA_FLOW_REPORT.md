@@ -37,8 +37,14 @@ FetchResult / BrowserFetchResult
 │
 └── ExtractorRegistry                            app/extractors/base.py
     (register() + run_all(content, content_type, url); dispatches to
-     every registered Extractor -- concrete strategies are (planned):
-     html, css, js, http_header, cookie, image_metadata, binary)
+     every registered Extractor)
+    │
+    ├── HtmlExtractor                            app/extractors/html.py
+    │   (text/html only; html.parser walks text nodes + <!-- --> comments,
+    │    skips <script>/<style>; tags matches html_text / html_comment)
+    │
+    ├── (planned) css/js, http_header, cookie, image_metadata, binary
+    │   extractors -- same Extractor interface, not yet implemented
     │
     └── find_passwords()                        app/matching.py
         (regex: VISUALPING\{16 lowercase hex\}; slices before/after context)
@@ -207,3 +213,25 @@ becomes the durable/exposed copy of that secret).
   same registry, so `ExtractorRegistry.run_all()` becomes the single
   chokepoint where every extracted secret in the system passes through --
   worth keeping an eye on if logging/instrumentation is ever added here.
+
+## Issue #9: HTML visible text & comments extractor
+
+- **Inputs:** a fetched response's `content` (`bytes`), `content_type`, and
+  `url` (the `Extractor.extract()` signature from issue #8).
+- **Transformation:** `app/extractors/html.py`'s `HtmlExtractor` only acts
+  on `text/html` content. It walks the markup with the stdlib
+  `html.parser.HTMLParser`, collecting visible text-node data and
+  `<!-- -->` comment data separately (content inside `<script>`/`<style>`
+  is skipped -- that's the CSS/JS extractor's job). Each chunk is passed
+  through `find_passwords()` from issue #7, and every match is wrapped into
+  a `PasswordMatch` tagged `SourceType.HTML_TEXT` or `SourceType.HTML_COMMENT`
+  depending on where it was found, with `locator` set to the chunk's
+  `line:col` position from the parser. (`SourceType.HTML` from issue #3 was
+  split into these two more specific values to match this issue's
+  acceptance criteria.)
+- **Outputs:** a `list[PasswordMatch]` returned to the caller in memory
+  only. **Data-flow note:** this is the first concrete extractor -- it's
+  the first place a real `PasswordMatch` (plaintext secret + context) gets
+  constructed from live crawl content. Nothing here logs, persists, or
+  transmits it; it's returned up the call stack for a later issue's
+  storage/API layer to handle per the data-flow watchlist.

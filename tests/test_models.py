@@ -9,7 +9,7 @@ from app.models import CrawlSummary, PageResult, PasswordMatch, SourceType
 def _match(**overrides):
     fields = dict(
         value="hunter2",
-        source_type=SourceType.HTML,
+        source_type=SourceType.HTML_TEXT,
         source_url="https://example.com/page",
         context_before="password: ",
         context_after=" </p>",
@@ -21,13 +21,13 @@ def _match(**overrides):
 
 def test_password_match_valid():
     match = _match()
-    assert match.source_type == SourceType.HTML
+    assert match.source_type == SourceType.HTML_TEXT
 
 
 def test_password_match_missing_required_field_raises():
     with pytest.raises(ValidationError):
         PasswordMatch(
-            source_type=SourceType.HTML,
+            source_type=SourceType.HTML_TEXT,
             source_url="https://example.com/page",
             context_before="",
             context_after="",
