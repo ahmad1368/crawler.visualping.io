@@ -70,3 +70,23 @@ focus on where credentials or extracted secrets travel.
   *response* headers/cookies from the target site, which themselves could
   contain secrets and should be treated as sensitive once extractors (later
   issues) start scanning them.
+
+## Issue #5: browser-based fetcher (Playwright) with network capture
+
+- **Inputs:** a target URL and the operator's Basic Auth credentials
+  (`username`/`password`) supplied to `BrowserFetcher`'s constructor, plus
+  an injected Playwright `Browser` instance.
+- **Transformation:** `app/crawler/browser_fetcher.py`'s `BrowserFetcher`
+  opens a new browser context with `http_credentials` set (so Basic Auth is
+  applied automatically to every request Chromium makes), navigates to the
+  URL, and listens for `request`/`response` events for the lifetime of the
+  page load. It collects rendered-DOM `<a href>` links via
+  `eval_on_selector_all` and all URLs observed in network traffic
+  (including JS-driven `fetch`/XHR calls a raw-HTML parser would miss).
+- **Outputs:** a `BrowserFetchResult` (`html`, `dom_links`, `network_urls`)
+  returned to the caller in memory only. **Data-flow note:** the Basic Auth
+  credentials are passed to Playwright's `http_credentials` context option
+  and are not logged, echoed into `BrowserFetchResult`, or written to disk.
+  `html` and `network_urls` are the rendered page content and every URL
+  Chromium touched -- both should be treated as sensitive input once
+  extractors (later issues) start scanning them for exposed passwords.
