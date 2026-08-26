@@ -8,6 +8,10 @@ fetch it with the browser fetcher to discover JS-driven links and enqueue
 them. Runs with a bounded concurrency (`asyncio.Semaphore`) and stops once
 `max_pages` URLs have been processed or the frontier is empty, whichever
 comes first.
+
+If an `EventBus` is supplied, publishes `PAGE_FETCHED` after each page is
+saved, `MATCH_FOUND` for each match found on it, and `CRAWL_FINISHED` with
+the final `CrawlSummary` once the run completes -- see issue #16.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from datetime import datetime, timezone
 from app.crawler.browser_fetcher import BrowserFetcher
 from app.crawler.fetcher import HttpFetcher
 from app.crawler.frontier import UrlFrontier
+from app.events import CRAWL_FINISHED, MATCH_FOUND, PAGE_FETCHED, EventBus
 from app.extractors.base import ExtractorRegistry
 from app.extractors.headers_cookies import HeaderCookieExtractor
 from app.models import CrawlSummary, PageResult
@@ -35,6 +40,7 @@ class Orchestrator:
         repository: Repository,
         concurrency: int = 4,
         max_pages: int = 100,
+        event_bus: EventBus | None = None,
     ) -> None:
         self._frontier = frontier
         self._http_fetcher = http_fetcher
@@ -44,6 +50,7 @@ class Orchestrator:
         self._repository = repository
         self._concurrency = concurrency
         self._max_pages = max_pages
+        self._event_bus = event_bus
 
     async def run(self) -> CrawlSummary:
         started_at = datetime.now(timezone.utc)
@@ -73,7 +80,7 @@ class Orchestrator:
         workers = [asyncio.create_task(worker()) for _ in range(self._concurrency)]
         await asyncio.gather(*workers)
 
-        return CrawlSummary(
+        summary = CrawlSummary(
             pages_visited=state["pages_visited"],
             resources_checked=state["resources_checked"],
             unique_passwords_found=len(unique_values),
@@ -81,6 +88,9 @@ class Orchestrator:
             started_at=started_at,
             finished_at=datetime.now(timezone.utc),
         )
+        if self._event_bus is not None:
+            self._event_bus.publish(CRAWL_FINISHED, summary)
+        return summary
 
     async def _process_url(self, url: str) -> tuple[bool, list[str]]:
         fetch_result = await self._http_fetcher.fetch(url)
@@ -108,5 +118,10 @@ class Orchestrator:
             matches=matches,
         )
         self._repository.save_page(page, snapshot=fetch_result.content)
+
+        if self._event_bus is not None:
+            self._event_bus.publish(PAGE_FETCHED, page)
+            for match in matches:
+                self._event_bus.publish(MATCH_FOUND, match)
 
         return is_html, [match.value for match in matches]
