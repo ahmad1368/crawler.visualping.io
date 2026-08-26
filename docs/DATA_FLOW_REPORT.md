@@ -5,6 +5,52 @@ issue that touches the crawl, extraction, storage, or API layers appends its
 own section below describing: inputs -> transformation -> outputs, with a
 focus on where credentials or extracted secrets travel.
 
+## Data flow tree (overview)
+
+Updated as each issue lands. Nodes marked `(planned)` don't exist in code
+yet -- they show where today's outputs are headed.
+
+```
+.env / environment variables
+└── Settings                                    app/settings.py
+    (TARGET_URL, AUTH_USERNAME, AUTH_PASSWORD, CONTEXT_CHARS, CONCURRENCY, MAX_PAGES)
+    │
+    ├── HttpFetcher                             app/crawler/fetcher.py
+    │   (httpx.AsyncClient + Basic Auth, retry/backoff)
+    │   └── FetchResult
+    │       (content, content_type, status_code, headers, cookies)
+    │
+    └── BrowserFetcher                          app/crawler/browser_fetcher.py
+        (Playwright Chromium + http_credentials, network capture)
+        └── BrowserFetchResult
+            (html, dom_links, network_urls)
+
+FetchResult / BrowserFetchResult
+└── Extractors (planned)                        app/extractors/
+    (one strategy class per password-hiding technique: html, css, js,
+     http_header, cookie, image_metadata, binary)
+    └── PasswordMatch                           app/models.py
+        (value, source_type, source_url, context_before, context_after, locator)
+        │
+        └── PageResult                          app/models.py
+            (url, status_code, fetched_at, matches[])
+            │
+            └── CrawlSummary                    app/models.py
+                (pages_visited, resources_checked, unique_passwords_found, ...)
+                │
+                ├── Storage (planned)            app/storage/
+                │   (SQLite repository -- durable store, gitignored *.db)
+                │
+                └── API (planned)                app/api/
+                    (REST + WebSocket -- surfaces results to the UI)
+```
+
+Sensitive edges to keep an eye on: `Settings` → both fetchers (Basic Auth
+credentials leave the process for the first time); `Extractors` →
+`PasswordMatch` (the extracted secret + context is created); and
+`PasswordMatch` → `Storage`/`API` (whatever persists or serializes it
+becomes the durable/exposed copy of that secret).
+
 ## Issue #1: scaffold project structure & tooling
 
 - **Inputs:** none (infra-only issue, no runtime data flow).
