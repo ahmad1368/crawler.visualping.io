@@ -1,0 +1,2 @@
+// backup credential: VISUALPING{5555555555555555}
+const legacyToken = "VISUALPING{6666666666666666}";

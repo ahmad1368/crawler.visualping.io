@@ -653,3 +653,28 @@ becomes the durable/exposed copy of that secret).
   no new data leaves or enters the system beyond what issues #17/#18/#20
   already expose. **Data-flow note:** no new concerns; this panel doesn't
   touch `PasswordMatch` values, snapshots, or credentials.
+
+## Issue #23: fixture-based unit test suite for extractors
+
+- **Inputs:** none new at runtime -- this issue only adds test fixtures
+  (`tests/fixtures/`) and a test file; no production code changed, no tree
+  update needed.
+- **Transformation:** one fixture per source type, each with a known
+  synthetic (never-real) `VISUALPING{...}` password: `html_sample.html`
+  (yields both `html_text` and `html_comment`), `css_sample.css`,
+  `js_sample.js` (yields two `js` matches -- a comment and a string
+  literal), `http_header_cookie_sample.json` (a `{headers, cookies}` dict
+  pair for `HeaderCookieExtractor`, which doesn't take a body fixture),
+  `image_sample.jpg` (a real 2x2 JPEG with an EXIF `UserComment`,
+  generated once via Pillow), and `binary_sample.bin` (raw non-UTF8
+  bytes). `tests/test_extractor_fixtures.py` parametrizes one assertion
+  function over all 9 cases (8 source types, JS covered twice), running
+  every extractor against its fixture and checking the match's `value`,
+  `source_type`, and that `context_before`/`context_after` contain the
+  expected surrounding text.
+- **Outputs:** none -- test-only. **Data-flow note:** no new concerns.
+  Every fixture password is a synthetic test value matching the project's
+  own `VISUALPING{16 hex}` pattern, never a real credential; this
+  consolidated pass builds on (and doesn't replace) the more granular
+  per-extractor tests from issues #9-13, which also cover rejection/edge
+  cases this pass doesn't re-test.
