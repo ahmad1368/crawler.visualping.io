@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from app.api import routes
 from app.api.routes import CrawlStatus, _CrawlState, app
-from app.models import CrawlSummary
+from app.models import CrawlSummary, PasswordMatch, SourceType
 
 VALID_BODY = {
     "url": "https://example.com",
@@ -35,12 +35,17 @@ class FakeOrchestrator:
         return self._summary
 
 
+class FakeRepository:
+    def get_matches(self):
+        return []
+
+
 def _patch_orchestrator(monkeypatch, summary=None, error=None):
     async def fake_build_orchestrator(request, event_bus):
         async def cleanup():
             return None
 
-        return FakeOrchestrator(summary=summary, error=error), cleanup
+        return FakeOrchestrator(summary=summary, error=error), FakeRepository(), cleanup
 
     monkeypatch.setattr(routes, "_build_orchestrator", fake_build_orchestrator)
 
@@ -71,7 +76,9 @@ def test_start_crawl_returns_id_and_completes_via_background_task(monkeypatch, c
 
     report_response = client.get(f"/crawls/{crawl_id}/report")
     assert report_response.status_code == 200
-    assert report_response.json()["unique_passwords_found"] == 1
+    body = report_response.json()
+    assert body["summary"]["unique_passwords_found"] == 1
+    assert body["matches"] == []
 
 
 def test_invalid_url_is_rejected():
@@ -113,6 +120,48 @@ def test_report_before_finished_returns_409(client):
     response = client.get("/crawls/still-running/report")
 
     assert response.status_code == 409
+
+
+def test_report_matches_table_dedupes_and_counts_repeated_values(monkeypatch, client):
+    def _match(**overrides):
+        fields = dict(
+            value="VISUALPING{abcdef1234567890}",
+            source_type=SourceType.HTML_TEXT,
+            source_url="https://example.com/page",
+            context_before="before",
+            context_after="after",
+            locator="line:1,col:0",
+        )
+        fields.update(overrides)
+        return PasswordMatch(**fields)
+
+    repeated = _match()
+    other_page = _match(source_url="https://example.com/other", locator="line:2,col:0")
+
+    class RepositoryWithMatches:
+        def get_matches(self):
+            return [repeated, repeated, other_page]
+
+    async def fake_build_orchestrator(request, event_bus):
+        async def cleanup():
+            return None
+
+        return FakeOrchestrator(summary=CANNED_SUMMARY), RepositoryWithMatches(), cleanup
+
+    monkeypatch.setattr(routes, "_build_orchestrator", fake_build_orchestrator)
+
+    response = client.post("/crawls", json=VALID_BODY)
+    crawl_id = response.json()["crawl_id"]
+
+    report = client.get(f"/crawls/{crawl_id}/report").json()
+
+    assert len(report["matches"]) == 2
+    row = next(r for r in report["matches"] if r["page_url"] == "https://example.com/page")
+    assert row["count_in_page"] == 2
+    assert row["source_type"] == "html_text"
+    assert row["context_before"] == "before"
+    other_row = next(r for r in report["matches"] if r["page_url"] == "https://example.com/other")
+    assert other_row["count_in_page"] == 1
 
 
 def test_failed_crawl_status_and_report(monkeypatch, client):

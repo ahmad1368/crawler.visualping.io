@@ -72,6 +72,38 @@
     background: #fafafa;
   }
   #log p { margin: 0 0 0.25rem 0; }
+  table#results-table {
+    margin-top: 1.5rem;
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+  }
+  #results-table th, #results-table td {
+    text-align: left;
+    padding: 0.5rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  #results-table th {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: #666;
+  }
+  button.password-cell {
+    margin: 0;
+    padding: 0.2rem 0.5rem;
+    font-size: 0.8rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: #fff;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+  }
+  button.password-cell:hover {
+    background: var(--accent);
+    color: #fff;
+  }
 </style>
 </head>
 <body>
@@ -93,12 +125,26 @@
       <button id="run-button" type="submit">Run</button>
     </form>
     <div id="log" aria-live="polite"></div>
+    <table id="results-table" style="display: none;">
+      <thead>
+        <tr>
+          <th>Page URL</th>
+          <th>Source Type</th>
+          <th>Password</th>
+          <th>Context</th>
+          <th>Count</th>
+        </tr>
+      </thead>
+      <tbody id="results-body"></tbody>
+    </table>
   </div>
 
   <script>
     const form = document.getElementById("crawl-form");
     const runButton = document.getElementById("run-button");
     const log = document.getElementById("log");
+    const resultsTable = document.getElementById("results-table");
+    const resultsBody = document.getElementById("results-body");
 
     function appendLog(text) {
       const line = document.createElement("p");
@@ -107,10 +153,63 @@
       log.scrollTop = log.scrollHeight;
     }
 
+    // Emits a "password-cell-click" event on window with the row's data --
+    // the snapshot viewer (issue #21) hooks into this to jump to the match.
+    function renderResultsTable(matches) {
+      resultsBody.innerHTML = "";
+      for (const row of matches) {
+        const tr = document.createElement("tr");
+
+        const pageCell = document.createElement("td");
+        pageCell.textContent = row.page_url;
+
+        const typeCell = document.createElement("td");
+        typeCell.textContent = row.source_type;
+
+        const passwordCell = document.createElement("td");
+        const passwordButton = document.createElement("button");
+        passwordButton.type = "button";
+        passwordButton.className = "password-cell";
+        passwordButton.textContent = row.value;
+        passwordButton.addEventListener("click", () => {
+          window.dispatchEvent(new CustomEvent("password-cell-click", { detail: row }));
+        });
+        passwordCell.appendChild(passwordButton);
+
+        const contextCell = document.createElement("td");
+        contextCell.textContent = row.context_before + " … " + row.context_after;
+
+        const countCell = document.createElement("td");
+        countCell.textContent = row.count_in_page;
+
+        tr.append(pageCell, typeCell, passwordCell, contextCell, countCell);
+        resultsBody.appendChild(tr);
+      }
+      resultsTable.style.display = matches.length ? "table" : "none";
+    }
+
+    async function loadReport(crawlId) {
+      let response;
+      try {
+        response = await fetch("/crawls/" + crawlId + "/report");
+      } catch (err) {
+        appendLog("Failed to load report: " + err);
+        return;
+      }
+      if (!response.ok) {
+        appendLog("Failed to load report (status " + response.status + ")");
+        return;
+      }
+      const report = await response.json();
+      renderResultsTable(report.matches);
+    }
+
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       runButton.disabled = true;
       log.innerHTML = "";
+      resultsBody.innerHTML = "";
+      resultsTable.style.display = "none";
       appendLog("Starting crawl...");
 
       const body = {
@@ -153,6 +252,7 @@
           appendLog("Crawl finished.");
           runButton.disabled = false;
           socket.close();
+          loadReport(crawl_id);
         }
       });
 

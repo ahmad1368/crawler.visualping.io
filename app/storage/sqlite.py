@@ -12,7 +12,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 
-from app.models import CrawlSummary, PageResult, PasswordMatch
+from app.models import CrawlSummary, PageResult, PasswordMatch, SourceType
 from app.storage.repository import Repository
 
 _SCHEMA = """
@@ -113,3 +113,23 @@ class SqliteRepository(Repository):
             started_at=datetime.fromisoformat(started) if started else datetime.now(timezone.utc),
             finished_at=datetime.fromisoformat(finished) if finished else None,
         )
+
+    def get_matches(self) -> list[PasswordMatch]:
+        rows = self._conn.execute(
+            """
+            SELECT value, source_type, source_url, context_before, context_after, locator
+            FROM matches
+            ORDER BY id
+            """
+        ).fetchall()
+        return [
+            PasswordMatch(
+                value=value,
+                source_type=SourceType(source_type),
+                source_url=source_url,
+                context_before=context_before,
+                context_after=context_after,
+                locator=locator,
+            )
+            for value, source_type, source_url, context_before, context_after, locator in rows
+        ]

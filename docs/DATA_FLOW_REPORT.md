@@ -14,10 +14,14 @@ yet -- they show where today's outputs are headed.
 Browser: GET /                                app/api/routes.py + app/static/index.html
 (operator fills in url/username/password/context_chars in an HTML form)
 │
-└── JS: fetch POST /crawls, then WebSocket /ws/crawls/{id}
+└── JS: fetch POST /crawls, then WebSocket /ws/crawls/{id}, then
+    fetch GET /crawls/{id}/report on crawl_finished
     app/static/index.html -- credentials leave the browser only in the
     POST body (JSON over the page's own origin); the Run button is
-    disabled from click until a crawl_finished message arrives
+    disabled from click until a crawl_finished message arrives; the
+    report's `matches` render into a results table with a clickable
+    password cell (dispatches a "password-cell-click" DOM event -- the
+    hook the (planned) snapshot viewer, issue #21, will use)
 
 POST /crawls (CrawlRequest: url, username, password, context_chars)
 app/api/routes.py -- validated by pydantic (HttpUrl, non-empty credentials);
@@ -71,16 +75,24 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
                     │   │                         the (planned) UI's "jump
                     │   │                         to location" viewer
                     │   │
+                    │   ├── get_matches()          every stored PasswordMatch,
+                    │   │   app/storage/ (issue #20) -- routes.py groups
+                    │   │   these by (source_url, value) into MatchTableRow
+                    │   │   (page_url, source_type, value, context, count_in_page)
+                    │   │
                     │   └── Orchestrator.run()'s return value -> CrawlSummary
                     │       for just this run, held in memory as
                     │       _crawls[crawl_id].report
                     │       │
                     │       └── GET /crawls/{id}/report   app/api/routes.py
-                    │           (returns the in-memory report once
-                    │           finished; 409 while running, 500 if the
-                    │           crawl failed -- NOT the same as
+                    │           (CrawlReportResponse{summary, matches} --
+                    │           summary is the in-memory report; matches is
+                    │           the MatchTableRow list built from
+                    │           get_matches() above; 409 while running, 500
+                    │           if the crawl failed -- NOT the same as
                     │           Repository.get_report(), a separate,
-                    │           DB-wide aggregate this endpoint doesn't use)
+                    │           DB-wide aggregate CrawlSummary this endpoint
+                    │           doesn't use)
                     │
                     └── EventBus.publish(PAGE_FETCHED, page) and, per match,
                         publish(MATCH_FOUND, match)          app/events.py
@@ -539,3 +551,33 @@ becomes the durable/exposed copy of that secret).
   mocked to a two-page crawl with an artificial delay -- this proves the
   Run button stays disabled while genuinely in progress and the log
   updates live, not just that the static markup looks right.
+
+## Issue #20: results table (page, source type, password, context, count)
+
+- **Inputs:** the browser's `fetch GET /crawls/{id}/report`, triggered by
+  the UI (issue #19) when it receives `crawl_finished`. No new user input.
+- **Transformation:** `GET /crawls/{id}/report`'s response shape changed
+  from a bare `CrawlSummary` to `CrawlReportResponse{summary, matches}`.
+  `Repository` gained `get_matches() -> list[PasswordMatch]`
+  (`SqliteRepository` implements it as a plain `SELECT ... FROM matches
+  ORDER BY id`); `_CrawlState` now retains the crawl's `Repository`
+  instance (`_build_orchestrator()` returns it alongside the orchestrator)
+  so the report endpoint can read it back. `_build_match_rows()` groups
+  raw matches by `(source_url, value)`, counting occurrences into
+  `count_in_page` and deduping identical matches into one `MatchTableRow`
+  (`page_url`, `source_type`, `value`, `context_before`/`context_after`,
+  `count_in_page`). `app/static/index.html` renders one `<tr>` per row;
+  the password cell is a `<button>` (not plain text) whose click handler
+  dispatches a `password-cell-click` `CustomEvent` on `window` carrying
+  the row -- the hook the snapshot viewer (issue #21) will attach to.
+- **Outputs:** the full table of previously-persisted `PasswordMatch`
+  values (plaintext secret + context) now travels from the per-crawl
+  SQLite file, through this JSON response, onto the operator's own screen.
+  **Data-flow note:** this is the intended end-of-pipeline destination for
+  this data -- the tool exists so the operator who ran the crawl (with
+  their own site's credentials) can see what it found -- but it's the
+  first point actual secret *values* leave the database and reach an HTTP
+  response body, not just aggregate counts (issue #17's report originally
+  exposed counts only). Same trust assumption as issues #17-19 applies: no
+  auth of its own, so this endpoint (and therefore every found password)
+  is only as protected as the network this API runs on.
