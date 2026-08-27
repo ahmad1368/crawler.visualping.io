@@ -214,6 +214,97 @@ def test_get_matches_preserves_the_same_value_found_on_two_distinct_pages():
     assert all(m.value == match_on_page_y.value for m in matches)
 
 
+def test_get_all_page_fetch_data_returns_empty_list_when_none_stored():
+    repo = _repo()
+
+    assert repo.get_all_page_fetch_data() == []
+
+
+def test_save_page_persists_content_type_headers_cookies_for_replay():
+    """issue #72: content_type/headers/cookies, once saved, come back out
+    via get_all_page_fetch_data() -- the input a replay pass needs to
+    re-run extraction without a live re-fetch."""
+    repo = _repo()
+    page = PageResult(
+        url="https://example.com/page",
+        status_code=200,
+        fetched_at=datetime.now(timezone.utc),
+    )
+
+    repo.save_page(
+        page,
+        snapshot=b"<html>content</html>",
+        content_type="text/html",
+        headers={"X-Debug-Password": "leaked=VISUALPING{abcdef1234567890}"},
+        cookies={"session": "abc123"},
+    )
+
+    data = repo.get_all_page_fetch_data()
+
+    assert len(data) == 1
+    assert data[0].url == "https://example.com/page"
+    assert data[0].content == b"<html>content</html>"
+    assert data[0].content_type == "text/html"
+    assert data[0].headers == {"X-Debug-Password": "leaked=VISUALPING{abcdef1234567890}"}
+    assert data[0].cookies == {"session": "abc123"}
+
+
+def test_save_page_without_content_type_is_excluded_from_replay_data():
+    """A page saved without content_type/headers/cookies (the params are
+    optional, for callers that only care about the snapshot) can't be
+    replayed with any confidence about which extractor should have run --
+    excluded from get_all_page_fetch_data() rather than replayed with a
+    guessed or empty content_type."""
+    repo = _repo()
+    page = PageResult(
+        url="https://example.com/page",
+        status_code=200,
+        fetched_at=datetime.now(timezone.utc),
+    )
+
+    repo.save_page(page, snapshot=b"content")  # no content_type/headers/cookies
+
+    assert repo.get_all_page_fetch_data() == []
+
+
+def test_get_all_page_fetch_data_defaults_missing_headers_cookies_to_empty_dict():
+    repo = _repo()
+    page = PageResult(
+        url="https://example.com/page",
+        status_code=200,
+        fetched_at=datetime.now(timezone.utc),
+    )
+
+    repo.save_page(page, snapshot=b"content", content_type="text/plain")
+
+    data = repo.get_all_page_fetch_data()
+
+    assert data[0].headers == {}
+    assert data[0].cookies == {}
+
+
+def test_save_page_upsert_updates_content_type_headers_cookies_too():
+    repo = _repo()
+    page = PageResult(
+        url="https://example.com/a",
+        status_code=200,
+        fetched_at=datetime.now(timezone.utc),
+    )
+
+    repo.save_page(page, snapshot=b"old", content_type="text/plain", headers={"A": "1"}, cookies={})
+    repo.save_page(
+        page, snapshot=b"new", content_type="text/html", headers={"B": "2"}, cookies={"c": "3"}
+    )
+
+    data = repo.get_all_page_fetch_data()
+
+    assert len(data) == 1
+    assert data[0].content == b"new"
+    assert data[0].content_type == "text/html"
+    assert data[0].headers == {"B": "2"}
+    assert data[0].cookies == {"c": "3"}
+
+
 def test_get_visited_urls_returns_empty_list_when_none_stored():
     repo = _repo()
 

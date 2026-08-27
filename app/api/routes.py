@@ -24,6 +24,7 @@ from app.crawler.browser_fetcher import BrowserFetcher
 from app.crawler.fetcher import HttpFetcher
 from app.crawler.frontier import UrlFrontier
 from app.crawler.orchestrator import Orchestrator
+from app.crawler.replay import replay_extraction
 from app.events import CRAWL_FINISHED, EventBus
 from app.extractors.base import ExtractorRegistry
 from app.extractors.binary_fallback import BinaryFallbackExtractor
@@ -31,7 +32,7 @@ from app.extractors.css_js import CssJsExtractor
 from app.extractors.headers_cookies import HeaderCookieExtractor
 from app.extractors.html import HtmlExtractor
 from app.extractors.image_exif import ImageExifExtractor
-from app.models import CrawlSummary
+from app.models import CrawlSummary, PasswordMatch
 from app.storage.repository import Repository
 from app.storage.sqlite import SqliteRepository
 
@@ -97,13 +98,18 @@ class SnapshotResponse(BaseModel):
 
 
 class _CrawlState:
-    def __init__(self) -> None:
+    def __init__(self, context_chars: int = 80) -> None:
         self.status = CrawlStatus.RUNNING
         self.report: CrawlSummary | None = None
         self.error: str | None = None
         self.event_bus = EventBus()
         self.repository: Repository | None = None
         self.orchestrator: Orchestrator | None = None
+        # Kept so a later /re-extract (issue #72) builds extractors with
+        # the same context_chars the original crawl used, instead of
+        # silently reverting to a default and producing inconsistent
+        # context strings.
+        self.context_chars = context_chars
 
 
 _crawls: dict[str, _CrawlState] = {}
@@ -182,7 +188,7 @@ async def start_crawl(
     request: CrawlRequest, background_tasks: BackgroundTasks
 ) -> CrawlCreatedResponse:
     crawl_id = str(uuid.uuid4())
-    _crawls[crawl_id] = _CrawlState()
+    _crawls[crawl_id] = _CrawlState(context_chars=request.context_chars)
     background_tasks.add_task(_run_crawl, crawl_id, request)
     return CrawlCreatedResponse(crawl_id=crawl_id)
 
@@ -253,14 +259,36 @@ async def get_crawl_report(crawl_id: str) -> CrawlReportResponse:
         raise HTTPException(status_code=500, detail=state.error or "crawl failed")
     assert state.report is not None  # guaranteed once status is FINISHED or STOPPED
 
-    return CrawlReportResponse(summary=state.report, matches=_build_match_rows(state))
+    matches = state.repository.get_matches() if state.repository is not None else []
+    return CrawlReportResponse(summary=state.report, matches=_build_match_rows(matches))
 
 
-def _build_match_rows(state: _CrawlState) -> list[MatchTableRow]:
+@app.post("/crawls/{crawl_id}/re-extract", response_model=CrawlReportResponse)
+async def re_extract_crawl(crawl_id: str) -> CrawlReportResponse:
+    """Re-run every registered extractor against this crawl's already-
+    persisted fetch data (issue #72) -- no live re-fetch, no network or
+    browser calls. Useful right after tuning an extractor/regex: see
+    updated results in well under a second instead of waiting through a
+    full re-crawl. Read-only -- doesn't touch the crawl's stored matches,
+    safe to call as many times as needed."""
+    state = _crawls.get(crawl_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="crawl not found")
     if state.repository is None:
-        return []
+        raise HTTPException(status_code=409, detail="crawl has not started yet")
 
-    matches = state.repository.get_matches()
+    registry = ExtractorRegistry()
+    registry.register(HtmlExtractor(context_chars=state.context_chars))
+    registry.register(CssJsExtractor(context_chars=state.context_chars))
+    registry.register(ImageExifExtractor(context_chars=state.context_chars))
+    registry.register(BinaryFallbackExtractor(context_chars=state.context_chars))
+    header_cookie_extractor = HeaderCookieExtractor(context_chars=state.context_chars)
+
+    summary, matches = replay_extraction(state.repository, registry, header_cookie_extractor)
+    return CrawlReportResponse(summary=summary, matches=_build_match_rows(matches))
+
+
+def _build_match_rows(matches: list[PasswordMatch]) -> list[MatchTableRow]:
     counts: dict[tuple[str, str], int] = {}
     for match in matches:
         key = (match.source_url, match.value)

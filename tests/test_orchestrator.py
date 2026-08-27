@@ -277,6 +277,34 @@ def test_pages_are_persisted_to_repository():
     assert repository.get_report().unique_passwords_found == 1
 
 
+def test_orchestrator_persists_content_type_headers_cookies_for_replay():
+    """issue #72: content_type/headers/cookies must flow from the fetch
+    result through to storage, not just the raw snapshot bytes -- that's
+    what makes get_all_page_fetch_data()/replay_extraction() possible."""
+    fetch_responses = {
+        SEED: FetchResult(
+            content=b"<html></html>",
+            content_type="text/html",
+            status_code=200,
+            headers={"X-Debug": "value"},
+            cookies={"session": "abc"},
+        )
+    }
+    browser_responses = {SEED: BrowserFetchResult(html="", dom_links=[], network_urls=[])}
+    orchestrator, _, _, repository = _build_orchestrator(fetch_responses, browser_responses)
+
+    run(orchestrator.run())
+
+    data = repository.get_all_page_fetch_data()
+
+    assert len(data) == 1
+    assert data[0].url == SEED
+    assert data[0].content == b"<html></html>"
+    assert data[0].content_type == "text/html"
+    assert data[0].headers == {"X-Debug": "value"}
+    assert data[0].cookies == {"session": "abc"}
+
+
 def test_orchestrator_resumes_from_repository_and_skips_already_visited_urls():
     repository = SqliteRepository(sqlite3.connect(":memory:"))
     # Simulate a previous, crashed run that already fetched PAGE_A.

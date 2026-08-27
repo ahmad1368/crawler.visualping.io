@@ -117,9 +117,13 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
                 └── PageResult(url, status_code, fetched_at, matches)
                     app/models.py
                     │
-                    ├── Repository.save_page(page, snapshot=content)
+                    ├── Repository.save_page(page, snapshot=content,
+                    │   content_type=..., headers=..., cookies=...)
                     │   app/storage/ (SqliteRepository -- one *.db file per
-                    │   crawl_id, durable, gitignored)
+                    │   crawl_id, durable, gitignored; content_type/headers/
+                    │   cookies added in issue #72, alongside the snapshot,
+                    │   specifically so a page can be re-extracted later
+                    │   without a live re-fetch)
                     │   │
                     │   ├── get_snapshot(url)     raw bytes back out
                     │   │   │
@@ -128,6 +132,29 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
                     │   │       utf-8 (errors="replace") and returns the
                     │   │       full raw page/resource content to the UI's
                     │   │       "jump to location" snapshot viewer
+                    │   │
+                    │   ├── get_all_page_fetch_data()   every page's
+                    │   │   │   content/content_type/headers/cookies
+                    │   │   │   (issue #72) -- pages saved without a
+                    │   │   │   content_type are excluded, never replayed
+                    │   │   │   with a guessed one
+                    │   │   │
+                    │   │   └── POST /crawls/{id}/re-extract
+                    │   │       app/api/routes.py -> app/crawler/replay.py
+                    │   │       ::replay_extraction() -- re-runs a fresh
+                    │   │       ExtractorRegistry + HeaderCookieExtractor
+                    │   │       (built with the crawl's own context_chars,
+                    │   │       _CrawlState.context_chars) against every
+                    │   │       stored page, zero network/browser calls.
+                    │   │       Read-only: returns fresh PasswordMatch
+                    │   │       objects without calling save_match/
+                    │   │       save_page, so it can't duplicate or corrupt
+                    │   │       what a live crawl already recorded, and is
+                    │   │       safe to call repeatedly. Response is the
+                    │   │       same CrawlReportResponse{summary, matches}
+                    │   │       shape as GET /report, computed fresh --
+                    │   │       allowed at any crawl status (even RUNNING/
+                    │   │       PAUSED) as long as the crawl has started
                     │   │
                     │   ├── get_matches()          every stored PasswordMatch,
                     │   │   app/storage/ (issue #20) -- routes.py groups
@@ -1376,3 +1403,112 @@ size.
   can only be confirmed by re-running against the real target's
   URL/credentials, not available in this session -- same recurring
   caveat as every fix in this report since issue #61.
+
+## Issue #72: cache/replay fetched site data instead of re-crawling live on every query
+
+User's question -- "store the entire site in memory... make a faster
+query" -- was answered as its own request: fetching (HTTP + Playwright
+navigation) is the real bottleneck, not extraction (fast, pure-CPU
+regex), and the crawl already durably stores every page's raw bytes.
+The gap was that content_type/headers/cookies -- everything extraction
+actually needs besides the bytes -- weren't persisted alongside the
+snapshot, so there was no way to correctly re-run extraction against
+stored data without them.
+
+- **Inputs:** `Repository.save_page()` (`app/storage/repository.py`)
+  gains three new optional parameters: `content_type`, `headers`,
+  `cookies`. `Orchestrator._process_url()` now passes all three from the
+  `FetchResult` it already had (`fetch_result.content_type`/`.headers`/
+  `.cookies`) -- previously computed and used for extraction in that same
+  request, then discarded rather than persisted.
+- **Transformation:**
+  1. `SqliteRepository`'s `pages` table gains `content_type`, `headers`,
+     `cookies` columns (the latter two JSON-encoded dicts). New
+     `get_all_page_fetch_data()` reads them back out as a
+     `list[PageFetchData]` (new model, `app/models.py`) -- joined against
+     `snapshots` for the content bytes. A page saved without a
+     `content_type` (the parameter is optional, for any caller that only
+     cares about the snapshot) is excluded from this list rather than
+     replayed with a guessed or empty one, which could misroute an
+     extractor (e.g. treat an image as HTML).
+  2. New `app/crawler/replay.py::replay_extraction()`: given a
+     `Repository`, an `ExtractorRegistry`, and a `HeaderCookieExtractor`,
+     re-runs both against every page's stored fetch data and returns a
+     `CrawlSummary` (same shape a live crawl produces) plus the full
+     match list. Deliberately **read-only** -- never calls
+     `save_page`/`save_match` -- so replaying can't duplicate or corrupt
+     what a real crawl already persisted, and is safe to call repeatedly
+     (e.g. once per extractor-tuning iteration).
+  3. New `POST /crawls/{id}/re-extract` (`app/api/routes.py`): builds a
+     fresh `ExtractorRegistry`/`HeaderCookieExtractor` using the crawl's
+     own `context_chars` (now kept on `_CrawlState.context_chars`, set at
+     crawl start, so replay produces context strings consistent with the
+     original crawl rather than silently reverting to a default), calls
+     `replay_extraction()`, and returns the same `CrawlReportResponse`
+     shape `GET /report` does. Allowed at any crawl status past "started"
+     (`state.repository is not None`) -- including `RUNNING`/`PAUSED` --
+     since it's read-only and safe to call against a still-in-progress
+     crawl's data so far, not just a finished one.
+  4. `_build_match_rows()` refactored to take a plain `list[PasswordMatch]`
+     instead of a `_CrawlState`, so both `GET /report` (backed by
+     `Repository.get_matches()`, the durably-persisted set) and the new
+     endpoint (backed by `replay_extraction()`'s freshly-computed,
+     unpersisted set) can share the same grouping/dedup logic.
+  5. **Deliberately not implemented** (per the issue's own stated
+     priority): an in-process `HttpFetcher` cache keyed by URL. Lower
+     priority because `UrlFrontier`'s existing dedup already means no URL
+     is fetched twice within one live crawl today -- it would only start
+     mattering if a future feature re-visits URLs (e.g. a retry-on-failure
+     path). Not built speculatively.
+- **Outputs:** `PageFetchData` (new) carries the same class of sensitive
+  data a snapshot already does -- raw response bytes -- plus something
+  new: **the target site's raw response headers and cookies, now
+  persisted verbatim**, not just whichever substring happened to match
+  the password regex.
+  **Data-flow/security note (per the data-flow watchlist -- flagged
+  explicitly, not silently added):** this is a genuinely new class of
+  data at rest. A response header or `Set-Cookie` value can carry a
+  session token, CSRF token, or other secret that was never a password
+  match and is now stored in the crawl's `*.db` regardless. This is the
+  same trust boundary the report already applies to snapshot content
+  (**"Crawl snapshots... can contain secrets beyond the one matched
+  password -- treat snapshot storage itself as sensitive data at
+  rest"**) extended to a new column, not a new category of risk: the
+  `*.db` file was already fully sensitive, gitignored, and never
+  auto-cleaned before this issue. There was no way to enable replay of
+  header/cookie-embedded password matches without persisting the
+  header/cookie values replay needs to scan -- an inherent tradeoff of
+  the feature, not an oversight.
+- **Tests:**
+  - `tests/test_sqlite_repository.py`: `save_page()`'s new params
+    persist and read back correctly via `get_all_page_fetch_data()`; a
+    page saved without `content_type` is excluded; missing headers/
+    cookies default to `{}`; the upsert path updates all three fields on
+    a repeat `save_page()` for the same URL.
+  - `tests/test_orchestrator.py`:
+    `test_orchestrator_persists_content_type_headers_cookies_for_replay`
+    -- confirms the full live pipeline (fetch -> orchestrator ->
+    storage) actually threads these through, not just the storage layer
+    in isolation.
+  - `tests/test_replay.py` (new file): `replay_extraction()` finds
+    matches from stored HTML and from stored headers/cookies; routes to
+    the extractor matching the *stored* content_type (not every
+    extractor); is read-only (a full `Repository` double asserts
+    `save_page`/`save_match` are never called); handles zero stored
+    pages without error; a repeated value across two pages counts once
+    in `unique_passwords_found` but still produces two match rows.
+  - `tests/test_api_routes.py`: `POST /crawls/{id}/re-extract` -- 404
+    unknown crawl, 409 before the crawl has started, a successful replay
+    against a `FakeRepository`'s stored fetch data, allowed while the
+    crawl status is still `RUNNING`, and idempotent across two
+    consecutive calls (same result both times, proving the endpoint
+    itself doesn't accumulate state across calls).
+  - Full suite: 198 tests pass (16 new). ruff/black/mypy clean.
+- **Not implemented / explicitly out of scope:** no UI button wired up
+  for `/re-extract` -- the issue's own proposed design only asked for
+  "a CLI/script entry point, or a new API action," and the API action is
+  what got built. Adding a UI trigger is a natural, separate follow-up
+  if wanted, not folded in here to avoid scope creep into UI-layer
+  design decisions (button placement, what "re-extract" should be called
+  to an operator, whether it needs its own confirmation) that weren't
+  part of this issue's request.

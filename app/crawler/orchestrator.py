@@ -189,7 +189,13 @@ class Orchestrator:
             fetched_at=datetime.now(timezone.utc),
             matches=matches,
         )
-        self._repository.save_page(page, snapshot=fetch_result.content)
+        self._repository.save_page(
+            page,
+            snapshot=fetch_result.content,
+            content_type=fetch_result.content_type,
+            headers=fetch_result.headers,
+            cookies=fetch_result.cookies,
+        )
 
         if self._event_bus is not None:
             self._event_bus.publish(PAGE_FETCHED, page)
