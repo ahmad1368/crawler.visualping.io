@@ -1047,75 +1047,51 @@ called out explicitly, not fabricated.
     implementation and its existing test coverage; it was not re-verified
     by driving a real browser against the real target's JS.
 
-## Fix: binary fallback extractor no longer blanket-excludes images
+## Fix: image EXIF extractor missed the nested Exif sub-IFD (UserComment, etc.)
 
-Found via code review after #63 still left the real crawl at 1/8
-passwords found -- `BinaryFallbackExtractor` (`app/extractors/binary_fallback.py`)
-excluded every `image/*` content type outright, on the assumption
-`ImageExifExtractor` covers images fully. It doesn't: EXIF metadata is
-only one place a password can live in an image file. PNG `tEXt`/`iTXt`
-chunks (e.g. a "Comment" field) are a completely different, non-EXIF
-mechanism -- plain, uncompressed strings sitting directly in the file
-bytes -- and JPEG `COM` comment segments work the same way. Neither is
-reachable through `image.getexif()`.
+Found via code review after #63 still left the real crawl at 1/8 passwords
+found -- `ImageExifExtractor.extract()` (`app/extractors/image_exif.py`)
+only ever scanned `image.getexif().items()`, which is the base IFD0 only.
+`UserComment` (tag `0x9286`), `DateTimeOriginal`, and most fields a person
+would actually stash a note in live in the nested "Exif" sub-IFD (reached
+via the IFD0 pointer tag `0x8769`), reachable only through
+`exif.get_ifd(ExifTags.IFD.Exif)` -- never through the top-level mapping's
+own `.items()`. Confirmed empirically with `piexif`: a `UserComment`
+written the way any real tool writes it (piexif, exiftool, a camera) was
+completely invisible to the old code. The project's own
+`tests/test_image_exif_extractor.py` passed anyway because its fixture
+helper set the tag directly on the top-level `Exif` object before saving,
+which Pillow serializes flatly into IFD0 -- a shape no real-world tool
+produces -- so the test gave false confidence.
 
-Confirmed empirically: built a PNG with a `Comment` chunk holding a
-password and verified the raw file bytes contain it in plain text
-(`b"VISUALPING{...}" in raw_png_bytes` is `True`), while
-`Image.open(...).info` shows the chunk and `Image.open(...).getexif()`
-shows nothing. Before this fix, neither extractor could ever find that
-password -- `ImageExifExtractor` only looks at EXIF, and
-`BinaryFallbackExtractor` was explicitly configured to skip images
-entirely (`tests/test_binary_fallback_extractor.py::
-test_skips_content_types_handled_by_other_extractors` asserted exactly
-that, by design).
-
-## How this fixes it
-
-- `_is_handled_elsewhere()` no longer treats `image/*` as "handled
-  elsewhere" -- `BinaryFallbackExtractor`'s raw `strings`-style byte scan
-  now runs on image content the same as any other binary type.
-- This does mean an EXIF-embedded password gets reported twice for the
-  same image now (once via `ImageExifExtractor` as `IMAGE_METADATA`,
-  once via this extractor as `BINARY`, since the EXIF blob's bytes are
-  also just bytes in the file) -- harmless, since matches are already
-  grouped by `(source_url, value)` downstream
-  (`app/api/routes.py::_build_match_rows`), so it surfaces as one report
-  row with a higher `count_in_page`, not a spurious second finding.
-- **Outputs:** no new `SourceType`, no new persisted column -- same
-  `BINARY` source type images now share with any other unhandled
-  content type.
-  **Data-flow/security note (per the data-flow watchlist):** no change
-  in kind -- same sensitive-text path (`PasswordMatch.value`/context)
-  through the same existing storage/API surface, just from image bytes
-  the extractor previously skipped outright.
-
-## Tests
-
-- `tests/test_binary_fallback_extractor.py`: removed `image/png` from
-  the "skipped" case, added `test_does_not_skip_image_content_types`
-  and `test_finds_password_in_png_text_chunk_metadata` (the actual
-  regression case, built with `Pillow`'s `PngImagePlugin.PngInfo`).
-- `tests/test_e2e_crawl.py`: the fixture's `/photo.jpg` now legitimately
-  matches under both `IMAGE_METADATA` and `BINARY`, since its EXIF bytes
-  are also plain bytes in the file. Switched the test's assertion from a
-  `value -> source_type` dict (which silently dropped duplicates via
-  last-write-wins) to a `value -> set[source_type]` one, to actually
-  assert on every source type a value is found under rather than
-  whichever happened to be inserted last. That stricter check also
-  surfaced a second, **pre-existing, out-of-scope** duplicate --
-  `HeaderCookieExtractor` finds a `Set-Cookie`-planted password under
-  both `COOKIE` and `HTTP_HEADER`, since it scans the raw `Set-Cookie`
-  response header and the parsed cookie jar separately. Reflected in the
-  updated expectation with an explanatory comment; not fixed here, since
-  it's unrelated to this PR's bug and both source types are technically
-  accurate (the value genuinely appears in both places).
-- Full suite: 152 tests pass (this repo's Chromium install let the
-  browser/UI/e2e tests run too, not just the excludable subset).
-  ruff/black/mypy clean.
-- `docs/DATA_FLOW_REPORT.md` updated with this section per this repo's
-  convention.
-
-**Not verified:** whether this specific fix recovers one of the 7
-still-missing real-target passwords -- that requires re-running against
-the real target's URL/credentials, not available in this session.
+- **Inputs/Transformation:** `extract()` now also scans
+  `exif.get_ifd(ExifTags.IFD.Exif)` (tag names from `ExifTags.TAGS`, same
+  namespace as IFD0) and `exif.get_ifd(ExifTags.IFD.GPSInfo)` (tag names
+  from `ExifTags.GPSTAGS`), via a shared `_scan_ifd()` helper. Matches
+  from the Exif sub-IFD share the `exif:<TagName>` locator prefix with
+  IFD0 matches (both are conceptually "EXIF"); GPS IFD matches get a
+  distinct `exif-gps:<TagName>` prefix. `exif.get_ifd(...)` returns an
+  empty mapping (not an error) when an image has no sub-IFD, so this is
+  safe against plain photos with only base EXIF or none at all.
+- **Outputs:** no new `SourceType` -- still `IMAGE_METADATA`, just with a
+  `locator` that can now read e.g. `exif:UserComment` or
+  `exif-gps:GPSProcessingMethod` where before those fields were silently
+  skipped. No new persisted column.
+  **Data-flow/security note (per the data-flow watchlist):** no change in
+  kind -- this surfaces the same class of sensitive text
+  (`PasswordMatch.value`/context) through the same existing storage/API
+  path, just from IFD locations the extractor previously missed.
+- **Tests:** `piexif==1.1.3` added as a dev-only dependency
+  (`pyproject.toml`) specifically to build realistic nested-IFD fixtures
+  -- hand-rolling correct multi-IFD EXIF byte layout without it proved
+  too fragile to trust as test fixture code. Two new tests in
+  `tests/test_image_exif_extractor.py`:
+  `test_extracts_password_from_user_comment_in_nested_exif_subifd` (the
+  regression case) and `test_extracts_password_from_gps_ifd`. All 7
+  tests in that file pass; full suite (148 tests, excluding the
+  browser/UI/e2e tests that need a live Chromium) still passes; ruff,
+  black, and mypy clean.
+- **Not verified against the real target:** whether this specific fix
+  recovers one of the 7 still-missing passwords can only be confirmed by
+  re-running against the real target's URL and credentials, which this
+  session does not have.
