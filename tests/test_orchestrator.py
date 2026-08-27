@@ -271,6 +271,93 @@ def test_redirect_loop_does_not_hang_or_abort_the_crawl():
     assert summary.queue_empty is True
 
 
+def test_pause_blocks_all_fetches_until_resumed():
+    fetch_responses = {SEED: _html_response(), PAGE_A: _html_response()}
+    browser_responses = {
+        SEED: BrowserFetchResult(html="", dom_links=[PAGE_A], network_urls=[]),
+        PAGE_A: BrowserFetchResult(html="", dom_links=[], network_urls=[]),
+    }
+    orchestrator, http_fetcher, _, _ = _build_orchestrator(
+        fetch_responses, browser_responses, concurrency=1
+    )
+
+    async def scenario():
+        orchestrator.pause()
+        task = asyncio.create_task(orchestrator.run())
+        await asyncio.sleep(0.05)  # let the worker reach and block on the pause point
+        assert http_fetcher.calls == [], "no fetch should happen while paused"
+
+        orchestrator.resume()
+        return await asyncio.wait_for(task, timeout=2)
+
+    summary = run(scenario())
+
+    assert sorted(http_fetcher.calls) == sorted([SEED, PAGE_A])
+    assert summary.queue_empty is True
+
+
+def test_stop_before_any_work_processes_nothing_and_leaves_queue_non_empty():
+    urls = [SEED] + [f"https://example.com/p{i}" for i in range(5)]
+    fetch_responses = {url: _html_response() for url in urls}
+    browser_responses = {
+        SEED: BrowserFetchResult(html="", dom_links=urls[1:], network_urls=[]),
+        **{url: BrowserFetchResult(html="", dom_links=[], network_urls=[]) for url in urls[1:]},
+    }
+    orchestrator, http_fetcher, _, _ = _build_orchestrator(
+        fetch_responses, browser_responses, concurrency=1
+    )
+
+    async def scenario():
+        orchestrator.pause()  # hold it before it starts so stop() lands deterministically
+        task = asyncio.create_task(orchestrator.run())
+        await asyncio.sleep(0.05)
+        orchestrator.stop()
+        return await asyncio.wait_for(task, timeout=2)
+
+    summary = run(scenario())
+
+    assert http_fetcher.calls == []
+    assert summary.resources_checked == 0
+    assert summary.queue_empty is False
+
+
+def test_stop_mid_crawl_ends_early_with_a_non_empty_queue():
+    urls = [SEED] + [f"https://example.com/p{i}" for i in range(5)]
+    fetch_responses = {url: _html_response() for url in urls}
+    browser_responses = {
+        SEED: BrowserFetchResult(html="", dom_links=urls[1:], network_urls=[]),
+        **{url: BrowserFetchResult(html="", dom_links=[], network_urls=[]) for url in urls[1:]},
+    }
+    orchestrator, http_fetcher, _, _ = _build_orchestrator(
+        fetch_responses, browser_responses, concurrency=1
+    )
+
+    # A real delay per fetch, so the event loop actually yields between
+    # pages -- the fakes elsewhere in this file return instantly with no
+    # true suspension point, which would let a crawl this small run to
+    # completion in a single scheduling turn and make "stop mid-crawl"
+    # unobservable (stop() would always land after run() already finished).
+    original_fetch = http_fetcher.fetch
+
+    async def delayed_fetch(url):
+        await asyncio.sleep(0.05)
+        return await original_fetch(url)
+
+    http_fetcher.fetch = delayed_fetch
+
+    async def scenario():
+        task = asyncio.create_task(orchestrator.run())
+        await asyncio.sleep(0.12)  # ~2 fetches worth, well before all 6 finish
+        orchestrator.stop()
+        return await asyncio.wait_for(task, timeout=2)
+
+    summary = run(scenario())
+
+    assert 0 < len(http_fetcher.calls) < len(urls)
+    assert summary.resources_checked == len(http_fetcher.calls)
+    assert summary.queue_empty is False
+
+
 def test_pagination_guard_stops_a_runaway_family_but_still_finds_real_content():
     real_content_url = "https://example.com/real-content"
     pagination_urls = [f"https://example.com/report?page={i}" for i in range(1, 51)]

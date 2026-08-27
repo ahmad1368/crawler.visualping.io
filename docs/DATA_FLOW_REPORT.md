@@ -55,7 +55,17 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
     (constructs a fresh httpx.AsyncClient + Playwright browser +
      ExtractorRegistry + HeaderCookieExtractor + a per-crawl
      SqliteRepository -- the single seam integration tests replace with a
-     fake Orchestrator, per issue #17's acceptance criteria)
+     fake Orchestrator, per issue #17's acceptance criteria; the built
+     Orchestrator is also stashed on _CrawlState.orchestrator, issue #68,
+     so the pause/resume/stop endpoints below have a live handle to it)
+    │
+    +-- POST /crawls/{id}/pause | /resume | /stop   app/api/routes.py (#68)
+    |   (call state.orchestrator.pause()/resume()/stop() directly, then
+    |    move _CrawlState.status to PAUSED/RUNNING/STOPPING; stop() uses a
+    |    transitional STOPPING rather than the terminal STOPPED so GET
+    |    /report's "report is set once status is terminal" guarantee still
+    |    holds -- _run_crawl(), not this endpoint, finalizes STOPPING to
+    |    STOPPED once Orchestrator.run() has actually returned)
     │
     └── Orchestrator.run()                      app/crawler/orchestrator.py
         (asyncio.Semaphore(concurrency)-bounded workers pop from the
@@ -65,7 +75,10 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
          run against the same *.db without re-fetching; a single URL's
          processing failure, e.g. the browser fetcher navigating into a
          genuine HTTP redirect loop, is caught per-URL so it can't hang
-         or abort the rest of the crawl, issue #24)
+         or abort the rest of the crawl, issue #24; each worker also
+         awaits an asyncio.Event before popping its next URL and checks a
+         stop flag right after, issue #68 -- pause()/resume()/stop()
+         control that Event/flag from outside an in-flight run())
         │
         ├── UrlFrontier                          app/crawler/frontier.py
         │   (queue + visited-set seeded from the request URL; normalizes
@@ -1095,3 +1108,104 @@ produces -- so the test gave false confidence.
   recovers one of the 7 still-missing passwords can only be confirmed by
   re-running against the real target's URL and credentials, which this
   session does not have.
+
+## Issue #68: pause, stop, and resume controls alongside Run
+
+- **Inputs:** no new request body shape -- the three new endpoints take
+  only the existing `crawl_id` path parameter, no request body.
+- **Transformation:**
+  1. `Orchestrator` (`app/crawler/orchestrator.py`) gains `pause()`/
+     `resume()`/`stop()`, all synchronous (no `await`) since they just
+     flip in-memory state an already-running `worker()` coroutine reads:
+     an `asyncio.Event` (`pause()` clears it, `resume()` sets it,
+     `worker()` awaits it before popping its next URL -- never
+     interrupting an in-flight fetch) and a `_stop_requested` flag
+     (checked right after the event, so a stopped worker exits before
+     touching the frontier again). `stop()` also sets the event so an
+     already-paused worker wakes up to see the stop rather than blocking
+     forever. None of the three touch already-in-flight `_process_url()`
+     work.
+  2. `app/api/routes.py`: `_CrawlState` gains an `orchestrator` field
+     (the built `Orchestrator` instance, stashed in `_run_crawl` right
+     after `_build_orchestrator()` returns) so the new endpoints have a
+     live handle to call into. `CrawlStatus` gains `PAUSED`, `STOPPING`,
+     and `STOPPED`. Three new endpoints -- `POST /crawls/{id}/pause`,
+     `/resume`, `/stop` -- validate the current status (409 on an invalid
+     transition, e.g. pausing an already-paused crawl, or any control
+     action before the crawl has actually started and `state.orchestrator`
+     is still `None`), call the matching `Orchestrator` method, and move
+     `_CrawlState.status` accordingly.
+  3. **Race avoided deliberately:** `stop_crawl()` moves status to the
+     transitional `STOPPING`, not the terminal `STOPPED`, because
+     `orchestrator.run()` hasn't actually returned yet at that point (an
+     in-flight fetch on another worker may still be running) -- and
+     `GET /report` relies on "status is terminal implies `state.report`
+     is set." `_run_crawl()` is the only place that ever finalizes
+     `STOPPING` to `STOPPED`, one line after `state.report =
+     await orchestrator.run()`, so the guarantee always holds. `GET
+     /report` now 409s on `RUNNING`, `PAUSED`, *and* `STOPPING` (not just
+     `RUNNING` as before); once truly `STOPPED` it behaves like
+     `FINISHED` -- the report reflects whatever was actually processed
+     before the stop.
+  4. UI (`app/static/index.html`): three new buttons (Pause/Resume/Stop)
+     next to Run, styled as a minimal outlined "secondary" variant of the
+     existing button so they read as companions to Run rather than
+     competing calls to action. A single `setControlsForState()` function
+     is the one place that decides all four buttons' enabled/disabled
+     state from one of `idle | running | paused | stopping`, called from
+     the form submit handler, each control button's click handler, and
+     the WebSocket's `crawl_finished` handler -- replacing the old
+     `runButton.disabled = ...` toggles scattered across those spots.
+- **Outputs:** no new persisted data shape -- `PasswordMatch`/
+  `PageResult`/`CrawlSummary` are unaffected. A stopped crawl's
+  `CrawlSummary` (from `Orchestrator.run()`'s normal return path, just
+  triggered early) has `queue_empty=False` and lower `resources_checked`/
+  `pages_visited` than a full run would, same shape as hitting `max_pages`
+  early today -- nothing new for a consumer of `GET /report` to handle.
+  **Data-flow/security note (per the data-flow watchlist):** no new
+  credential or secret path. The three new endpoints carry no request
+  body and return only `{crawl_id, status}` -- no `PasswordMatch`/context
+  data, no Basic Auth credentials. Pausing/stopping doesn't change what
+  gets persisted to the crawl's SQLite `*.db` or exposed via the existing
+  `/report`/`/snapshot` endpoints, only when the crawl stops collecting
+  more of it.
+- **Tests:**
+  - `tests/test_orchestrator.py`: three new tests against the real
+    `Orchestrator` -- pause blocks every fetch until resumed
+    (`test_pause_blocks_all_fetches_until_resumed`), stop before any work
+    starts processes nothing (`test_stop_before_any_work_processes_nothing_and_leaves_queue_non_empty`),
+    and stop mid-crawl ends early with a non-empty queue
+    (`test_stop_mid_crawl_ends_early_with_a_non_empty_queue`, using a
+    real per-fetch delay so the event loop actually yields between pages
+    -- the file's existing fakes return instantly with no true
+    suspension point, which would otherwise let a crawl this small run to
+    completion in one scheduling turn and make "mid-crawl" unobservable).
+  - `tests/test_api_routes.py`: a `SpyOrchestrator` double covering valid
+    transitions (pause while running, resume while paused, stop while
+    running or paused), invalid transitions (409s, and asserting the
+    orchestrator method was *not* called), 404 for an unknown crawl, 409
+    for a control action before the crawl has started, `GET /report`
+    409ing on `PAUSED`/`STOPPING` and succeeding once `STOPPED`, and a
+    direct test of `_run_crawl()`'s STOPPING-to-STOPPED finalization
+    racing concern described above.
+  - `tests/test_ui.py`: a new `_PausableFakeOrchestrator` (real
+    `asyncio.Event`-gated pause/stop, not just a canned response) plus
+    `test_pause_resume_stop_controls`, a full Playwright-driven run
+    through every state transition -- idle -> running -> paused (with an
+    explicit assertion that fetching genuinely stalls while paused, not
+    just that the button looks disabled) -> running again -> stopping ->
+    idle, ending with a partial `pages_visited` (0 < visited < 8) proving
+    Stop actually cut the crawl short rather than letting it finish.
+  - Full suite: 176 tests pass. ruff/black/mypy clean.
+- **Not verified:** real-world behavior against the actual target site
+  (only exercised against fakes/fixtures here, consistent with every
+  other issue in this report that lacked real target URL/credentials).
+  Also not covered: reconnecting a *new* WebSocket connection to a
+  `PAUSED` crawl (e.g. after a page refresh) -- `app/api/websocket.py`'s
+  connect-time check only special-cases `state.status is not RUNNING` as
+  "already finished," which would incorrectly treat a paused crawl the
+  same as a finished one for a reconnecting client. Out of scope here:
+  the UI never reconnects mid-crawl (one WebSocket opens after `POST
+  /crawls` and stays open through pause/resume/stop until
+  `crawl_finished`), so this doesn't affect the shipped UI, but it's a
+  real gap for any other client that might reconnect.

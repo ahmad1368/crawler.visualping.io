@@ -24,6 +24,15 @@ than aborting or hanging the whole crawl. A `PaginationGuard` stops
 following a `?page=N`-style URL family once it's gone several consecutive
 pages with no new links or matches, so a runaway/trap pagination family
 can't burn the entire `max_pages` budget on its own.
+
+`pause()`/`resume()`/`stop()` (issue #68) give external control over an
+in-flight `run()`: `pause()` blocks every worker before it pops its next
+URL (an in-flight fetch is never interrupted mid-request); `resume()`
+un-blocks them; `stop()` makes every worker exit its loop the next time it
+would otherwise pop a URL, so `run()` returns early with a summary over
+whatever was actually processed -- the same `CRAWL_FINISHED` event/return
+path as a normal completion, just early. None of the three touch
+already-in-flight work.
 """
 
 from __future__ import annotations
@@ -66,6 +75,19 @@ class Orchestrator:
         self._max_pages = max_pages
         self._pagination_guard = PaginationGuard(max_unproductive=pagination_family_limit)
         self._event_bus = event_bus
+        self._pause_event = asyncio.Event()
+        self._pause_event.set()  # not paused by default
+        self._stop_requested = False
+
+    def pause(self) -> None:
+        self._pause_event.clear()
+
+    def resume(self) -> None:
+        self._pause_event.set()
+
+    def stop(self) -> None:
+        self._stop_requested = True
+        self._pause_event.set()  # wake any paused worker so it can see the stop and exit
 
     async def run(self) -> CrawlSummary:
         started_at = datetime.now(timezone.utc)
@@ -79,7 +101,11 @@ class Orchestrator:
 
         async def worker() -> None:
             while True:
+                await self._pause_event.wait()
+
                 async with lock:
+                    if self._stop_requested:
+                        return
                     if state["resources_checked"] >= self._max_pages:
                         return
                     if not self._frontier.has_next():
