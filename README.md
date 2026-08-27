@@ -229,3 +229,5 @@ backfilling #1-28/#61/#63, which that report already covers in full).
 - #78: `PaginationGuard` now stops a pagination family on a lack of new
   *matches* (not just links), plus an always-on hard per-family page cap
   -- defeats an adversarial family that fakes novelty forever.
+- #80: Each fetched-page log entry is now a real `<a href>` opening the
+  page in a new tab, so you can browse exactly what the crawl visited.
