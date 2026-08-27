@@ -1512,3 +1512,91 @@ stored data without them.
   design decisions (button placement, what "re-extract" should be called
   to an operator, whether it needs its own confirmation) that weren't
   part of this issue's request.
+
+## Issue #78: PaginationGuard doesn't stop an adversarial pagination trap that always looks productive
+
+Found via live testing against the real target (URL deliberately not
+recorded here or anywhere else in this repo, per the challenge's own
+"don't share the site" instruction): a `?page=N` family serving
+randomized content on every page specifically so it always looks "new,"
+which defeated `PaginationGuard`'s existing streak logic and let that
+family run unbounded -- especially dangerous combined with issue #71's
+now-`None`-by-default `max_pages`, which removed the one thing that used
+to eventually cut off *any* runaway family, trap or legitimate.
+
+- **Root cause:** `PaginationGuard.record()` reset its unproductive
+  streak whenever a page yielded `new_links` **or** `new_matches`. For
+  *any* ordinary sequential pagination, discovering the link to the next
+  page is essentially always "new" the first time it's seen -- so
+  `new_links` was never actually a reliable signal that a family was
+  "still worth crawling," trap or not. A trap that randomizes content so
+  every page plausibly contains something link-like exploits this
+  directly: the streak counter never accumulates, `is_stopped()` never
+  returns `True`, and the crawl never terminates on that family.
+- **Transformation, two layers:**
+  1. `PaginationGuard.record(url, new_matches)` -- `new_links` removed
+     from the signature entirely (not just ignored: a parameter accepted
+     but silently unused would be misleading). The unproductive streak
+     now resets **only** on an actual new password match. A family that
+     keeps discovering "new" links/content but never a real match now
+     correctly accumulates an unproductive streak and stops after
+     `max_unproductive` (still 10 by default) pages, regardless of how
+     much it superficially varies page to page.
+  2. New unconditional hard ceiling: `max_family_pages` (default 50,
+     `PaginationGuard.__init__`, threaded through
+     `Orchestrator(pagination_family_page_cap=...)`) stops any one family
+     at that many total pages, independent of the streak logic --
+     protects against a family engineered to occasionally look
+     "productive" enough to keep resetting the streak (e.g. a genuine
+     match sprinkled in periodically) from running unbounded regardless.
+     Deliberately **on by default**, unlike `max_pages`/
+     `max_duration_seconds` (issue #71): those bound an entire crawl of
+     an unknown-sized real site where no fixed number is ever safely
+     guessable up front; a single pagination family is a narrower,
+     inherently guard-worthy shape this class already treats as
+     suspicious by existing, so a sane default here doesn't carry that
+     same risk of truncating a legitimate crawl.
+  3. `Orchestrator._process_url()` no longer computes/threads a
+     `new_links` count at all -- it existed purely to feed the old
+     signal. `UrlFrontier.add_many()` calls for `dom_links`/
+     `network_urls`/`interaction_urls` are unchanged, just no longer have
+     their return values summed for this purpose.
+- **Outputs:** no new persisted data shape, no new endpoint. Behavior
+  change only: a pagination family that never yields a real match now
+  terminates predictably instead of running indefinitely.
+  **Data-flow/security note (per the data-flow watchlist):** none --
+  no new credential path, no new sensitive data, no new sink. This is a
+  crawl-completeness/termination fix.
+  **Trade-off, named rather than assumed away:** an index-style
+  pagination family that never itself contains a password but links out
+  to real content pages elsewhere could, in principle, be cut off by
+  `max_family_pages` before discovering everything past page 50 of that
+  index. Any such links already discovered on earlier pages are still
+  crawled normally as their own, independent URLs (`PaginationGuard`
+  only ever gates the family's *own* URLs, never downstream ones already
+  added to the frontier) -- only additional links first appearing beyond
+  the cap would be missed. Judged acceptable for a tool that must
+  terminate; flagged here rather than silently decided.
+- **Tests:**
+  - `tests/test_pagination_guard.py`: rewritten for the new
+    `record(url, new_matches)` signature. New cases:
+    `test_guard_is_not_defeated_by_a_family_that_always_reports_zero_matches_but_never_zero_links`
+    (the core issue #78 regression, at the unit level), plus hard-ceiling
+    coverage (`max_family_pages` stops a family that never goes
+    unproductive at all, doesn't trip early, is disabled by `None`, and
+    is on by default).
+  - `tests/test_orchestrator.py`:
+    `test_pagination_guard_terminates_an_adversarial_trap_that_always_looks_productive`
+    -- an end-to-end simulation of the real finding (every one of 100
+    fake pagination pages links only to the next page in the chain, no
+    extractor registered so `new_matches` is always 0), with `max_pages`
+    explicitly `None` (issue #71's default, no whole-crawl cap in play).
+    Asserts the crawl processes exactly the 10 pagination pages before
+    the guard trips and ends with `queue_empty=True` -- not just "fewer
+    than 100," a precise, deterministic proof of termination.
+  - Full suite: 204 tests pass (10 new). ruff/black/mypy clean.
+- **Not verified against the real target:** re-running against the
+  actual trap to confirm it now terminates (and how many of the 8
+  passwords are found once it does) needs the real target's
+  URL/credentials, not available in this session -- same recurring
+  caveat as every fix in this report since issue #61.

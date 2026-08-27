@@ -226,3 +226,6 @@ backfilling #1-28/#61/#63, which that report already covers in full).
 - #72: New `POST /crawls/{id}/re-extract` re-runs extraction against a
   crawl's already-stored pages -- no live re-fetch needed after tuning
   an extractor.
+- #78: `PaginationGuard` now stops a pagination family on a lack of new
+  *matches* (not just links), plus an always-on hard per-family page cap
+  -- defeats an adversarial family that fakes novelty forever.
