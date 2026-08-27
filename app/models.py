@@ -46,3 +46,17 @@ class CrawlSummary(BaseModel):
     queue_empty: bool
     started_at: datetime
     finished_at: datetime | None = None
+
+
+class PageFetchData(BaseModel):
+    """Everything an extractor pass needs for one page, read back out of
+    storage instead of a live fetch (issue #72's replay path). Sensitive
+    the same way a snapshot is: `content` is the full raw body, and
+    `headers`/`cookies` are the target site's raw response headers/cookies
+    (not just whichever bytes happened to match the password regex)."""
+
+    url: str
+    content: bytes
+    content_type: str | None
+    headers: dict[str, str] = {}
+    cookies: dict[str, str] = {}

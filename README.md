@@ -223,3 +223,6 @@ backfilling #1-28/#61/#63, which that report already covers in full).
   pages already lists as two separate rows, not collapsed into one.
 - #71: `max_pages`/new `max_duration_seconds` now default to `None` --
   a crawl runs until its frontier actually empties, not a guessed cap.
+- #72: New `POST /crawls/{id}/re-extract` re-runs extraction against a
+  crawl's already-stored pages -- no live re-fetch needed after tuning
+  an extractor.

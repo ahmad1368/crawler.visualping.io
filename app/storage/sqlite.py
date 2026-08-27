@@ -2,24 +2,33 @@
 
 The database is the durable store for every page fetched, every extracted
 `PasswordMatch`, and every raw content snapshot -- all of it sensitive.
-The `*.db` file is gitignored (see issue #1); nothing here should ever log
-a match's value, a snapshot's content, or otherwise echo them outside the
-database itself.
+As of issue #72, `pages` also carries each page's response `content_type`/
+`headers`/`cookies` (headers/cookies JSON-encoded), so a later replay pass
+can re-run extraction without a live re-fetch -- the same sensitivity
+class as the snapshot itself (the target site's raw response headers can
+carry a session cookie or other secret beyond whichever bytes happened to
+match the password regex). The `*.db` file is gitignored (see issue #1);
+nothing here should ever log a match's value, a snapshot's content, a
+header/cookie value, or otherwise echo them outside the database itself.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 
-from app.models import CrawlSummary, PageResult, PasswordMatch, SourceType
+from app.models import CrawlSummary, PageFetchData, PageResult, PasswordMatch, SourceType
 from app.storage.repository import Repository
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS pages (
     url TEXT PRIMARY KEY,
     status_code INTEGER NOT NULL,
-    fetched_at TEXT NOT NULL
+    fetched_at TEXT NOT NULL,
+    content_type TEXT,
+    headers TEXT,
+    cookies TEXT
 );
 
 CREATE TABLE IF NOT EXISTS matches (
@@ -46,17 +55,34 @@ class SqliteRepository(Repository):
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
-    def save_page(self, page: PageResult, snapshot: bytes) -> None:
+    def save_page(
+        self,
+        page: PageResult,
+        snapshot: bytes,
+        content_type: str | None = None,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+    ) -> None:
         with self._conn:
             self._conn.execute(
                 """
-                INSERT INTO pages (url, status_code, fetched_at)
-                VALUES (?, ?, ?)
+                INSERT INTO pages (url, status_code, fetched_at, content_type, headers, cookies)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(url) DO UPDATE SET
                     status_code = excluded.status_code,
-                    fetched_at = excluded.fetched_at
+                    fetched_at = excluded.fetched_at,
+                    content_type = excluded.content_type,
+                    headers = excluded.headers,
+                    cookies = excluded.cookies
                 """,
-                (page.url, page.status_code, page.fetched_at.isoformat()),
+                (
+                    page.url,
+                    page.status_code,
+                    page.fetched_at.isoformat(),
+                    content_type,
+                    json.dumps(headers) if headers is not None else None,
+                    json.dumps(cookies) if cookies is not None else None,
+                ),
             )
             self._conn.execute(
                 """
@@ -135,3 +161,24 @@ class SqliteRepository(Repository):
     def get_visited_urls(self) -> list[str]:
         rows = self._conn.execute("SELECT url FROM pages").fetchall()
         return [url for (url,) in rows]
+
+    def get_all_page_fetch_data(self) -> list[PageFetchData]:
+        rows = self._conn.execute(
+            """
+            SELECT p.url, s.content, p.content_type, p.headers, p.cookies
+            FROM pages p
+            JOIN snapshots s ON s.url = p.url
+            WHERE p.content_type IS NOT NULL
+            ORDER BY p.url
+            """
+        ).fetchall()
+        return [
+            PageFetchData(
+                url=url,
+                content=content,
+                content_type=content_type,
+                headers=json.loads(headers) if headers else {},
+                cookies=json.loads(cookies) if cookies else {},
+            )
+            for url, content, content_type, headers, cookies in rows
+        ]

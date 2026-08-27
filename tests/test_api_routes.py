@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from app.api import routes
 from app.api.routes import CrawlRequest, _CrawlState, app
 from app.events import EventBus
-from app.models import CrawlSummary, PasswordMatch, SourceType
+from app.models import CrawlSummary, PageFetchData, PasswordMatch, SourceType
 
 VALID_BODY = {
     "url": "https://example.com",
@@ -38,14 +38,18 @@ class FakeOrchestrator:
 
 
 class FakeRepository:
-    def __init__(self, snapshots=None):
+    def __init__(self, snapshots=None, page_fetch_data=None):
         self._snapshots = snapshots or {}
+        self._page_fetch_data = page_fetch_data or []
 
     def get_matches(self):
         return []
 
     def get_snapshot(self, url):
         return self._snapshots.get(url)
+
+    def get_all_page_fetch_data(self):
+        return self._page_fetch_data
 
 
 def _patch_orchestrator(monkeypatch, summary=None, error=None):
@@ -294,6 +298,79 @@ def test_get_snapshot_for_unknown_crawl_returns_404(client):
     response = client.get("/crawls/does-not-exist/snapshot", params={"url": "https://example.com"})
 
     assert response.status_code == 404
+
+
+def test_re_extract_for_unknown_crawl_returns_404(client):
+    response = client.post("/crawls/does-not-exist/re-extract")
+
+    assert response.status_code == 404
+
+
+def test_re_extract_before_crawl_started_returns_409(client):
+    routes._crawls["not-started"] = _CrawlState()  # repository is still None
+
+    response = client.post("/crawls/not-started/re-extract")
+
+    assert response.status_code == 409
+
+
+def test_re_extract_reruns_extraction_against_stored_fetch_data(client):
+    password = "VISUALPING{abcdef1234567890}"
+    page_data = PageFetchData(
+        url="https://example.com/page",
+        content=f"<html>secret: {password}</html>".encode(),
+        content_type="text/html",
+    )
+    state = _CrawlState(context_chars=40)
+    state.repository = FakeRepository(page_fetch_data=[page_data])
+    routes._crawls["c1"] = state
+
+    response = client.post("/crawls/c1/re-extract")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["matches"]) == 1
+    assert body["matches"][0]["value"] == password
+    assert body["matches"][0]["page_url"] == "https://example.com/page"
+    assert body["summary"]["unique_passwords_found"] == 1
+
+
+def test_re_extract_works_while_crawl_is_still_running(client):
+    """Read-only, so it's allowed regardless of crawl status -- proves it
+    doesn't require the crawl to be FINISHED first."""
+    password = "VISUALPING{abcdef1234567890}"
+    page_data = PageFetchData(
+        url="https://example.com/page",
+        content=f"<html>secret: {password}</html>".encode(),
+        content_type="text/html",
+    )
+    state = _CrawlState()
+    state.status = routes.CrawlStatus.RUNNING
+    state.repository = FakeRepository(page_fetch_data=[page_data])
+    routes._crawls["c1"] = state
+
+    response = client.post("/crawls/c1/re-extract")
+
+    assert response.status_code == 200
+    assert len(response.json()["matches"]) == 1
+
+
+def test_re_extract_is_idempotent_across_repeated_calls(client):
+    password = "VISUALPING{abcdef1234567890}"
+    page_data = PageFetchData(
+        url="https://example.com/page",
+        content=f"<html>secret: {password}</html>".encode(),
+        content_type="text/html",
+    )
+    state = _CrawlState()
+    state.repository = FakeRepository(page_fetch_data=[page_data])
+    routes._crawls["c1"] = state
+
+    first = client.post("/crawls/c1/re-extract").json()
+    second = client.post("/crawls/c1/re-extract").json()
+
+    assert first["matches"] == second["matches"]
+    assert len(first["matches"]) == 1
 
 
 def test_response_payload_shapes_match_the_full_contract(monkeypatch, client):
