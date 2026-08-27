@@ -221,3 +221,5 @@ backfilling #1-28/#61/#63, which that report already covers in full).
   events as the crawl runs, instead of waiting for it to finish.
 - #70: Verified (no code change) that the same password on two distinct
   pages already lists as two separate rows, not collapsed into one.
+- #71: `max_pages`/new `max_duration_seconds` now default to `None` --
+  a crawl runs until its frontier actually empties, not a guessed cap.

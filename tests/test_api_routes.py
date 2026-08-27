@@ -545,21 +545,29 @@ def test_run_crawl_finalizes_to_stopped_not_finished_when_stop_was_requested(mon
     assert state.report == CANNED_SUMMARY
 
 
-def test_crawl_request_max_pages_defaults_to_1000():
+def test_crawl_request_max_pages_and_max_duration_default_to_none():
+    """issue #71: no default page-count/time cap -- completion is the
+    frontier actually emptying, not a guessed number."""
     request = CrawlRequest(url="https://example.com", username="alice", password="s3cret")
 
-    assert request.max_pages == 1000
+    assert request.max_pages is None
+    assert request.max_duration_seconds is None
 
 
-def test_crawl_request_max_pages_is_overridable():
+def test_crawl_request_max_pages_and_max_duration_are_overridable():
     request = CrawlRequest(
-        url="https://example.com", username="alice", password="s3cret", max_pages=5
+        url="https://example.com",
+        username="alice",
+        password="s3cret",
+        max_pages=5,
+        max_duration_seconds=120,
     )
 
     assert request.max_pages == 5
+    assert request.max_duration_seconds == 120
 
 
-def test_build_orchestrator_passes_request_max_pages_through(monkeypatch):
+def test_build_orchestrator_passes_request_max_pages_and_max_duration_through(monkeypatch):
     captured_kwargs = {}
 
     class CapturingOrchestrator:
@@ -569,7 +577,11 @@ def test_build_orchestrator_passes_request_max_pages_through(monkeypatch):
     monkeypatch.setattr(routes, "Orchestrator", CapturingOrchestrator)
 
     request = CrawlRequest(
-        url="https://example.com", username="alice", password="s3cret", max_pages=42
+        url="https://example.com",
+        username="alice",
+        password="s3cret",
+        max_pages=42,
+        max_duration_seconds=99,
     )
 
     async def scenario():
@@ -579,3 +591,27 @@ def test_build_orchestrator_passes_request_max_pages_through(monkeypatch):
     asyncio.run(scenario())
 
     assert captured_kwargs["max_pages"] == 42
+    assert captured_kwargs["max_duration_seconds"] == 99
+
+
+def test_build_orchestrator_passes_none_max_pages_and_max_duration_through_by_default(
+    monkeypatch,
+):
+    captured_kwargs = {}
+
+    class CapturingOrchestrator:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+    monkeypatch.setattr(routes, "Orchestrator", CapturingOrchestrator)
+
+    request = CrawlRequest(url="https://example.com", username="alice", password="s3cret")
+
+    async def scenario():
+        _orchestrator, _repository, cleanup = await routes._build_orchestrator(request, EventBus())
+        await cleanup()
+
+    asyncio.run(scenario())
+
+    assert captured_kwargs["max_pages"] is None
+    assert captured_kwargs["max_duration_seconds"] is None

@@ -77,8 +77,10 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
     │
     └── Orchestrator.run()                      app/crawler/orchestrator.py
         (asyncio.Semaphore(concurrency)-bounded workers pop from the
-         frontier until max_pages resources are checked or it's empty;
-         on start, calls Repository.get_visited_urls() and
+         frontier until it's empty -- completion is queue_empty, not a
+         page count; max_pages/max_duration_seconds default to None
+         (issue #71) and are opt-in ceilings only, no longer the routine
+         stopping condition; on start, calls Repository.get_visited_urls() and
          UrlFrontier.mark_visited() for each -- resumes a crashed prior
          run against the same *.db without re-fetching; a single URL's
          processing failure, e.g. the browser fetcher navigating into a
@@ -1306,3 +1308,71 @@ hold -- traced the full pipeline end-to-end and found no gap:
 - **Tests:** full suite: 179 tests pass (2 new). ruff/black/mypy clean.
 - **Conclusion:** already correct, as issue #70 itself suspected. Closed
   as verification-only, per the issue's own instructions.
+
+## Issue #71: replace fixed max_pages cap with a real completion condition
+
+User's own real-world evidence (a 100-page cap found 2/8 known
+passwords, a 1000-page cap found 4/8) proved the fixed cap -- not an
+actually-infinite frontier -- was what was cutting real crawls short,
+and that no single number can be picked in advance for a site of unknown
+size.
+
+- **Inputs:** no new request field type, just changed defaults --
+  `CrawlRequest.max_pages` goes from `int = 1000` to `int | None = None`,
+  and a new `CrawlRequest.max_duration_seconds: float | None = None`.
+  Same change mirrored in `Settings.max_pages`/new
+  `Settings.max_duration_seconds` (`app/settings.py`) and `.env.example`
+  (both commented out, `MAX_PAGES`/`MAX_DURATION_SECONDS`), for the
+  future non-API entry point those settings exist for.
+- **Transformation:** `Orchestrator.__init__` (`app/crawler/orchestrator.py`)
+  takes both as `None`-defaulted, opt-in ceilings now instead of
+  `max_pages` being a mandatory, always-active cap. The worker loop's
+  stopping checks changed from an unconditional `state["resources_checked"]
+  >= self._max_pages` to guarded checks (`if self._max_pages is not None
+  and ...`), plus a new elapsed-time check against `started_at` when
+  `max_duration_seconds` is set. `queue_empty` (i.e. the frontier
+  actually emptying) is now genuinely the primary/intended completion
+  signal for a normal, finite same-origin site -- unaffected by this
+  change: `UrlFrontier`'s same-origin filter + once-only `_seen` dedup
+  already make that site's URL space finite regardless of any page-count
+  cap. `PaginationGuard` (issue #63) is unchanged and remains the
+  specific defense against an unbounded `?page=N`-style family; this
+  issue doesn't touch or replace it, since it guards a different failure
+  mode (one URL family looping forever) than a blanket page-count cap
+  did (routine crawls being truncated early).
+- **Outputs:** no new persisted data shape. **Behavior change worth
+  naming explicitly:** a crawl with no explicit `max_pages`/
+  `max_duration_seconds` set can now legitimately fetch and persist far
+  more pages/resources -- and therefore far more `PasswordMatch` rows and
+  raw snapshots -- than the old 1000-page ceiling ever allowed, for a
+  large real site. That's the intended fix (finding all 8 passwords
+  requires it), not a regression, but it does mean a crawl against an
+  unexpectedly large or slow site can now run substantially longer and
+  produce a substantially larger `*.db` file than before, with no cap
+  unless the operator opts into one.
+  **Data-flow/security note (per the data-flow watchlist):** no new kind
+  of sensitive data or new sink -- same `PasswordMatch`/snapshot storage
+  path as always, just potentially much more volume per crawl by
+  default. Flagging per the watchlist's instruction to note the volume
+  change, not because a new exposure surface was introduced.
+- **Tests:**
+  - `tests/test_orchestrator.py`: `test_max_pages_defaults_to_none_so_a_large_crawl_is_not_capped`
+    (a ~1200-URL fake frontier -- more than the old 1000 default --
+    fully completes with `queue_empty=True` when `max_pages` is
+    omitted) and `test_max_duration_seconds_stops_the_crawl_early` (a
+    real per-fetch delay, `max_duration_seconds` set short, crawl ends
+    early with `queue_empty=False`, mirroring the `stop()`-mid-crawl
+    test's timing approach from issue #68).
+  - `tests/test_api_routes.py`: `CrawlRequest`'s new `None` defaults,
+    both overridable, and `_build_orchestrator` threading both through
+    to `Orchestrator` correctly (including the `None`-by-default case,
+    not just the overridden case).
+  - `tests/test_settings.py`: `Settings.max_pages`/`max_duration_seconds`
+    default to `None` when their env vars are absent, and load correctly
+    when set.
+  - Full suite: 182 tests pass (7 new). ruff/black/mypy clean.
+- **Not verified against the real target:** whether this actually
+  recovers the remaining missing passwords (the issue's own stated goal)
+  can only be confirmed by re-running against the real target's
+  URL/credentials, not available in this session -- same recurring
+  caveat as every fix in this report since issue #61.

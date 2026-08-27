@@ -109,6 +109,7 @@ def _build_orchestrator(
     match_value="VISUALPING{abcdef1234567890}",
     concurrency=2,
     max_pages=100,
+    max_duration_seconds=None,
 ):
     frontier = UrlFrontier(SEED)
     http_fetcher = FakeHttpFetcher(fetch_responses)
@@ -126,6 +127,7 @@ def _build_orchestrator(
         repository=repository,
         concurrency=concurrency,
         max_pages=max_pages,
+        max_duration_seconds=max_duration_seconds,
     )
     return orchestrator, http_fetcher, browser_fetcher, repository
 
@@ -176,6 +178,76 @@ def test_crawl_respects_max_pages_limit():
 
     assert len(http_fetcher.calls) == 3
     assert summary.resources_checked == 3
+    assert summary.queue_empty is False
+
+
+def test_max_pages_defaults_to_none_so_a_large_crawl_is_not_capped():
+    """Regression test for issue #71: the old default of 1000 would have
+    truncated this ~1200-page frontier before it ever emptied. With
+    max_pages omitted entirely (the new None default), the crawl must
+    run to genuine completion instead."""
+    urls = [SEED] + [f"https://example.com/p{i}" for i in range(1200)]
+    fetch_responses = {url: _html_response() for url in urls}
+    browser_responses = {
+        SEED: BrowserFetchResult(html="", dom_links=urls[1:], network_urls=[]),
+        **{url: BrowserFetchResult(html="", dom_links=[], network_urls=[]) for url in urls[1:]},
+    }
+    frontier = UrlFrontier(SEED)
+    http_fetcher = FakeHttpFetcher(fetch_responses)
+    browser_fetcher = FakeBrowserFetcher(browser_responses)
+    registry = ExtractorRegistry()
+    registry.register(ConstantValueExtractor("VISUALPING{abcdef1234567890}"))
+    repository = SqliteRepository(sqlite3.connect(":memory:"))
+
+    orchestrator = Orchestrator(
+        frontier=frontier,
+        http_fetcher=http_fetcher,
+        browser_fetcher=browser_fetcher,
+        extractor_registry=registry,
+        header_cookie_extractor=NoOpHeaderCookieExtractor(),
+        repository=repository,
+        concurrency=8,
+        # max_pages intentionally omitted -- exercises the class's own
+        # None default, not the test helper's separate default of 100.
+    )
+
+    summary = run(orchestrator.run())
+
+    assert len(http_fetcher.calls) == len(urls)
+    assert summary.resources_checked == len(urls)
+    assert summary.queue_empty is True
+
+
+def test_max_duration_seconds_stops_the_crawl_early():
+    urls = [SEED] + [f"https://example.com/p{i}" for i in range(20)]
+    fetch_responses = {url: _html_response() for url in urls}
+    browser_responses = {
+        SEED: BrowserFetchResult(html="", dom_links=urls[1:], network_urls=[]),
+        **{url: BrowserFetchResult(html="", dom_links=[], network_urls=[]) for url in urls[1:]},
+    }
+    orchestrator, http_fetcher, _, _ = _build_orchestrator(
+        fetch_responses,
+        browser_responses,
+        concurrency=1,
+        max_pages=None,
+        max_duration_seconds=0.15,
+    )
+
+    # A real delay per fetch, same reasoning as the stop()-mid-crawl test:
+    # the fakes elsewhere in this file return instantly with no true
+    # suspension point, which would make a time-based cutoff unobservable.
+    original_fetch = http_fetcher.fetch
+
+    async def delayed_fetch(url):
+        await asyncio.sleep(0.05)
+        return await original_fetch(url)
+
+    http_fetcher.fetch = delayed_fetch
+
+    summary = run(orchestrator.run())
+
+    assert 0 < len(http_fetcher.calls) < len(urls)
+    assert summary.resources_checked == len(http_fetcher.calls)
     assert summary.queue_empty is False
 
 
