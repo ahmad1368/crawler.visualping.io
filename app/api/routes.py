@@ -47,6 +47,9 @@ async def index() -> str:
 
 class CrawlStatus(str, Enum):
     RUNNING = "running"
+    PAUSED = "paused"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
     FINISHED = "finished"
     FAILED = "failed"
 
@@ -95,6 +98,7 @@ class _CrawlState:
         self.error: str | None = None
         self.event_bus = EventBus()
         self.repository: Repository | None = None
+        self.orchestrator: Orchestrator | None = None
 
 
 _crawls: dict[str, _CrawlState] = {}
@@ -143,10 +147,22 @@ async def _run_crawl(crawl_id: str, request: CrawlRequest) -> None:
     state = _crawls[crawl_id]
     try:
         orchestrator, repository, cleanup = await _build_orchestrator(request, state.event_bus)
+        state.orchestrator = orchestrator
         state.repository = repository
         try:
             state.report = await orchestrator.run()
-            state.status = CrawlStatus.FINISHED
+            # A user-initiated stop (see stop_crawl()) already moved this to
+            # STOPPING before run() returned early -- finalize to STOPPED
+            # rather than clobbering it back to a plain FINISHED. The
+            # transitional STOPPING (as opposed to setting STOPPED directly
+            # in stop_crawl()) exists so GET /report's "report is set once
+            # status is terminal" guarantee holds: report is only ever
+            # assigned right here, one line before this status flip.
+            state.status = (
+                CrawlStatus.STOPPED
+                if state.status is CrawlStatus.STOPPING
+                else CrawlStatus.FINISHED
+            )
         finally:
             await cleanup()
     except Exception as exc:
@@ -173,16 +189,63 @@ async def get_crawl_status(crawl_id: str) -> CrawlStatusResponse:
     return CrawlStatusResponse(crawl_id=crawl_id, status=state.status)
 
 
+def _require_running_crawl(crawl_id: str) -> _CrawlState:
+    state = _crawls.get(crawl_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="crawl not found")
+    if state.orchestrator is None:
+        raise HTTPException(status_code=409, detail="crawl has not started yet")
+    return state
+
+
+@app.post("/crawls/{crawl_id}/pause", response_model=CrawlStatusResponse)
+async def pause_crawl(crawl_id: str) -> CrawlStatusResponse:
+    state = _require_running_crawl(crawl_id)
+    if state.status is not CrawlStatus.RUNNING:
+        raise HTTPException(status_code=409, detail=f"cannot pause a crawl that is {state.status}")
+    assert state.orchestrator is not None
+    state.orchestrator.pause()
+    state.status = CrawlStatus.PAUSED
+    return CrawlStatusResponse(crawl_id=crawl_id, status=state.status)
+
+
+@app.post("/crawls/{crawl_id}/resume", response_model=CrawlStatusResponse)
+async def resume_crawl(crawl_id: str) -> CrawlStatusResponse:
+    state = _require_running_crawl(crawl_id)
+    if state.status is not CrawlStatus.PAUSED:
+        raise HTTPException(status_code=409, detail=f"cannot resume a crawl that is {state.status}")
+    assert state.orchestrator is not None
+    state.orchestrator.resume()
+    state.status = CrawlStatus.RUNNING
+    return CrawlStatusResponse(crawl_id=crawl_id, status=state.status)
+
+
+@app.post("/crawls/{crawl_id}/stop", response_model=CrawlStatusResponse)
+async def stop_crawl(crawl_id: str) -> CrawlStatusResponse:
+    state = _require_running_crawl(crawl_id)
+    if state.status not in (CrawlStatus.RUNNING, CrawlStatus.PAUSED):
+        raise HTTPException(status_code=409, detail=f"cannot stop a crawl that is {state.status}")
+    assert state.orchestrator is not None
+    state.orchestrator.stop()
+    # Transitional, not the terminal STOPPED -- run()'s in-flight work (e.g.
+    # a URL mid-fetch on another worker) hasn't actually wound down yet.
+    # _run_crawl() finalizes to STOPPED only once run() has really returned
+    # and state.report is set, so GET /report never sees a STOPPED crawl
+    # with no report yet.
+    state.status = CrawlStatus.STOPPING
+    return CrawlStatusResponse(crawl_id=crawl_id, status=state.status)
+
+
 @app.get("/crawls/{crawl_id}/report", response_model=CrawlReportResponse)
 async def get_crawl_report(crawl_id: str) -> CrawlReportResponse:
     state = _crawls.get(crawl_id)
     if state is None:
         raise HTTPException(status_code=404, detail="crawl not found")
-    if state.status is CrawlStatus.RUNNING:
+    if state.status in (CrawlStatus.RUNNING, CrawlStatus.PAUSED, CrawlStatus.STOPPING):
         raise HTTPException(status_code=409, detail="crawl not finished yet")
     if state.status is CrawlStatus.FAILED:
         raise HTTPException(status_code=500, detail=state.error or "crawl failed")
-    assert state.report is not None  # guaranteed once status is FINISHED
+    assert state.report is not None  # guaranteed once status is FINISHED or STOPPED
 
     return CrawlReportResponse(summary=state.report, matches=_build_match_rows(state))
 

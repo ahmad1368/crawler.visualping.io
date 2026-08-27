@@ -60,6 +60,24 @@
     background: var(--accent-disabled);
     cursor: not-allowed;
   }
+  #controls {
+    display: flex;
+    gap: 0.5rem;
+  }
+  #controls button {
+    margin-top: 1.5rem;
+  }
+  button.secondary {
+    background: #fff;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+  }
+  button.secondary:disabled {
+    background: #fff;
+    color: var(--accent-disabled);
+    border-color: var(--accent-disabled);
+    cursor: not-allowed;
+  }
   #log {
     margin-top: 1.5rem;
     border: 1px solid var(--border);
@@ -211,7 +229,12 @@
       <label for="context_chars">Context length</label>
       <input id="context_chars" name="context_chars" type="number" min="0" value="80" />
 
-      <button id="run-button" type="submit">Run</button>
+      <div id="controls">
+        <button id="run-button" type="submit">Run</button>
+        <button id="pause-button" class="secondary" type="button" disabled>Pause</button>
+        <button id="resume-button" class="secondary" type="button" disabled>Resume</button>
+        <button id="stop-button" class="secondary" type="button" disabled>Stop</button>
+      </div>
     </form>
     <div id="summary-panel" style="display: none;" aria-live="polite">
       <div class="summary-stat">
@@ -259,6 +282,9 @@
   <script>
     const form = document.getElementById("crawl-form");
     const runButton = document.getElementById("run-button");
+    const pauseButton = document.getElementById("pause-button");
+    const resumeButton = document.getElementById("resume-button");
+    const stopButton = document.getElementById("stop-button");
     const log = document.getElementById("log");
     const resultsTable = document.getElementById("results-table");
     const resultsBody = document.getElementById("results-body");
@@ -279,6 +305,52 @@
     let currentCrawlId = null;
     let liveResourcesChecked = 0;
     let livePasswordValues = new Set();
+
+    // Single source of truth for the four control buttons' enabled state --
+    // "idle" (nothing started/crawl over) | "running" | "paused" |
+    // "stopping" (Stop pressed, waiting for crawl_finished).
+    function setControlsForState(controlState) {
+      runButton.disabled = controlState === "running" || controlState === "paused" || controlState === "stopping";
+      pauseButton.disabled = controlState !== "running";
+      resumeButton.disabled = controlState !== "paused";
+      stopButton.disabled = !(controlState === "running" || controlState === "paused");
+    }
+
+    async function postControlAction(action) {
+      let response;
+      try {
+        response = await fetch("/crawls/" + currentCrawlId + "/" + action, { method: "POST" });
+      } catch (err) {
+        appendLog("Failed to " + action + " crawl: " + err);
+        return false;
+      }
+      if (!response.ok) {
+        appendLog("Failed to " + action + " crawl (status " + response.status + ")");
+        return false;
+      }
+      return true;
+    }
+
+    pauseButton.addEventListener("click", async () => {
+      if (await postControlAction("pause")) {
+        setControlsForState("paused");
+        appendLog("Crawl paused.");
+      }
+    });
+
+    resumeButton.addEventListener("click", async () => {
+      if (await postControlAction("resume")) {
+        setControlsForState("running");
+        appendLog("Crawl resumed.");
+      }
+    });
+
+    stopButton.addEventListener("click", async () => {
+      if (await postControlAction("stop")) {
+        setControlsForState("stopping");
+        appendLog("Stopping crawl...");
+      }
+    });
 
     function resetSummaryPanel() {
       liveResourcesChecked = 0;
@@ -433,7 +505,7 @@
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
-      runButton.disabled = true;
+      setControlsForState("running");
       log.innerHTML = "";
       resultsBody.innerHTML = "";
       resultsTable.style.display = "none";
@@ -457,13 +529,13 @@
         });
       } catch (err) {
         appendLog("Failed to start crawl: " + err);
-        runButton.disabled = false;
+        setControlsForState("idle");
         return;
       }
 
       if (!response.ok) {
         appendLog("Failed to start crawl (status " + response.status + ")");
-        runButton.disabled = false;
+        setControlsForState("idle");
         return;
       }
 
@@ -484,7 +556,7 @@
           summaryPasswordsFound.textContent = livePasswordValues.size;
         } else if (message.type === "crawl_finished") {
           appendLog("Crawl finished.");
-          runButton.disabled = false;
+          setControlsForState("idle");
           socket.close();
           loadReport(crawl_id);
         }
@@ -492,7 +564,7 @@
 
       socket.addEventListener("error", () => {
         appendLog("WebSocket error.");
-        runButton.disabled = false;
+        setControlsForState("idle");
       });
     });
   </script>

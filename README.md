@@ -207,3 +207,13 @@ about:
   They exist only in memory for the duration of a crawl (as request
   parameters, then as `httpx`/Playwright auth objects) and in the
   Authorization header sent to the target site itself.
+
+## Implemented so far
+
+A running one-line-per-issue list for work landing after the original
+28-issue backlog (see `docs/DATA_FLOW_REPORT.md` for the full history and
+per-issue detail; this list starts fresh from here rather than
+backfilling #1-28/#61/#63, which that report already covers in full).
+
+- #68: Pause, stop, and resume controls alongside Run, in the UI and via
+  three new `POST /crawls/{id}/{pause,resume,stop}` endpoints.

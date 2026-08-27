@@ -290,6 +290,193 @@ def test_response_payload_shapes_match_the_full_contract(monkeypatch, client):
     assert set(snapshot_response.json().keys()) == {"url", "content"}
 
 
+class SpyOrchestrator:
+    """A minimal orchestrator double that just records whether
+    pause()/resume()/stop() were called -- for testing the API layer's
+    wiring to those methods without a real crawl running."""
+
+    def __init__(self):
+        self.paused = False
+        self.resumed = False
+        self.stopped = False
+
+    def pause(self):
+        self.paused = True
+
+    def resume(self):
+        self.resumed = True
+
+    def stop(self):
+        self.stopped = True
+
+
+def _running_state(orchestrator=None) -> _CrawlState:
+    state = _CrawlState()
+    state.status = routes.CrawlStatus.RUNNING
+    state.orchestrator = orchestrator if orchestrator is not None else SpyOrchestrator()
+    return state
+
+
+def test_pause_running_crawl_calls_orchestrator_and_updates_status(client):
+    orchestrator = SpyOrchestrator()
+    routes._crawls["c1"] = _running_state(orchestrator)
+
+    response = client.post("/crawls/c1/pause")
+
+    assert response.status_code == 200
+    assert response.json() == {"crawl_id": "c1", "status": "paused"}
+    assert orchestrator.paused is True
+
+
+def test_resume_paused_crawl_calls_orchestrator_and_updates_status(client):
+    orchestrator = SpyOrchestrator()
+    state = _running_state(orchestrator)
+    state.status = routes.CrawlStatus.PAUSED
+    routes._crawls["c1"] = state
+
+    response = client.post("/crawls/c1/resume")
+
+    assert response.status_code == 200
+    assert response.json() == {"crawl_id": "c1", "status": "running"}
+    assert orchestrator.resumed is True
+
+
+def test_stop_running_crawl_calls_orchestrator_and_moves_to_stopping(client):
+    orchestrator = SpyOrchestrator()
+    routes._crawls["c1"] = _running_state(orchestrator)
+
+    response = client.post("/crawls/c1/stop")
+
+    assert response.status_code == 200
+    assert response.json() == {"crawl_id": "c1", "status": "stopping"}
+    assert orchestrator.stopped is True
+
+
+def test_stop_paused_crawl_is_allowed(client):
+    orchestrator = SpyOrchestrator()
+    state = _running_state(orchestrator)
+    state.status = routes.CrawlStatus.PAUSED
+    routes._crawls["c1"] = state
+
+    response = client.post("/crawls/c1/stop")
+
+    assert response.status_code == 200
+    assert orchestrator.stopped is True
+
+
+@pytest.mark.parametrize("action", ["pause", "resume", "stop"])
+def test_control_action_for_unknown_crawl_returns_404(client, action):
+    response = client.post(f"/crawls/does-not-exist/{action}")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize("action", ["pause", "resume", "stop"])
+def test_control_action_before_crawl_started_returns_409(client, action):
+    routes._crawls["not-started"] = _CrawlState()  # orchestrator is still None
+
+    response = client.post(f"/crawls/not-started/{action}")
+
+    assert response.status_code == 409
+
+
+def test_pause_already_paused_crawl_returns_409_and_does_not_call_orchestrator(client):
+    orchestrator = SpyOrchestrator()
+    state = _running_state(orchestrator)
+    state.status = routes.CrawlStatus.PAUSED
+    routes._crawls["c1"] = state
+
+    response = client.post("/crawls/c1/pause")
+
+    assert response.status_code == 409
+    assert orchestrator.paused is False
+
+
+def test_resume_running_crawl_returns_409_and_does_not_call_orchestrator(client):
+    orchestrator = SpyOrchestrator()
+    routes._crawls["c1"] = _running_state(orchestrator)
+
+    response = client.post("/crawls/c1/resume")
+
+    assert response.status_code == 409
+    assert orchestrator.resumed is False
+
+
+def test_stop_finished_crawl_returns_409_and_does_not_call_orchestrator(client):
+    orchestrator = SpyOrchestrator()
+    state = _running_state(orchestrator)
+    state.status = routes.CrawlStatus.FINISHED
+    routes._crawls["c1"] = state
+
+    response = client.post("/crawls/c1/stop")
+
+    assert response.status_code == 409
+    assert orchestrator.stopped is False
+
+
+def test_report_returns_409_while_paused(client):
+    state = _running_state()
+    state.status = routes.CrawlStatus.PAUSED
+    routes._crawls["c1"] = state
+
+    response = client.get("/crawls/c1/report")
+
+    assert response.status_code == 409
+
+
+def test_report_returns_409_while_stopping(client):
+    state = _running_state()
+    state.status = routes.CrawlStatus.STOPPING
+    routes._crawls["c1"] = state
+
+    response = client.get("/crawls/c1/report")
+
+    assert response.status_code == 409
+
+
+def test_report_available_once_stopped(client):
+    state = _running_state()
+    state.status = routes.CrawlStatus.STOPPED
+    state.report = CANNED_SUMMARY
+    routes._crawls["c1"] = state
+
+    response = client.get("/crawls/c1/report")
+
+    assert response.status_code == 200
+    assert response.json()["summary"]["unique_passwords_found"] == 1
+
+
+def test_run_crawl_finalizes_to_stopped_not_finished_when_stop_was_requested(monkeypatch):
+    """Regression test for the race this design deliberately avoids: a
+    stop request moves status to the transitional STOPPING (not the
+    terminal STOPPED) precisely so `_run_crawl` -- not the stop endpoint
+    -- is what finalizes to STOPPED, always after `state.report` is
+    already set. Simulates stop_crawl() having flipped the status to
+    STOPPING while orchestrator.run() was still in flight."""
+    crawl_id = "c1"
+    state = _CrawlState()
+    routes._crawls[crawl_id] = state
+
+    class StoppingOrchestrator:
+        async def run(self):
+            state.status = routes.CrawlStatus.STOPPING
+            return CANNED_SUMMARY
+
+    async def fake_build_orchestrator(request, event_bus):
+        async def cleanup():
+            return None
+
+        return StoppingOrchestrator(), FakeRepository(), cleanup
+
+    monkeypatch.setattr(routes, "_build_orchestrator", fake_build_orchestrator)
+
+    request = CrawlRequest(**VALID_BODY)
+    asyncio.run(routes._run_crawl(crawl_id, request))
+
+    assert state.status == routes.CrawlStatus.STOPPED
+    assert state.report == CANNED_SUMMARY
+
+
 def test_crawl_request_max_pages_defaults_to_1000():
     request = CrawlRequest(url="https://example.com", username="alice", password="s3cret")
 
