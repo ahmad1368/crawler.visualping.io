@@ -1046,3 +1046,95 @@ called out explicitly, not fabricated.
   - Item 8's confirmation is based on re-reading the existing
     implementation and its existing test coverage; it was not re-verified
     by driving a real browser against the real target's JS.
+
+## Fix: browser fetcher now discovers click-only navigation, not just passive DOM/network observation
+
+Found via code review after #63 still left the real crawl at 1/8
+passwords found -- `BrowserFetcher.fetch()` (`app/crawler/browser_fetcher.py`)
+only ever did a single passive `page.goto(url, wait_until="networkidle")`,
+then read `a[href]` off the rendered DOM and whatever the browser happened
+to fetch on its own during that one load. It never clicked, hovered, or
+interacted with anything. That covers JS-injected `<a>` tags and
+auto-loaded resources (`<link>`/`<script>`/`<img>`), but misses:
+navigation wired to a non-anchor element (`<button onclick="location.href
+= ...">`, a router push with no real `href`), and content or resources
+that only appear after a click (an accordion, a "reveal more" button, a
+lazy-loaded panel). Since the challenge brief this fetcher is built
+against opens with "a real browser can click its way to every page,"
+that's a plausible reason some of the still-missing passwords are
+unreachable -- the current crawler can render JS, but never *acts* on it
+the way a person would.
+
+## How this fixes it
+
+`BrowserFetchResult` gains a new `interaction_urls` field alongside the
+existing `dom_links`/`network_urls`, populated by a new click-discovery
+pass in `BrowserFetcher`:
+
+1. **Candidate selection** (`_find_click_candidates`): after the normal
+   passive load, find every visible element matching `button:not([type=
+   submit]), [role='button'], [onclick]` -- explicitly excluding real
+   `<a>` tags (already covered by `dom_links`) and any `submit` button/
+   input (submitting a form is a mutating action, out of scope for a
+   read-only crawler -- could log the crawl out or change state on the
+   target site). Also skips any element whose visible text or
+   `aria-label` matches an unsafe-action keyword (`delete`, `remove`,
+   `logout`, `sign out`, `unsubscribe`, `deactivate`, ...) -- a
+   destructive-sounding control never gets clicked. Capped at
+   `max_click_candidates` (default 15, constructor-configurable) so one
+   page with many interactive controls can't blow up crawl time.
+2. **Per-candidate click** (`_click_one`): each candidate is clicked on
+   its *own fresh browser context* (page reloaded from scratch, then just
+   that one element clicked) rather than clicking through a single shared
+   page -- so one click's side effects (navigation, DOM mutation) can
+   never interfere with discovering the next candidate. Reports the union
+   of: any new network requests seen during/after the click, any new
+   `a[href]` links that appeared in the DOM as a result (diffed against
+   the pre-click DOM), and the page's own URL if the click caused a
+   top-level navigation. A `dialog` handler auto-dismisses any
+   `alert()`/`confirm()`/`prompt()` the click might trigger, so one
+   dialog can't hang the whole discovery pass; a single candidate
+   failing/timing out is caught and skipped rather than aborting the rest
+   (same resilience pattern the orchestrator already uses per-URL).
+3. **Wiring**: `Orchestrator._process_url()` now also feeds
+   `browser_result.interaction_urls` into `UrlFrontier.add_many(...)`,
+   same as the existing `dom_links`/`network_urls`.
+- **Outputs:** no new persisted data shape -- discovered URLs still just
+  flow into the existing frontier/dedup/same-origin pipeline.
+  **Data-flow/security note (per the data-flow watchlist):** each
+  click-discovery context is created the same way as the existing
+  passive-load context, with `http_credentials` set from the same
+  username/password already threaded through -- no new credential path,
+  no additional logging of the click targets or their content beyond
+  what already happens for any discovered URL.
+- **Cost trade-off, explicit:** this adds up to `max_click_candidates`
+  extra full page loads per HTML page (default 15, each a fresh
+  navigate + click + short wait), on top of the one passive load that
+  already happened. Bounded and worth it for completeness on a crawl
+  this size, but a meaningfully slower per-page cost than before --
+  flagged here rather than silently accepted.
+
+## Tests
+
+- New `tests/test_browser_fetcher.py::test_fetch_discovers_urls_only_reachable_by_clicking`:
+  a fixture page with (a) a button wired to `location.href = ...` with no
+  `href` attribute at all, (b) a button that injects a new `<a href>`
+  into the DOM when clicked, and (c) a "Delete Account" button pointing
+  at a URL that must never be visited. Asserts the first two URLs are
+  discovered via `interaction_urls` and the third never appears in any
+  of `dom_links`/`network_urls`/`interaction_urls` -- proving both the
+  discovery path and the safety filter.
+  - Existing `test_fetch_extracts_dom_links_and_network_urls` and
+    `test_fetch_applies_basic_auth_credentials_to_context` pass
+    unchanged.
+- Full suite: 151 tests pass (Chromium available in this environment).
+  ruff/black/mypy clean.
+- `docs/DATA_FLOW_REPORT.md` updated with this section per this repo's
+  convention.
+
+**Not verified:** whether this specific fix recovers one of the 7
+still-missing real-target passwords -- that requires re-running against
+the real target's URL/credentials, not available in this session. Also
+not verified: real-world runtime impact of the extra per-candidate page
+loads against an actual multi-page target (only measured against small
+local fixture pages here).
