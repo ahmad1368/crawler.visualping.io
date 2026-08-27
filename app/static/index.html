@@ -90,6 +90,13 @@
     background: #fafafa;
   }
   #log p { margin: 0 0 0.25rem 0; }
+  #log a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  #log a:hover {
+    text-decoration: underline;
+  }
   #summary-panel {
     margin-top: 1.5rem;
     display: grid;
@@ -483,6 +490,24 @@
       log.scrollTop = log.scrollHeight;
     }
 
+    // Same as appendLog, but for a page_fetched entry: a real <a href>
+    // to the fetched URL (not a styled button/JS-only handler), so the
+    // operator can click -- or middle-click, or right-click "open in new
+    // tab" -- to see exactly what the crawl visited. Opens in a new tab;
+    // the target site's Basic Auth prompt appears once per browser
+    // session (cached per-origin after that), not on every click.
+    function appendPageLink(url, statusCode) {
+      const line = document.createElement("p");
+      const link = document.createElement("a");
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = "Fetched " + url + " (" + statusCode + ")";
+      line.appendChild(link);
+      log.appendChild(line);
+      log.scrollTop = log.scrollHeight;
+    }
+
     // Emits a "password-cell-click" event on window with the row's data --
     // the snapshot viewer above listens for it to jump to the match.
     function renderResultsTable(matches) {
@@ -579,7 +604,7 @@
       socket.addEventListener("message", (event) => {
         const message = JSON.parse(event.data);
         if (message.type === "page_fetched") {
-          appendLog("Fetched " + message.payload.url + " (" + message.payload.status_code + ")");
+          appendPageLink(message.payload.url, message.payload.status_code);
           liveResourcesChecked += 1;
           summaryResourcesChecked.textContent = liveResourcesChecked;
         } else if (message.type === "match_found") {

@@ -50,7 +50,11 @@ Browser: GET /                                app/api/routes.py + app/static/ind
     completeness summary panel (pages visited, resources checked, unique
     passwords found, queue empty) updates live from page_fetched/
     match_found events during the crawl, then is overwritten with the
-    authoritative CrawlSummary once GET /crawls/{id}/report loads
+    authoritative CrawlSummary once GET /crawls/{id}/report loads. Each
+    page_fetched log entry (issue #80) renders as a real `<a href>` to
+    the fetched URL, target="_blank" -- opens the live target page in a
+    new tab so the operator can browse exactly what the crawl visited,
+    not just a styled/JS-only click handler
 
 POST /crawls (CrawlRequest: url, username, password, context_chars)
 app/api/routes.py -- validated by pydantic (HttpUrl, non-empty credentials);
@@ -1600,3 +1604,50 @@ to eventually cut off *any* runaway family, trap or legitimate.
   passwords are found once it does) needs the real target's
   URL/credentials, not available in this session -- same recurring
   caveat as every fix in this report since issue #61.
+
+## Issue #80: clickable page-fetched log links, opening in a new tab
+
+- **Inputs:** no new backend input or endpoint -- purely a client-side
+  change to how `app/static/index.html` renders the `page_fetched`
+  WebSocket payload it was already receiving (the URL and status code,
+  unchanged since issue #16/#18).
+- **Transformation:** new `appendPageLink(url, statusCode)` builds a real
+  `<a href="{url}" target="_blank" rel="noopener noreferrer">` inside the
+  log line, replacing the plain-text `appendLog(...)` call previously
+  used for `page_fetched` entries specifically (every other log message
+  type -- crawl started/paused/resumed/stopping/finished, errors, match
+  found -- is unchanged, still plain text via `appendLog`). A real anchor
+  rather than a styled button or a JS-only click handler, per the
+  request, so it supports the browser's native affordances too (hover to
+  see the URL, right-click "open in new tab," middle-click, etc.), not
+  just a left-click.
+- **Outputs:** no new persisted data shape, no new response payload --
+  same `page_fetched` data, just rendered differently.
+  **Data-flow/security note (per the data-flow watchlist):** no new
+  concern. The link's `href` is only the target URL, never credentials
+  (the target requires HTTP Basic Auth; embedding `user:pass@host` in a
+  link is both bad practice and blocked by modern browsers, so this was
+  never on the table). Clicking a link makes the operator's own browser
+  navigate directly to the live target site in a new tab -- the operator
+  already possesses those credentials (they typed them into the crawl
+  form) and is knowingly testing that site, so this isn't a new exposure,
+  just a convenience for browsing what was actually visited. First click
+  in a browser session hits the target's native Basic Auth prompt (no
+  way to carry credentials over automatically); the browser caches that
+  per-origin afterward, so it's a one-time prompt per session, not per
+  click -- disclosed as an accepted UX wrinkle in the issue, not treated
+  as a defect.
+- **Tests:** extended the existing
+  `test_run_button_disables_during_crawl_and_log_updates_live`
+  (`tests/test_ui.py`) rather than adding a new fixture/test, since it
+  already exercises a live `page_fetched` event -- new assertions check
+  the rendered `<a>`'s `href`/`target`/`rel` attributes and visible text
+  directly. Full suite: 204 tests pass (no new test *count* -- coverage
+  added to an existing test). ruff/black/mypy clean.
+- **Not implemented / explicitly out of scope:** routing the link through
+  the app's own already-persisted snapshot (issue #72) instead of the
+  live target, to avoid the Basic Auth re-prompt entirely, would work but
+  is a larger, separate change (a new endpoint serving raw bytes with the
+  stored `content_type` so a browser tab renders it) not requested here
+  -- noted as a natural future enhancement if the auth-prompt friction
+  turns out to matter in practice.

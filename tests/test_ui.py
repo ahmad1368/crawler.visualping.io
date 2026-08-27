@@ -306,6 +306,14 @@ def test_run_button_disables_during_crawl_and_log_updates_live(live_server):
                 page.locator("#summary-resources-checked").inner_text() == "1"
             ), "resources-checked stat should update live from page_fetched events"
 
+            # Each fetched page is a real <a href>, not a styled button or a
+            # JS-only click handler -- opens in a new tab, no re-fetch.
+            fetched_link = page.locator("#log a").first
+            assert fetched_link.get_attribute("href") == "https://example.com/"
+            assert fetched_link.get_attribute("target") == "_blank"
+            assert fetched_link.get_attribute("rel") == "noopener noreferrer"
+            assert "Fetched https://example.com/" in fetched_link.inner_text()
+
             page.wait_for_function("document.querySelectorAll('#log p').length >= 3", timeout=5000)
             log_lines = page.locator("#log p").all_inner_texts()
             fetched_lines = [line for line in log_lines if line.startswith("Fetched")]
