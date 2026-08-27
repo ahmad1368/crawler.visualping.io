@@ -1047,94 +1047,51 @@ called out explicitly, not fabricated.
     implementation and its existing test coverage; it was not re-verified
     by driving a real browser against the real target's JS.
 
-## Fix: browser fetcher now discovers click-only navigation, not just passive DOM/network observation
+## Fix: image EXIF extractor missed the nested Exif sub-IFD (UserComment, etc.)
 
-Found via code review after #63 still left the real crawl at 1/8
-passwords found -- `BrowserFetcher.fetch()` (`app/crawler/browser_fetcher.py`)
-only ever did a single passive `page.goto(url, wait_until="networkidle")`,
-then read `a[href]` off the rendered DOM and whatever the browser happened
-to fetch on its own during that one load. It never clicked, hovered, or
-interacted with anything. That covers JS-injected `<a>` tags and
-auto-loaded resources (`<link>`/`<script>`/`<img>`), but misses:
-navigation wired to a non-anchor element (`<button onclick="location.href
-= ...">`, a router push with no real `href`), and content or resources
-that only appear after a click (an accordion, a "reveal more" button, a
-lazy-loaded panel). Since the challenge brief this fetcher is built
-against opens with "a real browser can click its way to every page,"
-that's a plausible reason some of the still-missing passwords are
-unreachable -- the current crawler can render JS, but never *acts* on it
-the way a person would.
+Found via code review after #63 still left the real crawl at 1/8 passwords
+found -- `ImageExifExtractor.extract()` (`app/extractors/image_exif.py`)
+only ever scanned `image.getexif().items()`, which is the base IFD0 only.
+`UserComment` (tag `0x9286`), `DateTimeOriginal`, and most fields a person
+would actually stash a note in live in the nested "Exif" sub-IFD (reached
+via the IFD0 pointer tag `0x8769`), reachable only through
+`exif.get_ifd(ExifTags.IFD.Exif)` -- never through the top-level mapping's
+own `.items()`. Confirmed empirically with `piexif`: a `UserComment`
+written the way any real tool writes it (piexif, exiftool, a camera) was
+completely invisible to the old code. The project's own
+`tests/test_image_exif_extractor.py` passed anyway because its fixture
+helper set the tag directly on the top-level `Exif` object before saving,
+which Pillow serializes flatly into IFD0 -- a shape no real-world tool
+produces -- so the test gave false confidence.
 
-## How this fixes it
-
-`BrowserFetchResult` gains a new `interaction_urls` field alongside the
-existing `dom_links`/`network_urls`, populated by a new click-discovery
-pass in `BrowserFetcher`:
-
-1. **Candidate selection** (`_find_click_candidates`): after the normal
-   passive load, find every visible element matching `button:not([type=
-   submit]), [role='button'], [onclick]` -- explicitly excluding real
-   `<a>` tags (already covered by `dom_links`) and any `submit` button/
-   input (submitting a form is a mutating action, out of scope for a
-   read-only crawler -- could log the crawl out or change state on the
-   target site). Also skips any element whose visible text or
-   `aria-label` matches an unsafe-action keyword (`delete`, `remove`,
-   `logout`, `sign out`, `unsubscribe`, `deactivate`, ...) -- a
-   destructive-sounding control never gets clicked. Capped at
-   `max_click_candidates` (default 15, constructor-configurable) so one
-   page with many interactive controls can't blow up crawl time.
-2. **Per-candidate click** (`_click_one`): each candidate is clicked on
-   its *own fresh browser context* (page reloaded from scratch, then just
-   that one element clicked) rather than clicking through a single shared
-   page -- so one click's side effects (navigation, DOM mutation) can
-   never interfere with discovering the next candidate. Reports the union
-   of: any new network requests seen during/after the click, any new
-   `a[href]` links that appeared in the DOM as a result (diffed against
-   the pre-click DOM), and the page's own URL if the click caused a
-   top-level navigation. A `dialog` handler auto-dismisses any
-   `alert()`/`confirm()`/`prompt()` the click might trigger, so one
-   dialog can't hang the whole discovery pass; a single candidate
-   failing/timing out is caught and skipped rather than aborting the rest
-   (same resilience pattern the orchestrator already uses per-URL).
-3. **Wiring**: `Orchestrator._process_url()` now also feeds
-   `browser_result.interaction_urls` into `UrlFrontier.add_many(...)`,
-   same as the existing `dom_links`/`network_urls`.
-- **Outputs:** no new persisted data shape -- discovered URLs still just
-  flow into the existing frontier/dedup/same-origin pipeline.
-  **Data-flow/security note (per the data-flow watchlist):** each
-  click-discovery context is created the same way as the existing
-  passive-load context, with `http_credentials` set from the same
-  username/password already threaded through -- no new credential path,
-  no additional logging of the click targets or their content beyond
-  what already happens for any discovered URL.
-- **Cost trade-off, explicit:** this adds up to `max_click_candidates`
-  extra full page loads per HTML page (default 15, each a fresh
-  navigate + click + short wait), on top of the one passive load that
-  already happened. Bounded and worth it for completeness on a crawl
-  this size, but a meaningfully slower per-page cost than before --
-  flagged here rather than silently accepted.
-
-## Tests
-
-- New `tests/test_browser_fetcher.py::test_fetch_discovers_urls_only_reachable_by_clicking`:
-  a fixture page with (a) a button wired to `location.href = ...` with no
-  `href` attribute at all, (b) a button that injects a new `<a href>`
-  into the DOM when clicked, and (c) a "Delete Account" button pointing
-  at a URL that must never be visited. Asserts the first two URLs are
-  discovered via `interaction_urls` and the third never appears in any
-  of `dom_links`/`network_urls`/`interaction_urls` -- proving both the
-  discovery path and the safety filter.
-  - Existing `test_fetch_extracts_dom_links_and_network_urls` and
-    `test_fetch_applies_basic_auth_credentials_to_context` pass
-    unchanged.
-- Full suite: 151 tests pass (Chromium available in this environment).
-  ruff/black/mypy clean.
-- `docs/DATA_FLOW_REPORT.md` updated with this section per this repo's
-  convention.
-
-**Not verified:** whether this specific fix recovers one of the 7
-still-missing real-target passwords -- that requires re-running against
-the real target's URL/credentials, not available in this session. Also
-not verified: real-world runtime impact of the extra per-candidate page
-loads against an actual multi-page target (only measured against small
-local fixture pages here).
+- **Inputs/Transformation:** `extract()` now also scans
+  `exif.get_ifd(ExifTags.IFD.Exif)` (tag names from `ExifTags.TAGS`, same
+  namespace as IFD0) and `exif.get_ifd(ExifTags.IFD.GPSInfo)` (tag names
+  from `ExifTags.GPSTAGS`), via a shared `_scan_ifd()` helper. Matches
+  from the Exif sub-IFD share the `exif:<TagName>` locator prefix with
+  IFD0 matches (both are conceptually "EXIF"); GPS IFD matches get a
+  distinct `exif-gps:<TagName>` prefix. `exif.get_ifd(...)` returns an
+  empty mapping (not an error) when an image has no sub-IFD, so this is
+  safe against plain photos with only base EXIF or none at all.
+- **Outputs:** no new `SourceType` -- still `IMAGE_METADATA`, just with a
+  `locator` that can now read e.g. `exif:UserComment` or
+  `exif-gps:GPSProcessingMethod` where before those fields were silently
+  skipped. No new persisted column.
+  **Data-flow/security note (per the data-flow watchlist):** no change in
+  kind -- this surfaces the same class of sensitive text
+  (`PasswordMatch.value`/context) through the same existing storage/API
+  path, just from IFD locations the extractor previously missed.
+- **Tests:** `piexif==1.1.3` added as a dev-only dependency
+  (`pyproject.toml`) specifically to build realistic nested-IFD fixtures
+  -- hand-rolling correct multi-IFD EXIF byte layout without it proved
+  too fragile to trust as test fixture code. Two new tests in
+  `tests/test_image_exif_extractor.py`:
+  `test_extracts_password_from_user_comment_in_nested_exif_subifd` (the
+  regression case) and `test_extracts_password_from_gps_ifd`. All 7
+  tests in that file pass; full suite (148 tests, excluding the
+  browser/UI/e2e tests that need a live Chromium) still passes; ruff,
+  black, and mypy clean.
+- **Not verified against the real target:** whether this specific fix
+  recovers one of the 7 still-missing passwords can only be confirmed by
+  re-running against the real target's URL and credentials, which this
+  session does not have.
