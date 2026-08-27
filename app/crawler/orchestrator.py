@@ -7,9 +7,20 @@ result, persist the page and its matches, and -- for HTML pages -- also
 fetch it with the browser fetcher to discover JS-driven links (rendered
 DOM `<a href>`s, URLs seen in network traffic during load, and URLs only
 revealed by actually clicking a non-anchor interactive control) and
-enqueue them. Runs with a bounded concurrency (`asyncio.Semaphore`) and
-stops once `max_pages` URLs have been processed or the frontier is empty,
-whichever comes first.
+enqueue them. Runs with a bounded concurrency (`asyncio.Semaphore`).
+
+Completion is the frontier actually emptying (`queue_empty` on the
+returned `CrawlSummary`), not an arbitrary page count -- `max_pages`
+defaults to `None` (issue #71: a fixed cap was silently truncating real
+crawls well before the frontier emptied, and there's no way to know the
+right number for an unknown site up front, so guessing one is no longer
+the default). `max_pages` still exists, opt-in, as a hard ceiling for an
+operator who wants one; `max_duration_seconds` (also opt-in, `None` by
+default) is a wall-clock alternative that bounds total run cost
+independent of how many distinct URLs a pathological site can generate --
+neither is needed for a normal, finite same-origin site to terminate
+correctly, since `UrlFrontier`'s same-origin filter and once-only dedup
+already make the URL space finite on its own.
 
 If an `EventBus` is supplied, publishes `PAGE_FETCHED` after each page is
 saved, `MATCH_FOUND` for each match found on it, and `CRAWL_FINISHED` with
@@ -23,7 +34,7 @@ makes the browser fetcher's navigation fail) is caught and skipped rather
 than aborting or hanging the whole crawl. A `PaginationGuard` stops
 following a `?page=N`-style URL family once it's gone several consecutive
 pages with no new links or matches, so a runaway/trap pagination family
-can't burn the entire `max_pages` budget on its own.
+can't run forever on its own even with no `max_pages` cap in play.
 
 `pause()`/`resume()`/`stop()` (issue #68) give external control over an
 in-flight `run()`: `pause()` blocks every worker before it pops its next
@@ -61,7 +72,8 @@ class Orchestrator:
         header_cookie_extractor: HeaderCookieExtractor,
         repository: Repository,
         concurrency: int = 4,
-        max_pages: int = 1000,
+        max_pages: int | None = None,
+        max_duration_seconds: float | None = None,
         pagination_family_limit: int = 10,
         event_bus: EventBus | None = None,
     ) -> None:
@@ -73,6 +85,7 @@ class Orchestrator:
         self._repository = repository
         self._concurrency = concurrency
         self._max_pages = max_pages
+        self._max_duration_seconds = max_duration_seconds
         self._pagination_guard = PaginationGuard(max_unproductive=pagination_family_limit)
         self._event_bus = event_bus
         self._pause_event = asyncio.Event()
@@ -106,8 +119,15 @@ class Orchestrator:
                 async with lock:
                     if self._stop_requested:
                         return
-                    if state["resources_checked"] >= self._max_pages:
+                    if (
+                        self._max_pages is not None
+                        and state["resources_checked"] >= self._max_pages
+                    ):
                         return
+                    if self._max_duration_seconds is not None:
+                        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+                        if elapsed >= self._max_duration_seconds:
+                            return
                     if not self._frontier.has_next():
                         return
                     url = self._frontier.next()

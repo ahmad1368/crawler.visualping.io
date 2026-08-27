@@ -16,4 +16,8 @@ class Settings(BaseSettings):
     auth_password: str = Field(alias="AUTH_PASSWORD")
     context_chars: int = Field(default=80, alias="CONTEXT_CHARS")
     concurrency: int = Field(default=4, alias="CONCURRENCY")
-    max_pages: int = Field(default=1000, alias="MAX_PAGES")
+    # None by default (issue #71): a fixed page-count guess was cutting
+    # real crawls short before the frontier actually emptied. Set either
+    # as an explicit opt-in ceiling if desired -- see Orchestrator.
+    max_pages: int | None = Field(default=None, alias="MAX_PAGES")
+    max_duration_seconds: float | None = Field(default=None, alias="MAX_DURATION_SECONDS")

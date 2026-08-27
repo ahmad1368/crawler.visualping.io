@@ -59,7 +59,12 @@ class CrawlRequest(BaseModel):
     username: str = Field(min_length=1)
     password: str = Field(min_length=1)
     context_chars: int = 80
-    max_pages: int = 1000
+    # Both None by default (issue #71): completion is the frontier
+    # actually emptying, not a guessed page count -- see
+    # Orchestrator's module docstring. Either can still be set as an
+    # explicit opt-in ceiling.
+    max_pages: int | None = None
+    max_duration_seconds: float | None = None
 
 
 class CrawlCreatedResponse(BaseModel):
@@ -132,6 +137,7 @@ async def _build_orchestrator(request: CrawlRequest, event_bus: EventBus):
         header_cookie_extractor=HeaderCookieExtractor(context_chars=request.context_chars),
         repository=repository,
         max_pages=request.max_pages,
+        max_duration_seconds=request.max_duration_seconds,
         event_bus=event_bus,
     )
 
