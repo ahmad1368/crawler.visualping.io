@@ -9,7 +9,7 @@ import uvicorn
 from playwright.sync_api import sync_playwright
 
 from app.api import routes
-from app.events import CRAWL_FINISHED, PAGE_FETCHED
+from app.events import CRAWL_FINISHED, MATCH_FOUND, PAGE_FETCHED
 from app.main import app  # imports app.api.websocket for /ws/crawls/{id} too
 from app.models import CrawlSummary, PageResult, PasswordMatch, SourceType
 
@@ -123,6 +123,85 @@ class _PausableFakeOrchestrator:
         return summary
 
 
+STREAM_MATCH_VALUE_A = "VISUALPING{aaaaaaaaaaaaaaaa}"
+STREAM_MATCH_VALUE_B = "VISUALPING{bbbbbbbbbbbbbbbb}"
+
+
+def _streamed_matches() -> list[PasswordMatch]:
+    # Two matches for the SAME (source_url, value) pair, then one for a
+    # different pair -- exercises the client's count_in_page grouping,
+    # not just "a row shows up."
+    return [
+        PasswordMatch(
+            value=STREAM_MATCH_VALUE_A,
+            source_type=SourceType.HTML_TEXT,
+            source_url="https://example.com/page-a",
+            context_before="before-a",
+            context_after="after-a",
+            locator="line:1,col:0",
+        ),
+        PasswordMatch(
+            value=STREAM_MATCH_VALUE_A,
+            source_type=SourceType.HTML_TEXT,
+            source_url="https://example.com/page-a",
+            context_before="before-a",
+            context_after="after-a",
+            locator="line:1,col:0",
+        ),
+        PasswordMatch(
+            value=STREAM_MATCH_VALUE_B,
+            source_type=SourceType.HTML_TEXT,
+            source_url="https://example.com/page-b",
+            context_before="before-b",
+            context_after="after-b",
+            locator="line:2,col:0",
+        ),
+    ]
+
+
+class _MatchStreamingFakeRepository:
+    """Backs the final GET /report reconciliation pass with the same
+    matches streamed live -- so the test can check the post-finish table
+    matches what was already shown before crawl_finished."""
+
+    def get_matches(self):
+        return _streamed_matches()
+
+    def get_snapshot(self, url):
+        return None
+
+
+class _MatchStreamingFakeOrchestrator:
+    """Publishes MATCH_FOUND events with a real delay between them, so a
+    UI test can observe the results table populate live, before
+    crawl_finished -- including two matches for the same (source_url,
+    value) pair, to prove the client groups them into one row with
+    count_in_page=2 rather than a duplicate row."""
+
+    def __init__(self, event_bus) -> None:
+        self._event_bus = event_bus
+
+    async def run(self) -> CrawlSummary:
+        for match in _streamed_matches():
+            await asyncio.sleep(0.15)
+            self._event_bus.publish(MATCH_FOUND, match)
+
+        # A real gap before crawl_finished, so the test has a reliable
+        # window to observe "all matches streamed, crawl not yet done."
+        await asyncio.sleep(0.3)
+
+        summary = CrawlSummary(
+            pages_visited=2,
+            resources_checked=2,
+            unique_passwords_found=2,
+            queue_empty=True,
+            started_at=datetime.now(timezone.utc),
+            finished_at=datetime.now(timezone.utc),
+        )
+        self._event_bus.publish(CRAWL_FINISHED, summary)
+        return summary
+
+
 def _run_live_server(monkeypatch, fake_build_orchestrator):
     monkeypatch.setattr(routes, "_build_orchestrator", fake_build_orchestrator)
 
@@ -188,6 +267,19 @@ def live_server_pausable(monkeypatch):
             return None
 
         return orchestrator, _FakeRepository(), cleanup
+
+    yield from _run_live_server(monkeypatch, fake_build_orchestrator)
+
+
+@pytest.fixture
+def live_server_match_streaming(monkeypatch):
+    async def fake_build_orchestrator(request, event_bus):
+        orchestrator = _MatchStreamingFakeOrchestrator(event_bus)
+
+        async def cleanup() -> None:
+            return None
+
+        return orchestrator, _MatchStreamingFakeRepository(), cleanup
 
     yield from _run_live_server(monkeypatch, fake_build_orchestrator)
 
@@ -364,5 +456,59 @@ def test_pause_resume_stop_controls(live_server_pausable):
             )
             pages_visited = int(page.locator("#summary-pages-visited").inner_text())
             assert 0 < pages_visited < 8, "stop should end the crawl before all pages are processed"
+        finally:
+            browser.close()
+
+
+def test_results_table_populates_live_before_crawl_finishes(live_server_match_streaming):
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(live_server_match_streaming + "/")
+
+            page.fill("#url", "https://example.com")
+            page.fill("#username", "alice")
+            page.fill("#password", "s3cret")
+            page.click("#run-button")
+
+            # First match_found (page-a, value A) -- a row appears
+            # immediately, well before the crawl finishes.
+            page.wait_for_function(
+                "document.querySelectorAll('#results-table tbody tr').length >= 1", timeout=3000
+            )
+            assert page.locator("#log p:has-text('Crawl finished')").count() == 0
+            rows = page.locator("#results-table tbody tr")
+            assert rows.count() == 1
+            assert rows.nth(0).locator("td").nth(2).inner_text() == STREAM_MATCH_VALUE_A
+            assert rows.nth(0).locator("td").nth(4).inner_text() == "1"
+
+            # Second match_found for the SAME (source_url, value) pair
+            # increments the existing row's count rather than adding a
+            # second row for it.
+            page.wait_for_function(
+                "document.querySelectorAll('#results-table tbody tr')[0]"
+                ".children[4].textContent === '2'",
+                timeout=3000,
+            )
+            assert page.locator("#results-table tbody tr").count() == 1
+
+            # Third match_found, a different (source_url, value) pair,
+            # adds a second row -- still before crawl_finished.
+            page.wait_for_function(
+                "document.querySelectorAll('#results-table tbody tr').length >= 2", timeout=3000
+            )
+            assert page.locator("#log p:has-text('Crawl finished')").count() == 0
+
+            # Crawl finishes; the GET /report reconciliation pass lands on
+            # the same final shape the live stream already showed.
+            page.wait_for_selector("#log p:has-text('Crawl finished')", timeout=3000)
+            page.wait_for_function(
+                "document.getElementById('run-button').disabled === false", timeout=3000
+            )
+            final_rows = page.locator("#results-table tbody tr")
+            assert final_rows.count() == 2
+            values = page.locator("#results-table tbody tr td:nth-child(3)").all_inner_texts()
+            assert set(values) == {STREAM_MATCH_VALUE_A, STREAM_MATCH_VALUE_B}
         finally:
             browser.close()

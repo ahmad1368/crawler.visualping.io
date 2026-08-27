@@ -217,3 +217,5 @@ backfilling #1-28/#61/#63, which that report already covers in full).
 
 - #68: Pause, stop, and resume controls alongside Run, in the UI and via
   three new `POST /crawls/{id}/{pause,resume,stop}` endpoints.
+- #69: Results table now populates live from `match_found` WebSocket
+  events as the crawl runs, instead of waiting for it to finish.

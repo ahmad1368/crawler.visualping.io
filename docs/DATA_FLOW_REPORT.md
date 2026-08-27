@@ -32,13 +32,21 @@ Browser: GET /                                app/api/routes.py + app/static/ind
     fetch GET /crawls/{id}/report on crawl_finished, then (on a password
     cell click) fetch GET /crawls/{id}/snapshot?url=...
     app/static/index.html -- credentials leave the browser only in the
-    POST body (JSON over the page's own origin); the Run button is
-    disabled from click until a crawl_finished message arrives; the
-    report's `matches` render into a results table with a clickable
-    password cell (dispatches a "password-cell-click" DOM event) that
-    opens a modal showing the raw snapshot with the match `<mark>`ed and
-    scrolled into view -- or, for image_metadata/binary, a locator +
-    context fallback instead of trying to search a non-text body. A
+    POST body (JSON over the page's own origin); Run/Pause/Resume/Stop
+    (issue #68) enable and disable together from one control-state
+    function. The results table populates live, one row per match_found
+    message as it arrives (issue #69) -- grouped client-side by
+    (source_url, value) into the same shape the backend's
+    _build_match_rows produces, incrementing count_in_page on a repeat
+    rather than adding a duplicate row -- not just once at the end; each
+    row still has a clickable password cell (dispatches a
+    "password-cell-click" DOM event) that opens a modal showing the raw
+    snapshot with the match `<mark>`ed and scrolled into view -- or, for
+    image_metadata/binary, a locator + context fallback instead of trying
+    to search a non-text body. Once crawl_finished arrives, GET
+    /crawls/{id}/report is still fetched as the authoritative
+    reconciliation pass and its `matches` replace the live-built table
+    wholesale -- the live version is never treated as final. A
     completeness summary panel (pages visited, resources checked, unique
     passwords found, queue empty) updates live from page_fetched/
     match_found events during the crawl, then is overwritten with the
@@ -1209,3 +1217,48 @@ produces -- so the test gave false confidence.
   /crawls` and stays open through pause/resume/stop until
   `crawl_finished`), so this doesn't affect the shipped UI, but it's a
   real gap for any other client that might reconnect.
+
+## Issue #69: stream found passwords into the results table live
+
+- **Inputs:** no new backend input or endpoint -- purely a client-side
+  change to how `app/static/index.html` consumes the `match_found`
+  WebSocket messages it was already receiving (wired since issues
+  #16/#18). Previously that payload was only used for a log line and the
+  live password-count stat; the results table itself waited for the
+  final `GET /crawls/{id}/report` after `crawl_finished`.
+- **Transformation:** a new client-side `liveMatchesByKey` `Map`, keyed
+  the same way the backend's `_build_match_rows()`
+  (`app/api/routes.py`) already groups matches -- `(source_url, value)`.
+  On each `match_found` message, `recordLiveMatch()` either increments
+  the existing entry's `count_in_page` (a repeat of the same password on
+  the same page) or adds a new one, then re-renders the results table
+  from the map via the existing `renderResultsTable()` (already reused
+  as-is, since it just takes a row-shaped array -- no change to it). The
+  final `GET /report` fetch on `crawl_finished` is deliberately left in
+  place as the authoritative reconciliation pass (per this issue's own
+  suggested resolution) -- it replaces the live-built table wholesale
+  with the backend-computed one, so a client-side grouping bug could
+  never leave a wrong result on screen after the crawl actually finishes.
+- **Outputs:** no new persisted data shape, no new REST/WebSocket
+  contract -- same `match_found` payload shape, just consumed one more
+  place in the browser.
+  **Data-flow/security note (per the data-flow watchlist):** no new
+  exposure surface. The WebSocket already carried the full
+  `PasswordMatch` (plaintext secret + context) to the browser as of
+  issue #16/#18; this issue doesn't transmit or persist anything new, it
+  only makes the browser render data it was already receiving earlier
+  instead of discarding it until the end.
+- **Tests:** `tests/test_ui.py` gains `_MatchStreamingFakeOrchestrator` /
+  `_MatchStreamingFakeRepository` (publishes `MATCH_FOUND` with a real
+  delay between each, backs the final report with the same matches) and
+  `test_results_table_populates_live_before_crawl_finishes` -- a
+  Playwright-driven test proving: a row appears after the first match
+  while the crawl is still running (`Crawl finished` not yet logged); a
+  second match for the *same* `(source_url, value)` increments that
+  row's count rather than adding a duplicate; a third, different match
+  adds a second row, still pre-finish; and the post-`crawl_finished`
+  `GET /report` reconciliation lands on the same two rows. Full suite:
+  177 tests pass. ruff/black/mypy clean.
+- **Not verified:** real-world behavior against the actual target site
+  (only exercised against fakes/fixtures here, same caveat as every
+  other UI-layer issue in this report).

@@ -305,6 +305,37 @@
     let currentCrawlId = null;
     let liveResourcesChecked = 0;
     let livePasswordValues = new Set();
+    // Mirrors the backend's (source_url, value) grouping from
+    // _build_match_rows -- keyed the same way, so live rows and the
+    // final GET /report reconciliation pass end up with the same shape.
+    let liveMatchesByKey = new Map();
+
+    function matchKey(sourceUrl, value) {
+      return sourceUrl + " " + value;
+    }
+
+    // Called on each match_found WebSocket message -- groups repeated
+    // (source_url, value) matches into one row with an incremented
+    // count_in_page, same as the backend does, and re-renders the table
+    // immediately rather than waiting for the crawl to finish.
+    function recordLiveMatch(payload) {
+      const key = matchKey(payload.source_url, payload.value);
+      const existing = liveMatchesByKey.get(key);
+      if (existing) {
+        existing.count_in_page += 1;
+      } else {
+        liveMatchesByKey.set(key, {
+          page_url: payload.source_url,
+          source_type: payload.source_type,
+          value: payload.value,
+          context_before: payload.context_before,
+          context_after: payload.context_after,
+          count_in_page: 1,
+          locator: payload.locator,
+        });
+      }
+      renderResultsTable(Array.from(liveMatchesByKey.values()));
+    }
 
     // Single source of truth for the four control buttons' enabled state --
     // "idle" (nothing started/crawl over) | "running" | "paused" |
@@ -355,6 +386,7 @@
     function resetSummaryPanel() {
       liveResourcesChecked = 0;
       livePasswordValues = new Set();
+      liveMatchesByKey = new Map();
       summaryPagesVisited.textContent = "0";
       summaryResourcesChecked.textContent = "0";
       summaryPasswordsFound.textContent = "0";
@@ -554,6 +586,7 @@
           appendLog("Password found at " + message.payload.source_url);
           livePasswordValues.add(message.payload.value);
           summaryPasswordsFound.textContent = livePasswordValues.size;
+          recordLiveMatch(message.payload);
         } else if (message.type === "crawl_finished") {
           appendLog("Crawl finished.");
           setControlsForState("idle");
