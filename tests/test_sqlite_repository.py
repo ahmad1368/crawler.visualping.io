@@ -174,6 +174,46 @@ def test_get_matches_includes_duplicate_values_for_count_aggregation():
     assert len(repo.get_matches()) == 2
 
 
+def test_get_matches_preserves_the_same_value_found_on_two_distinct_pages():
+    """Regression test for issue #70: no uniqueness constraint on
+    `value` -- only `id` is a primary key (see the `matches` table
+    schema) -- so the same password found on two separate pages is two
+    separate rows, not silently collapsed into one at the storage layer.
+    Cross-page grouping-for-display happens one layer up, in
+    app/api/routes.py::_build_match_rows(), not here."""
+    repo = _repo()
+    match_on_page_y = _match(source_url="https://example.com/page-y")
+    match_on_page_b = _match(source_url="https://example.com/page-b")
+
+    repo.save_page(
+        PageResult(
+            url="https://example.com/page-y",
+            status_code=200,
+            fetched_at=datetime.now(timezone.utc),
+            matches=[match_on_page_y],
+        ),
+        snapshot=b"content-y",
+    )
+    repo.save_page(
+        PageResult(
+            url="https://example.com/page-b",
+            status_code=200,
+            fetched_at=datetime.now(timezone.utc),
+            matches=[match_on_page_b],
+        ),
+        snapshot=b"content-b",
+    )
+
+    matches = repo.get_matches()
+
+    assert len(matches) == 2
+    assert {m.source_url for m in matches} == {
+        "https://example.com/page-y",
+        "https://example.com/page-b",
+    }
+    assert all(m.value == match_on_page_y.value for m in matches)
+
+
 def test_get_visited_urls_returns_empty_list_when_none_stored():
     repo = _repo()
 
