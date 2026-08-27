@@ -4,10 +4,12 @@ repository into a full crawl.
 For each URL popped from the frontier: fetch it over HTTP, run the
 body-content extractors and the header/cookie extractor against the
 result, persist the page and its matches, and -- for HTML pages -- also
-fetch it with the browser fetcher to discover JS-driven links and enqueue
-them. Runs with a bounded concurrency (`asyncio.Semaphore`) and stops once
-`max_pages` URLs have been processed or the frontier is empty, whichever
-comes first.
+fetch it with the browser fetcher to discover JS-driven links (rendered
+DOM `<a href>`s, URLs seen in network traffic during load, and URLs only
+revealed by actually clicking a non-anchor interactive control) and
+enqueue them. Runs with a bounded concurrency (`asyncio.Semaphore`) and
+stops once `max_pages` URLs have been processed or the frontier is empty,
+whichever comes first.
 
 If an `EventBus` is supplied, publishes `PAGE_FETCHED` after each page is
 saved, `MATCH_FOUND` for each match found on it, and `CRAWL_FINISHED` with
@@ -131,6 +133,7 @@ class Orchestrator:
             browser_result = await self._browser_fetcher.fetch(url)
             new_links += self._frontier.add_many(browser_result.dom_links)
             new_links += self._frontier.add_many(browser_result.network_urls)
+            new_links += self._frontier.add_many(browser_result.interaction_urls)
 
         self._pagination_guard.record(url, new_links=new_links, new_matches=len(matches))
 
