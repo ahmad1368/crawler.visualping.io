@@ -1046,3 +1046,76 @@ called out explicitly, not fabricated.
   - Item 8's confirmation is based on re-reading the existing
     implementation and its existing test coverage; it was not re-verified
     by driving a real browser against the real target's JS.
+
+## Fix: binary fallback extractor no longer blanket-excludes images
+
+Found via code review after #63 still left the real crawl at 1/8
+passwords found -- `BinaryFallbackExtractor` (`app/extractors/binary_fallback.py`)
+excluded every `image/*` content type outright, on the assumption
+`ImageExifExtractor` covers images fully. It doesn't: EXIF metadata is
+only one place a password can live in an image file. PNG `tEXt`/`iTXt`
+chunks (e.g. a "Comment" field) are a completely different, non-EXIF
+mechanism -- plain, uncompressed strings sitting directly in the file
+bytes -- and JPEG `COM` comment segments work the same way. Neither is
+reachable through `image.getexif()`.
+
+Confirmed empirically: built a PNG with a `Comment` chunk holding a
+password and verified the raw file bytes contain it in plain text
+(`b"VISUALPING{...}" in raw_png_bytes` is `True`), while
+`Image.open(...).info` shows the chunk and `Image.open(...).getexif()`
+shows nothing. Before this fix, neither extractor could ever find that
+password -- `ImageExifExtractor` only looks at EXIF, and
+`BinaryFallbackExtractor` was explicitly configured to skip images
+entirely (`tests/test_binary_fallback_extractor.py::
+test_skips_content_types_handled_by_other_extractors` asserted exactly
+that, by design).
+
+## How this fixes it
+
+- `_is_handled_elsewhere()` no longer treats `image/*` as "handled
+  elsewhere" -- `BinaryFallbackExtractor`'s raw `strings`-style byte scan
+  now runs on image content the same as any other binary type.
+- This does mean an EXIF-embedded password gets reported twice for the
+  same image now (once via `ImageExifExtractor` as `IMAGE_METADATA`,
+  once via this extractor as `BINARY`, since the EXIF blob's bytes are
+  also just bytes in the file) -- harmless, since matches are already
+  grouped by `(source_url, value)` downstream
+  (`app/api/routes.py::_build_match_rows`), so it surfaces as one report
+  row with a higher `count_in_page`, not a spurious second finding.
+- **Outputs:** no new `SourceType`, no new persisted column -- same
+  `BINARY` source type images now share with any other unhandled
+  content type.
+  **Data-flow/security note (per the data-flow watchlist):** no change
+  in kind -- same sensitive-text path (`PasswordMatch.value`/context)
+  through the same existing storage/API surface, just from image bytes
+  the extractor previously skipped outright.
+
+## Tests
+
+- `tests/test_binary_fallback_extractor.py`: removed `image/png` from
+  the "skipped" case, added `test_does_not_skip_image_content_types`
+  and `test_finds_password_in_png_text_chunk_metadata` (the actual
+  regression case, built with `Pillow`'s `PngImagePlugin.PngInfo`).
+- `tests/test_e2e_crawl.py`: the fixture's `/photo.jpg` now legitimately
+  matches under both `IMAGE_METADATA` and `BINARY`, since its EXIF bytes
+  are also plain bytes in the file. Switched the test's assertion from a
+  `value -> source_type` dict (which silently dropped duplicates via
+  last-write-wins) to a `value -> set[source_type]` one, to actually
+  assert on every source type a value is found under rather than
+  whichever happened to be inserted last. That stricter check also
+  surfaced a second, **pre-existing, out-of-scope** duplicate --
+  `HeaderCookieExtractor` finds a `Set-Cookie`-planted password under
+  both `COOKIE` and `HTTP_HEADER`, since it scans the raw `Set-Cookie`
+  response header and the parsed cookie jar separately. Reflected in the
+  updated expectation with an explanatory comment; not fixed here, since
+  it's unrelated to this PR's bug and both source types are technically
+  accurate (the value genuinely appears in both places).
+- Full suite: 152 tests pass (this repo's Chromium install let the
+  browser/UI/e2e tests run too, not just the excludable subset).
+  ruff/black/mypy clean.
+- `docs/DATA_FLOW_REPORT.md` updated with this section per this repo's
+  convention.
+
+**Not verified:** whether this specific fix recovers one of the 7
+still-missing real-target passwords -- that requires re-running against
+the real target's URL/credentials, not available in this session.
