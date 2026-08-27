@@ -3,11 +3,20 @@
 Reads EXIF fields (e.g. `UserComment`, `ImageDescription`) from downloaded
 images via Pillow. Operators sometimes stash debug notes -- including
 credentials -- in these fields without realizing they ship with the image.
+
+`Image.getexif()` only returns the base IFD0 tags (`ImageDescription`,
+`Make`, `DateTime`, ...) -- fields like `UserComment` or `DateTimeOriginal`
+live in the nested "Exif" sub-IFD (pointer tag 0x8769), and GPS fields live
+in their own nested IFD (pointer tag 0x8825). Both are reachable only via
+`exif.get_ifd(...)`, never through the top-level `Exif` mapping's own
+`.items()` -- any real-world tool (a camera, exiftool, piexif) writes
+`UserComment` there, so skipping this misses it entirely.
 """
 
 from __future__ import annotations
 
 import io
+from collections.abc import Mapping
 
 from PIL import ExifTags, Image
 from PIL.Image import DecompressionBombError
@@ -52,12 +61,23 @@ class ImageExifExtractor:
             return []
 
         matches: list[PasswordMatch] = []
-        for tag_id, value in exif.items():
+        matches.extend(self._scan_ifd(exif, ExifTags.TAGS, "exif", url))
+        matches.extend(self._scan_ifd(exif.get_ifd(ExifTags.IFD.Exif), ExifTags.TAGS, "exif", url))
+        matches.extend(
+            self._scan_ifd(exif.get_ifd(ExifTags.IFD.GPSInfo), ExifTags.GPSTAGS, "exif-gps", url)
+        )
+        return matches
+
+    def _scan_ifd(
+        self, ifd: Mapping[int, object], tag_names: dict[int, str], locator_prefix: str, url: str
+    ) -> list[PasswordMatch]:
+        matches: list[PasswordMatch] = []
+        for tag_id, value in ifd.items():
             text = _decode_exif_value(value)
             if not text:
                 continue
-            tag_name = ExifTags.TAGS.get(tag_id, str(tag_id))
-            matches.extend(self._matches_for(text, url, f"exif:{tag_name}"))
+            tag_name = tag_names.get(tag_id, str(tag_id))
+            matches.extend(self._matches_for(text, url, f"{locator_prefix}:{tag_name}"))
         return matches
 
     def _matches_for(self, text: str, url: str, locator: str) -> list[PasswordMatch]:

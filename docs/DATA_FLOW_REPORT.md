@@ -1046,3 +1046,52 @@ called out explicitly, not fabricated.
   - Item 8's confirmation is based on re-reading the existing
     implementation and its existing test coverage; it was not re-verified
     by driving a real browser against the real target's JS.
+
+## Fix: image EXIF extractor missed the nested Exif sub-IFD (UserComment, etc.)
+
+Found via code review after #63 still left the real crawl at 1/8 passwords
+found -- `ImageExifExtractor.extract()` (`app/extractors/image_exif.py`)
+only ever scanned `image.getexif().items()`, which is the base IFD0 only.
+`UserComment` (tag `0x9286`), `DateTimeOriginal`, and most fields a person
+would actually stash a note in live in the nested "Exif" sub-IFD (reached
+via the IFD0 pointer tag `0x8769`), reachable only through
+`exif.get_ifd(ExifTags.IFD.Exif)` -- never through the top-level mapping's
+own `.items()`. Confirmed empirically with `piexif`: a `UserComment`
+written the way any real tool writes it (piexif, exiftool, a camera) was
+completely invisible to the old code. The project's own
+`tests/test_image_exif_extractor.py` passed anyway because its fixture
+helper set the tag directly on the top-level `Exif` object before saving,
+which Pillow serializes flatly into IFD0 -- a shape no real-world tool
+produces -- so the test gave false confidence.
+
+- **Inputs/Transformation:** `extract()` now also scans
+  `exif.get_ifd(ExifTags.IFD.Exif)` (tag names from `ExifTags.TAGS`, same
+  namespace as IFD0) and `exif.get_ifd(ExifTags.IFD.GPSInfo)` (tag names
+  from `ExifTags.GPSTAGS`), via a shared `_scan_ifd()` helper. Matches
+  from the Exif sub-IFD share the `exif:<TagName>` locator prefix with
+  IFD0 matches (both are conceptually "EXIF"); GPS IFD matches get a
+  distinct `exif-gps:<TagName>` prefix. `exif.get_ifd(...)` returns an
+  empty mapping (not an error) when an image has no sub-IFD, so this is
+  safe against plain photos with only base EXIF or none at all.
+- **Outputs:** no new `SourceType` -- still `IMAGE_METADATA`, just with a
+  `locator` that can now read e.g. `exif:UserComment` or
+  `exif-gps:GPSProcessingMethod` where before those fields were silently
+  skipped. No new persisted column.
+  **Data-flow/security note (per the data-flow watchlist):** no change in
+  kind -- this surfaces the same class of sensitive text
+  (`PasswordMatch.value`/context) through the same existing storage/API
+  path, just from IFD locations the extractor previously missed.
+- **Tests:** `piexif==1.1.3` added as a dev-only dependency
+  (`pyproject.toml`) specifically to build realistic nested-IFD fixtures
+  -- hand-rolling correct multi-IFD EXIF byte layout without it proved
+  too fragile to trust as test fixture code. Two new tests in
+  `tests/test_image_exif_extractor.py`:
+  `test_extracts_password_from_user_comment_in_nested_exif_subifd` (the
+  regression case) and `test_extracts_password_from_gps_ifd`. All 7
+  tests in that file pass; full suite (148 tests, excluding the
+  browser/UI/e2e tests that need a live Chromium) still passes; ruff,
+  black, and mypy clean.
+- **Not verified against the real target:** whether this specific fix
+  recovers one of the 7 still-missing passwords can only be confirmed by
+  re-running against the real target's URL and credentials, which this
+  session does not have.
