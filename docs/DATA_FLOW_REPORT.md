@@ -1262,3 +1262,47 @@ produces -- so the test gave false confidence.
 - **Not verified:** real-world behavior against the actual target site
   (only exercised against fakes/fixtures here, same caveat as every
   other UI-layer issue in this report).
+
+## Issue #70: verify same password on multiple distinct pages lists once per page
+
+Verification-only issue, filed against a suspicion that turned out not to
+hold -- traced the full pipeline end-to-end and found no gap:
+
+- **`SqliteRepository`** (`app/storage/sqlite.py`): the `matches` table's
+  only primary key is an autoincrement `id` -- no `UNIQUE` constraint on
+  `value` or `(value, source_url)`. `_insert_match()` is an unconditional
+  `INSERT`, and `get_matches()` returns every row, ordered by `id`. Two
+  `save_page()` calls for two different pages, each with a match sharing
+  the same `value`, produce two independent rows.
+- **`Orchestrator`** (`app/crawler/orchestrator.py`): the `unique_values:
+  set[str]` accumulated across `worker()` iterations only feeds
+  `CrawlSummary.unique_passwords_found` (a count) -- it's never consulted
+  before calling `self._repository.save_page(...)`, so it can't
+  short-circuit or suppress storage of a repeat value on a later page.
+- **`_build_match_rows()`** (`app/api/routes.py`): already grouped by
+  `(match.source_url, match.value)`, not `value` alone -- confirmed by
+  reading the existing code, not just the issue's own quoted snippet.
+  Only an *identical* `(page, value)` pair collapses into one row with an
+  incremented `count_in_page`; a different page with the same value was
+  already a separate row before this issue.
+- **Live results table** (`app/static/index.html`, issue #69): the
+  client-side `liveMatchesByKey` grouping key is `sourceUrl + " " +
+  value` -- structurally the same `(source_url, value)` pairing, so it
+  already produces one row per page for a repeated value too. Verified
+  by code inspection (the same `recordLiveMatch()`/`matchKey()` code
+  path issue #69 already tests for a *different*-value-per-page case);
+  not given a dedicated new Playwright test here, since it would exercise
+  the identical generic grouping logic issue #69's test already covers,
+  not new logic.
+- **Outputs:** no production code changed. Two new regression tests
+  stand as the requested verification evidence:
+  - `tests/test_sqlite_repository.py::test_get_matches_preserves_the_same_value_found_on_two_distinct_pages`
+    -- storage layer.
+  - `tests/test_api_routes.py::test_same_password_found_on_two_distinct_pages_lists_once_per_page`
+    -- API/report layer, asserting each row carries its own page's
+    `source_type`/`context`/`locator`, not the other page's.
+  **Data-flow/security note (per the data-flow watchlist):** none -- no
+  code changed, no new data path.
+- **Tests:** full suite: 179 tests pass (2 new). ruff/black/mypy clean.
+- **Conclusion:** already correct, as issue #70 itself suspected. Closed
+  as verification-only, per the issue's own instructions.

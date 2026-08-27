@@ -172,6 +172,74 @@ def test_report_matches_table_dedupes_and_counts_repeated_values(monkeypatch, cl
     assert other_row["count_in_page"] == 1
 
 
+def test_same_password_found_on_two_distinct_pages_lists_once_per_page(monkeypatch, client):
+    """Regression test for issue #70: the same password value found on
+    two distinct pages must produce two separate report rows -- each
+    carrying that page's own source_type/context/locator -- not collapse
+    into one row just because the value repeats. Verified end-to-end:
+    SqliteRepository has no uniqueness constraint on `value` (only an
+    autoincrement id), Orchestrator's unique_values set only feeds
+    CrawlSummary.unique_passwords_found and never filters what gets
+    saved, and _build_match_rows() groups by (source_url, value), not
+    value alone -- only an identical (page, value) pair collapses, into
+    a higher count_in_page, which is the separate scenario the test
+    above already covers."""
+    same_value = "VISUALPING{abcdef1234567890}"
+    match_on_page_y = PasswordMatch(
+        value=same_value,
+        source_type=SourceType.HTML_TEXT,
+        source_url="https://example.com/page-y",
+        context_before="found on Y: ",
+        context_after=" here",
+        locator="line:1,col:0",
+    )
+    match_on_page_b = PasswordMatch(
+        value=same_value,
+        source_type=SourceType.HTML_COMMENT,
+        source_url="https://example.com/page-b",
+        context_before="also on B: ",
+        context_after=" there",
+        locator="line:5,col:2",
+    )
+
+    class RepositoryWithSameValueOnTwoPages:
+        def get_matches(self):
+            return [match_on_page_y, match_on_page_b]
+
+    async def fake_build_orchestrator(request, event_bus):
+        async def cleanup():
+            return None
+
+        return (
+            FakeOrchestrator(summary=CANNED_SUMMARY),
+            RepositoryWithSameValueOnTwoPages(),
+            cleanup,
+        )
+
+    monkeypatch.setattr(routes, "_build_orchestrator", fake_build_orchestrator)
+
+    response = client.post("/crawls", json=VALID_BODY)
+    crawl_id = response.json()["crawl_id"]
+
+    report = client.get(f"/crawls/{crawl_id}/report").json()
+
+    assert len(report["matches"]) == 2, "same password on two distinct pages must not collapse"
+
+    row_y = next(r for r in report["matches"] if r["page_url"] == "https://example.com/page-y")
+    row_b = next(r for r in report["matches"] if r["page_url"] == "https://example.com/page-b")
+
+    assert row_y["value"] == row_b["value"] == same_value
+    assert row_y["count_in_page"] == 1
+    assert row_b["count_in_page"] == 1
+    # Each row carries its own page's details, not the other page's.
+    assert row_y["source_type"] == "html_text"
+    assert row_y["context_before"] == "found on Y: "
+    assert row_y["locator"] == "line:1,col:0"
+    assert row_b["source_type"] == "html_comment"
+    assert row_b["context_before"] == "also on B: "
+    assert row_b["locator"] == "line:5,col:2"
+
+
 def test_failed_crawl_status_and_report(monkeypatch, client):
     _patch_orchestrator(monkeypatch, error=RuntimeError("target unreachable"))
 

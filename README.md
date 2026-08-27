@@ -219,3 +219,5 @@ backfilling #1-28/#61/#63, which that report already covers in full).
   three new `POST /crawls/{id}/{pause,resume,stop}` endpoints.
 - #69: Results table now populates live from `match_found` WebSocket
   events as the crawl runs, instead of waiting for it to finish.
+- #70: Verified (no code change) that the same password on two distinct
+  pages already lists as two separate rows, not collapsed into one.
