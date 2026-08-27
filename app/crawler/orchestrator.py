@@ -33,7 +33,11 @@ single URL's processing failing (e.g. a genuine HTTP redirect loop that
 makes the browser fetcher's navigation fail) is caught and skipped rather
 than aborting or hanging the whole crawl. A `PaginationGuard` stops
 following a `?page=N`-style URL family once it's gone several consecutive
-pages with no new links or matches, so a runaway/trap pagination family
+pages with no new password matches (issue #78: matches, not link
+discovery -- ordinary pagination always finds a "new" next-page link, so
+that was never a reliable signal), and unconditionally caps any one
+family at `pagination_family_page_cap` total pages regardless of
+apparent productivity, so a runaway or adversarial pagination family
 can't run forever on its own even with no `max_pages` cap in play.
 
 `pause()`/`resume()`/`stop()` (issue #68) give external control over an
@@ -75,6 +79,7 @@ class Orchestrator:
         max_pages: int | None = None,
         max_duration_seconds: float | None = None,
         pagination_family_limit: int = 10,
+        pagination_family_page_cap: int | None = 50,
         event_bus: EventBus | None = None,
     ) -> None:
         self._frontier = frontier
@@ -86,7 +91,10 @@ class Orchestrator:
         self._concurrency = concurrency
         self._max_pages = max_pages
         self._max_duration_seconds = max_duration_seconds
-        self._pagination_guard = PaginationGuard(max_unproductive=pagination_family_limit)
+        self._pagination_guard = PaginationGuard(
+            max_unproductive=pagination_family_limit,
+            max_family_pages=pagination_family_page_cap,
+        )
         self._event_bus = event_bus
         self._pause_event = asyncio.Event()
         self._pause_event.set()  # not paused by default
@@ -174,14 +182,17 @@ class Orchestrator:
         )
 
         is_html = content_type.startswith("text/html")
-        new_links = 0
         if is_html:
             browser_result = await self._browser_fetcher.fetch(url)
-            new_links += self._frontier.add_many(browser_result.dom_links)
-            new_links += self._frontier.add_many(browser_result.network_urls)
-            new_links += self._frontier.add_many(browser_result.interaction_urls)
+            self._frontier.add_many(browser_result.dom_links)
+            self._frontier.add_many(browser_result.network_urls)
+            self._frontier.add_many(browser_result.interaction_urls)
 
-        self._pagination_guard.record(url, new_links=new_links, new_matches=len(matches))
+        # Keyed on new_matches alone, not link discovery -- issue #78:
+        # ordinary sequential pagination always discovers a "new" next-page
+        # link, so that was never a reliable productivity signal, and an
+        # adversarial family can trivially fake it forever.
+        self._pagination_guard.record(url, new_matches=len(matches))
 
         page = PageResult(
             url=url,

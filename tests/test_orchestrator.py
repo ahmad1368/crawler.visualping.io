@@ -505,3 +505,53 @@ def test_pagination_guard_stops_a_runaway_family_but_still_finds_real_content():
     # the guard stops the family -- not all 50.
     assert len(http_fetcher.calls) <= 5
     assert len([u for u in http_fetcher.calls if u in pagination_urls]) == 3
+
+
+def test_pagination_guard_terminates_an_adversarial_trap_that_always_looks_productive():
+    """Regression test for issue #78: a real target was found serving a
+    ?page=N family where every page has randomized content, so it always
+    discovers a "new" link (to the next page) even though it never
+    contains a password -- which used to reset the old new_links-based
+    streak forever and never terminate. Simulated here the same way:
+    every pagination page links only to the next page in the chain (a
+    "new" link every time) and no extractor is registered at all, so
+    new_matches is always 0. Must still terminate well short of the
+    full, deliberately oversized 100-page trap."""
+    pagination_urls = [f"https://example.com/report?page={i}" for i in range(1, 101)]
+    fetch_responses = {SEED: _html_response()}
+    fetch_responses.update({url: _html_response() for url in pagination_urls})
+
+    browser_responses = {
+        SEED: BrowserFetchResult(html="", dom_links=[pagination_urls[0]], network_urls=[])
+    }
+    for i, url in enumerate(pagination_urls):
+        next_link = [pagination_urls[i + 1]] if i + 1 < len(pagination_urls) else []
+        browser_responses[url] = BrowserFetchResult(html="", dom_links=next_link, network_urls=[])
+
+    frontier = UrlFrontier(SEED)
+    http_fetcher = FakeHttpFetcher(fetch_responses)
+    browser_fetcher = FakeBrowserFetcher(browser_responses)
+    registry = ExtractorRegistry()  # no extractor registered -- never a match, ever
+    repository = SqliteRepository(sqlite3.connect(":memory:"))
+
+    orchestrator = Orchestrator(
+        frontier=frontier,
+        http_fetcher=http_fetcher,
+        browser_fetcher=browser_fetcher,
+        extractor_registry=registry,
+        header_cookie_extractor=NoOpHeaderCookieExtractor(),
+        repository=repository,
+        concurrency=1,
+        max_pages=None,  # exactly issue #71's default -- no whole-crawl cap in play
+        pagination_family_limit=10,
+    )
+
+    summary = run(asyncio.wait_for(orchestrator.run(), timeout=5))
+
+    # SEED + exactly the 10 pagination pages processed before the
+    # unproductive streak trips -- not all 100. The next-discovered page
+    # (11) is skipped once its family is stopped, so the frontier is
+    # actually empty, not just abandoned mid-queue.
+    assert len([u for u in http_fetcher.calls if u in pagination_urls]) == 10
+    assert summary.resources_checked == 11
+    assert summary.queue_empty is True
