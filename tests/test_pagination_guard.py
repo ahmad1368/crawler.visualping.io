@@ -117,7 +117,37 @@ def test_guard_hard_ceiling_disabled_when_none():
 def test_guard_hard_ceiling_is_on_by_default():
     guard = PaginationGuard(max_unproductive=1000)
 
-    for i in range(50):
+    for i in range(200):
         guard.record(f"https://example.com/report?page={i}", new_matches=1)
+
+    assert guard.is_stopped("https://example.com/report?page=999") is True
+
+
+def test_guard_resets_streak_on_a_page_with_a_new_external_link():
+    """Regression test for issue #88: a real target's crawl coverage
+    dropped from ~680 to ~480 pages because an index/listing family that
+    never itself contains a password (only links out to individual
+    content pages that do) was wrongly treated as unproductive by
+    new_matches alone. A new_external_links signal must independently
+    keep the streak from tripping."""
+    guard = PaginationGuard(max_unproductive=3, max_family_pages=None)
+
+    guard.record("https://example.com/report?page=0", new_matches=0, new_external_links=1)
+    guard.record("https://example.com/report?page=1", new_matches=0, new_external_links=1)
+    guard.record("https://example.com/report?page=2", new_matches=0, new_external_links=1)
+    guard.record("https://example.com/report?page=3", new_matches=0, new_external_links=1)
+
+    assert guard.is_stopped("https://example.com/report?page=999") is False
+
+
+def test_guard_still_stops_when_neither_matches_nor_external_links_are_new():
+    """A family with a same-family-only link every page (e.g. just the
+    next page in the chain, never anything else) must still trip the
+    streak -- new_external_links=0 provides no productivity signal on
+    its own, same as new_matches=0."""
+    guard = PaginationGuard(max_unproductive=3, max_family_pages=None)
+
+    for i in range(3):
+        guard.record(f"https://example.com/report?page={i}", new_matches=0, new_external_links=0)
 
     assert guard.is_stopped("https://example.com/report?page=999") is True
