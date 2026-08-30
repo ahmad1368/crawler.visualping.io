@@ -122,8 +122,14 @@
     font-weight: 600;
     color: var(--accent);
   }
-  table#results-table {
+  #results-filter-container {
     margin-top: 1.5rem;
+  }
+  #results-filter-container label {
+    margin-top: 0;
+  }
+  table#results-table {
+    margin-top: 0.75rem;
     width: 100%;
     border-collapse: collapse;
     font-size: 0.85rem;
@@ -262,6 +268,15 @@
       </div>
     </div>
     <div id="log" aria-live="polite"></div>
+    <div id="results-filter-container" style="display: none;">
+      <label for="results-filter">Filter results</label>
+      <input
+        id="results-filter"
+        type="search"
+        autocomplete="off"
+        placeholder="e.g. js"
+      />
+    </div>
     <table id="results-table" style="display: none;">
       <thead>
         <tr>
@@ -295,6 +310,8 @@
     const log = document.getElementById("log");
     const resultsTable = document.getElementById("results-table");
     const resultsBody = document.getElementById("results-body");
+    const resultsFilterContainer = document.getElementById("results-filter-container");
+    const resultsFilterInput = document.getElementById("results-filter");
     const summaryPanel = document.getElementById("summary-panel");
     const summaryPagesVisited = document.getElementById("summary-pages-visited");
     const summaryResourcesChecked = document.getElementById("summary-resources-checked");
@@ -310,6 +327,9 @@
     const NON_TEXT_SOURCE_TYPES = new Set(["image_metadata", "binary"]);
 
     let currentCrawlId = null;
+    // All matches known so far (live WebSocket rows or the final report),
+    // unfiltered -- the source of truth the search box filters against.
+    let currentMatches = [];
     let liveResourcesChecked = 0;
     let livePasswordValues = new Set();
     // Mirrors the backend's (source_url, value) grouping from
@@ -508,9 +528,30 @@
       log.scrollTop = log.scrollHeight;
     }
 
+    // Case-insensitive substring ("contains") match against the page URL --
+    // the column that carries the file path, e.g. entering "js" matches
+    // ".../app.js".
+    function rowMatchesFilter(row, term) {
+      return row.page_url.toLowerCase().includes(term);
+    }
+
+    // Re-applies the current search box value to currentMatches and
+    // re-renders. Called both on user input and whenever currentMatches
+    // changes (new live match, or the final report loading).
+    function applyResultsFilter() {
+      const term = resultsFilterInput.value.trim().toLowerCase();
+      const filtered = term ? currentMatches.filter((row) => rowMatchesFilter(row, term)) : currentMatches;
+      renderMatchRows(filtered);
+      const hasAnyMatches = currentMatches.length > 0;
+      resultsFilterContainer.style.display = hasAnyMatches ? "block" : "none";
+      resultsTable.style.display = hasAnyMatches ? "table" : "none";
+    }
+
+    resultsFilterInput.addEventListener("input", applyResultsFilter);
+
     // Emits a "password-cell-click" event on window with the row's data --
     // the snapshot viewer above listens for it to jump to the match.
-    function renderResultsTable(matches) {
+    function renderMatchRows(matches) {
       resultsBody.innerHTML = "";
       for (const row of matches) {
         const tr = document.createElement("tr");
@@ -540,7 +581,14 @@
         tr.append(pageCell, typeCell, passwordCell, contextCell, countCell);
         resultsBody.appendChild(tr);
       }
-      resultsTable.style.display = matches.length ? "table" : "none";
+    }
+
+    // Updates the unfiltered match list and re-renders through the current
+    // search filter. All producers of rows (live WebSocket matches, the
+    // final report) call this instead of renderMatchRows directly.
+    function renderResultsTable(matches) {
+      currentMatches = matches;
+      applyResultsFilter();
     }
 
     async function loadReport(crawlId) {
@@ -566,6 +614,9 @@
       log.innerHTML = "";
       resultsBody.innerHTML = "";
       resultsTable.style.display = "none";
+      resultsFilterInput.value = "";
+      resultsFilterContainer.style.display = "none";
+      currentMatches = [];
       closeSnapshotViewer();
       resetSummaryPanel();
       appendLog("Starting crawl...");
