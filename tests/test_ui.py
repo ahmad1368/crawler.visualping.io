@@ -520,3 +520,43 @@ def test_results_table_populates_live_before_crawl_finishes(live_server_match_st
             assert set(values) == {STREAM_MATCH_VALUE_A, STREAM_MATCH_VALUE_B}
         finally:
             browser.close()
+
+
+def test_results_filter_narrows_and_restores_rows(live_server_match_streaming):
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(live_server_match_streaming + "/")
+
+            page.fill("#url", "https://example.com")
+            page.fill("#username", "alice")
+            page.fill("#password", "s3cret")
+            page.click("#run-button")
+
+            page.wait_for_selector("#log p:has-text('Crawl finished')", timeout=3000)
+            assert page.locator("#results-table tbody tr").count() == 2
+            assert page.locator("#results-filter-container").is_visible()
+
+            # Substring match against page_url, case-insensitive -- only
+            # the page-a row (source_url ".../page-a") should remain.
+            page.fill("#results-filter", "PAGE-A")
+            page.wait_for_function(
+                "document.querySelectorAll('#results-table tbody tr').length === 1"
+            )
+            rows = page.locator("#results-table tbody tr")
+            assert rows.nth(0).locator("td").nth(2).inner_text() == STREAM_MATCH_VALUE_A
+
+            # A term matching neither row hides the table entirely.
+            page.fill("#results-filter", "no-such-page")
+            page.wait_for_function(
+                "document.querySelectorAll('#results-table tbody tr').length === 0"
+            )
+
+            # Clearing the input restores every row.
+            page.fill("#results-filter", "")
+            page.wait_for_function(
+                "document.querySelectorAll('#results-table tbody tr').length === 2"
+            )
+        finally:
+            browser.close()

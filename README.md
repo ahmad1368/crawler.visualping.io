@@ -241,3 +241,5 @@ backfilling #1-28/#61/#63, which that report already covers in full).
   -- defeats an adversarial family that fakes novelty forever.
 - #80: Each fetched-page log entry is now a real `<a href>` opening the
   page in a new tab, so you can browse exactly what the crawl visited.
+- #86: A search box above the results table filters rows client-side by
+  a case-insensitive substring match against the page URL.
