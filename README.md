@@ -277,3 +277,9 @@ backfilling #1-28/#61/#63, which that report already covers in full).
 - #89: Re-verified the clickable fetched-page log links (#80) after six
   later issues touched the same file -- still correct, no code change
   needed.
+- #98: New `Base64HexExtractor`/`ReversedTextExtractor`/`Rot13Extractor`
+  decode/transform text before re-checking it for a flag -- catches a
+  password hidden via Base64/hex encoding, written backwards, or ROT13
+  substitution. `HeaderCookieExtractor` also gained the same three
+  transforms for header/cookie values. (JS char-code decoding already
+  existed, issue #83; verified still correct, untouched.)

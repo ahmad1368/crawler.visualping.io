@@ -27,6 +27,7 @@ from app.crawler.orchestrator import Orchestrator
 from app.crawler.replay import replay_extraction
 from app.events import CRAWL_FINISHED, EventBus
 from app.extractors.base import ExtractorRegistry
+from app.extractors.base64_hex import Base64HexExtractor
 from app.extractors.binary_fallback import BinaryFallbackExtractor
 from app.extractors.client_storage import ClientStorageExtractor
 from app.extractors.css_js import CssJsExtractor
@@ -38,6 +39,8 @@ from app.extractors.image_ocr import ImageOcrExtractor
 from app.extractors.image_structural import ImageStructuralExtractor
 from app.extractors.js_charcode import JsCharCodeExtractor
 from app.extractors.redirect_chain import RedirectExtractor
+from app.extractors.reversed_text import ReversedTextExtractor
+from app.extractors.rot13 import Rot13Extractor
 from app.models import CrawlSummary, PasswordMatch
 from app.storage.repository import Repository
 from app.storage.sqlite import SqliteRepository
@@ -142,6 +145,9 @@ async def _build_orchestrator(request: CrawlRequest, event_bus: EventBus):
     registry.register(ImageStructuralExtractor(context_chars=_CONTEXT_CHARS))
     registry.register(ImageOcrExtractor(context_chars=_CONTEXT_CHARS))
     registry.register(ImageLsbExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(Base64HexExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ReversedTextExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(Rot13Extractor(context_chars=_CONTEXT_CHARS))
     registry.register(BinaryFallbackExtractor(context_chars=_CONTEXT_CHARS))
 
     repository = SqliteRepository(sqlite3.connect(f"crawl_{uuid.uuid4().hex}.db"))
@@ -297,6 +303,9 @@ async def re_extract_crawl(crawl_id: str) -> CrawlReportResponse:
     registry.register(ImageStructuralExtractor(context_chars=_CONTEXT_CHARS))
     registry.register(ImageOcrExtractor(context_chars=_CONTEXT_CHARS))
     registry.register(ImageLsbExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(Base64HexExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ReversedTextExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(Rot13Extractor(context_chars=_CONTEXT_CHARS))
     registry.register(BinaryFallbackExtractor(context_chars=_CONTEXT_CHARS))
     header_cookie_extractor = HeaderCookieExtractor(context_chars=_CONTEXT_CHARS)
 
