@@ -71,6 +71,14 @@ class BrowserFetchResult:
     dom_links: list[str]
     network_urls: list[str]
     interaction_urls: list[str] = field(default_factory=list)
+    # Client-side storage snapshot (issue #103), captured once per page
+    # right after load. A fresh, isolated browser context is created for
+    # every page fetch (`_new_authenticated_context()` below) -- there is
+    # no persistent cross-page browser session in this design, so this is
+    # a per-page snapshot, not a whole-crawl before/after diff.
+    cookies: str = ""
+    local_storage: dict[str, str] = field(default_factory=dict)
+    session_storage: dict[str, str] = field(default_factory=dict)
 
 
 class BrowserFetcher:
@@ -89,7 +97,7 @@ class BrowserFetcher:
         self._click_timeout_ms = click_timeout_ms
 
     async def fetch(self, url: str) -> BrowserFetchResult:
-        html, dom_links, network_urls = await self._load(url)
+        html, dom_links, network_urls, storage = await self._load(url)
         candidate_indices = await self._find_click_candidates(url)
         interaction_urls = await self._discover_via_clicks(url, candidate_indices)
 
@@ -98,6 +106,9 @@ class BrowserFetcher:
             dom_links=sorted(set(dom_links)),
             network_urls=sorted(network_urls),
             interaction_urls=sorted(interaction_urls),
+            cookies=storage["cookies"],
+            local_storage=storage["localStorage"],
+            session_storage=storage["sessionStorage"],
         )
 
     async def _new_authenticated_context(self):
@@ -105,9 +116,10 @@ class BrowserFetcher:
             http_credentials={"username": self._username, "password": self._password}
         )
 
-    async def _load(self, url: str) -> tuple[str, list[str], set[str]]:
+    async def _load(self, url: str) -> tuple[str, list[str], set[str], dict]:
         """Passive load: goto + networkidle, same as before click-driven
-        discovery existed. Returns (html, dom_links, network_urls)."""
+        discovery existed. Returns (html, dom_links, network_urls,
+        storage_snapshot)."""
         context = await self._new_authenticated_context()
         network_urls: set[str] = set()
 
@@ -127,10 +139,40 @@ class BrowserFetcher:
             dom_links = await page.eval_on_selector_all(
                 "a[href]", "elements => elements.map(e => e.href)"
             )
+            storage = await self._read_client_storage(page)
         finally:
             await context.close()
 
-        return html, dom_links, network_urls
+        return html, dom_links, network_urls, storage
+
+    @staticmethod
+    async def _read_client_storage(page) -> dict:
+        """Snapshot document.cookie/localStorage/sessionStorage right
+        after load (issue #103). Degrades to an empty snapshot rather
+        than failing the whole page fetch -- storage access can throw in
+        edge cases (a sandboxed frame, a site that blocks it outright)."""
+        empty = {"cookies": "", "localStorage": {}, "sessionStorage": {}}
+        try:
+            result = await page.evaluate(
+                """() => {
+                    const toObj = (storage) => {
+                        const obj = {};
+                        for (let i = 0; i < storage.length; i++) {
+                            const key = storage.key(i);
+                            obj[key] = storage.getItem(key);
+                        }
+                        return obj;
+                    };
+                    return {
+                        cookies: document.cookie,
+                        localStorage: toObj(window.localStorage),
+                        sessionStorage: toObj(window.sessionStorage),
+                    };
+                }"""
+            )
+        except Exception:
+            return empty
+        return result if isinstance(result, dict) else empty
 
     async def _find_click_candidates(self, url: str) -> list[int]:
         """Return the indices (into `_CLICK_CANDIDATE_SELECTOR`'s match

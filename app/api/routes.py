@@ -28,6 +28,7 @@ from app.crawler.replay import replay_extraction
 from app.events import CRAWL_FINISHED, EventBus
 from app.extractors.base import ExtractorRegistry
 from app.extractors.binary_fallback import BinaryFallbackExtractor
+from app.extractors.client_storage import ClientStorageExtractor
 from app.extractors.css_js import CssJsExtractor
 from app.extractors.headers_cookies import HeaderCookieExtractor
 from app.extractors.html import HtmlExtractor
@@ -36,6 +37,7 @@ from app.extractors.image_lsb import ImageLsbExtractor
 from app.extractors.image_ocr import ImageOcrExtractor
 from app.extractors.image_structural import ImageStructuralExtractor
 from app.extractors.js_charcode import JsCharCodeExtractor
+from app.extractors.redirect_chain import RedirectExtractor
 from app.models import CrawlSummary, PasswordMatch
 from app.storage.repository import Repository
 from app.storage.sqlite import SqliteRepository
@@ -149,6 +151,8 @@ async def _build_orchestrator(request: CrawlRequest, event_bus: EventBus):
         browser_fetcher=BrowserFetcher(browser, request.username, request.password),
         extractor_registry=registry,
         header_cookie_extractor=HeaderCookieExtractor(context_chars=_CONTEXT_CHARS),
+        redirect_extractor=RedirectExtractor(context_chars=_CONTEXT_CHARS),
+        client_storage_extractor=ClientStorageExtractor(context_chars=_CONTEXT_CHARS),
         repository=repository,
         max_pages=request.max_pages,
         max_duration_seconds=request.max_duration_seconds,

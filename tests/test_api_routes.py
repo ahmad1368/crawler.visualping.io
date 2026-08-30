@@ -452,6 +452,7 @@ def test_response_payload_shapes_match_the_full_contract(monkeypatch, client):
         "started_at",
         "finished_at",
         "asset_completeness",
+        "content_negotiation",
     }
     assert len(report["matches"]) == 1
     assert set(report["matches"][0].keys()) == {

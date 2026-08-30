@@ -72,18 +72,24 @@ that bound.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 
 from app.crawler.asset_scanner import audit_static_assets
 from app.crawler.browser_fetcher import BrowserFetcher
+from app.crawler.content_negotiation import probe_content_negotiation
 from app.crawler.fetcher import HttpFetcher
 from app.crawler.frontier import UrlFrontier
 from app.crawler.pagination_guard import PaginationGuard, pagination_family_key
 from app.events import CRAWL_FINISHED, MATCH_FOUND, PAGE_FETCHED, EventBus
 from app.extractors.base import ExtractorRegistry
+from app.extractors.client_storage import ClientStorageExtractor
 from app.extractors.headers_cookies import HeaderCookieExtractor
+from app.extractors.redirect_chain import RedirectExtractor
 from app.models import CrawlSummary, PageResult
 from app.storage.repository import Repository
+
+logger = logging.getLogger(__name__)
 
 
 class Orchestrator:
@@ -101,6 +107,8 @@ class Orchestrator:
         pagination_family_limit: int = 10,
         pagination_family_page_cap: int | None = 200,
         event_bus: EventBus | None = None,
+        redirect_extractor: RedirectExtractor | None = None,
+        client_storage_extractor: ClientStorageExtractor | None = None,
     ) -> None:
         self._frontier = frontier
         self._http_fetcher = http_fetcher
@@ -111,6 +119,8 @@ class Orchestrator:
         self._concurrency = concurrency
         self._max_pages = max_pages
         self._max_duration_seconds = max_duration_seconds
+        self._redirect_extractor = redirect_extractor or RedirectExtractor()
+        self._client_storage_extractor = client_storage_extractor or ClientStorageExtractor()
         self._pagination_guard = PaginationGuard(
             max_unproductive=pagination_family_limit,
             max_family_pages=pagination_family_page_cap,
@@ -182,16 +192,23 @@ class Orchestrator:
 
         queue_empty = not self._frontier.has_next()
         asset_completeness = None
+        content_negotiation = None
         if queue_empty:
             # Only on genuine completion -- an operator-bounded crawl
             # (stop(), max_pages, max_duration_seconds) deliberately
-            # limited how much gets fetched, and this audit's own
-            # fetches would silently defeat that bound (issue #99).
+            # limited how much gets fetched, and either audit's own
+            # fetches would silently defeat that bound (issues #99/#103).
             asset_completeness = await audit_static_assets(
                 self._repository,
                 self._http_fetcher,
                 self._extractor_registry,
                 self._header_cookie_extractor,
+                event_bus=self._event_bus,
+                unique_values=unique_values,
+            )
+            content_negotiation = await probe_content_negotiation(
+                self._repository,
+                self._http_fetcher,
                 event_bus=self._event_bus,
                 unique_values=unique_values,
             )
@@ -204,6 +221,7 @@ class Orchestrator:
             started_at=started_at,
             finished_at=datetime.now(timezone.utc),
             asset_completeness=asset_completeness,
+            content_negotiation=content_negotiation,
         )
         if self._event_bus is not None:
             self._event_bus.publish(CRAWL_FINISHED, summary)
@@ -217,11 +235,26 @@ class Orchestrator:
         matches.extend(
             self._header_cookie_extractor.extract(fetch_result.headers, fetch_result.cookies, url)
         )
+        if fetch_result.redirect_history:
+            logger.info(
+                "Redirect chain analyzed for %s -- %d hop(s).",
+                url,
+                len(fetch_result.redirect_history),
+            )
+            matches.extend(self._redirect_extractor.extract(fetch_result.redirect_history, url))
 
         is_html = content_type.startswith("text/html")
         new_external_links = 0
         if is_html:
             browser_result = await self._browser_fetcher.fetch(url)
+            matches.extend(
+                self._client_storage_extractor.extract(
+                    browser_result.cookies,
+                    browser_result.local_storage,
+                    browser_result.session_storage,
+                    url,
+                )
+            )
             discovered = (
                 *browser_result.dom_links,
                 *browser_result.network_urls,

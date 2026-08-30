@@ -104,15 +104,29 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
          structural link discovery, fetches whatever's missing through
          the same extractor pipeline, and attaches a
          StaticAssetCompletenessReport to the returned CrawlSummary
-         (CrawlSummary.asset_completeness, None when skipped))
+         (CrawlSummary.asset_completeness, None when skipped); also runs
+         app/crawler/content_negotiation.py::probe_content_negotiation(),
+         issue #103, same queue_empty-only gating: re-requests a bounded
+         sample of already-crawled HTML pages with alternate Accept/
+         X-Requested-With headers, attaching a ContentNegotiationReport
+         (CrawlSummary.content_negotiation))
         │
         ├── UrlFrontier                          app/crawler/frontier.py
         │   (queue + visited-set seeded from the request URL; normalizes
         │    URLs, same-origin filter, dedupe prevents cyclic-link loops)
         │
         └── per URL popped: HttpFetcher.fetch(url)   app/crawler/fetcher.py
-            (httpx.AsyncClient + Basic Auth, retry/backoff)
-            └── FetchResult (content, content_type, status_code, headers, cookies)
+            (httpx.AsyncClient + Basic Auth, retry/backoff; extra_headers
+             param added issue #103 for content-negotiation probing)
+            └── FetchResult (content, content_type, status_code, headers,
+                cookies, redirect_history -- issue #103, from httpx's own
+                response.history, discarded before this issue since
+                follow_redirects=True only surfaced the final response)
+                │
+                ├── RedirectExtractor.extract(redirect_history, url)
+                │   app/extractors/redirect_chain.py -- issue #103, not
+                │   routed through ExtractorRegistry (different input
+                │   shape, same reason as HeaderCookieExtractor below)
                 │
                 ├── ExtractorRegistry.run_all(content, content_type, url)
                 │   app/extractors/base.py -- dispatches to HtmlExtractor,
@@ -138,7 +152,19 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
                 │
                 ├── if content_type is text/html:
                 │   BrowserFetcher.fetch(url)     app/crawler/browser_fetcher.py
-                │   └── BrowserFetchResult (dom_links, network_urls)
+                │   └── BrowserFetchResult (dom_links, network_urls,
+                │       cookies/local_storage/session_storage -- issue
+                │       #103, a per-page page.evaluate() snapshot right
+                │       after goto(); no persistent cross-page browser
+                │       session exists in this design, see issue #103's
+                │       own report section for why that scopes this to a
+                │       per-page snapshot, not a whole-crawl diff)
+                │       ├── ClientStorageExtractor.extract(cookies,
+                │       │   local_storage, session_storage, url)
+                │       │   app/extractors/client_storage.py -- issue #103,
+                │       │   same not-routed-through-ExtractorRegistry
+                │       │   reason as HeaderCookieExtractor/RedirectExtractor
+                │       │
                 │       └── UrlFrontier.add_many(...) -- feeds discovered
                 │           links back into the queue (same-origin + dedup
                 │           keeps the crawl bounded)
@@ -2219,4 +2245,111 @@ demonstrated an actual need for it against a real image.
   exhaustive multi-bit-plane/permutation search would be a much larger,
   separate feature. Recovering a pixel-coordinate locator (vs. a
   message-byte offset) is also deferred, noted above.
+
+## Issue #103: cookie, redirect, and content-negotiation probing module
+
+- **Confirmed gaps, checked before filing:** `HttpFetcher`
+  (`app/crawler/fetcher.py`) sets `follow_redirects=True` and returned
+  only the *final* response -- every intermediate redirect hop's
+  `Location` header/status was silently discarded
+  (`httpx.Response.history` existed but was never read).
+  `BrowserFetcher` never evaluated `document.cookie`/`localStorage`/
+  `sessionStorage` in-page. No content-negotiation probing (re-requesting
+  with alternate `Accept`/`X-Requested-With` headers) existed anywhere.
+- **Architectural note that shaped scope:** `BrowserFetcher` creates a
+  fresh, isolated browser context per page fetch
+  (`_new_authenticated_context()`), deliberately, for isolation/
+  simplicity -- there is no persistent cross-page browser session in
+  this design. A whole-crawl "storage state before vs. after" diff
+  doesn't fit that without a much larger context-lifecycle change, so
+  this is scoped to a **per-page storage snapshot** instead (captured at
+  each page's own load, same lifecycle as its DOM links) -- still audits
+  every page's client-side storage, just not as one before/after diff.
+- **Transformation, three independent additions:**
+  1. **Redirects** -- `FetchResult` (`app/crawler/fetcher.py`) gains
+     `redirect_history: list[RedirectHop]`, built from
+     `httpx.Response.history` (url/status_code/location per hop). New
+     `RedirectExtractor` (`app/extractors/redirect_chain.py`, same
+     differently-shaped-input pattern as `HeaderCookieExtractor`, not
+     routed through `ExtractorRegistry`) scans each hop's `Location`
+     header (its query string is part of the same string, so no
+     separate parsing needed) against the flag regex. Wired directly in
+     `Orchestrator._process_url`, folded into that page's own `matches`.
+     Also logs a line per URL with a non-empty redirect chain: hop count.
+  2. **Client-side storage** -- `BrowserFetchResult` gains `cookies:
+     str`, `local_storage: dict[str, str]`, `session_storage: dict[str,
+     str]`, captured via a new `page.evaluate()` call right after
+     `goto()` in `BrowserFetcher._load()` (degrades to an empty snapshot
+     on any evaluation error, e.g. a sandboxed frame -- never fails the
+     page fetch). New `ClientStorageExtractor`
+     (`app/extractors/client_storage.py`, same pattern) scans all three
+     against the flag regex, wired the same way, into the `is_html`
+     branch of `_process_url` right after the browser fetch.
+  3. **Content negotiation** -- new
+     `app/crawler/content_negotiation.py::probe_content_negotiation()`,
+     a post-crawl audit phase mirroring issue #99's `audit_static_assets`
+     pattern exactly: only runs when `queue_empty` (an operator-bounded
+     early stop must not be silently defeated by extra probing fetches).
+     Re-requests a bounded, representative sample (default 5, `sample_
+     size` param) of already-crawled HTML pages via `HttpFetcher.fetch()`
+     (which gained an `extra_headers` parameter for this) with three
+     fixed header sets (`Accept: application/json`, `Accept: text/
+     plain`, `X-Requested-With: XMLHttpRequest`), scanning both the
+     response body and every response header value. Any match found has
+     no natural "page" to attach a stored snapshot to -- it's a probe of
+     an *existing* URL, and reusing that URL for `save_page()` would
+     clobber the primary crawl's own stored snapshot for it -- so it's
+     persisted via `Repository.save_match()`, the standalone-match path
+     that method was built for but, until this issue, nothing in
+     production code actually called. Logs per probe (hit or miss) and
+     a final summary line.
+- **Outputs:** new `SourceType.CLIENT_STORAGE`/`REDIRECT`/
+  `CONTENT_NEGOTIATION` values (each a genuinely distinct vantage point,
+  matching how `IMAGE_OCR`/`IMAGE_LSB` each got their own value), added
+  to `NON_TEXT_SOURCE_TYPES` in `app/static/index.html` -- none of these
+  values are present in a crawled page's own stored snapshot body, so
+  the snapshot viewer's locator+context fallback applies to all three.
+  New `ContentNegotiationReport` (`app/models.py`, mirroring
+  `StaticAssetCompletenessReport`'s shape) attached to
+  `CrawlSummary.content_negotiation` -- flows through the existing
+  `GET /report` and WebSocket payload, no new endpoint.
+  **Data-flow/security note (per the data-flow watchlist):** two
+  genuinely new categories of captured data, flagged explicitly per the
+  issue's own acceptance criteria: client-side storage (cookies/
+  localStorage/sessionStorage values) and redirect `Location` headers
+  are now read and, if they contain a match, persisted -- same trust
+  boundary as existing snapshot/header/cookie storage (issue #72's
+  headers/cookies note already established this precedent), not a new
+  risk category, but a new *source* of at-rest data worth naming
+  explicitly. Redirect/storage/probe data itself (the full snapshot, not
+  just an extracted match) is never persisted wholesale -- only
+  `PasswordMatch` rows are, same as every other extractor.
+- **`/re-extract` (issue #72) wiring -- deliberately excluded, not an
+  oversight:** none of these three mechanisms are wired into the replay
+  path. `PageFetchData` (what `/re-extract` replays from) has no
+  redirect-history or client-storage field -- that data was never
+  persisted in the first place, so there's nothing to replay it from
+  without a much larger storage-schema change. The content-negotiation
+  probe is fundamentally a *live* re-fetch with different headers, which
+  would violate `/re-extract`'s whole design principle (issue #72:
+  "zero network/browser calls"). All three require live network/browser
+  access every time, unlike the passive body-content extractors that
+  are.
+- **Tests:** new `tests/test_redirect_chain_extractor.py` (5),
+  `tests/test_client_storage_extractor.py` (6),
+  `tests/test_content_negotiation.py` (7) -- unit-level for each
+  mechanism in isolation, including a failed-probe-doesn't-abort-the-
+  rest case and a sample-size-bounds-page-count case. The existing
+  end-to-end test (`tests/test_e2e_crawl.py`, a real Orchestrator/
+  HttpFetcher/BrowserFetcher/repository against a real local server) now
+  also exercises all three live -- its `EXPECTED_SOURCE_TYPES` needed
+  updating since the fixture server has no real negotiation logic (same
+  body regardless of `Accept`), so the probe legitimately, if
+  incidentally, re-finds several already-planted passwords under
+  `CONTENT_NEGOTIATION` too, and the fixture's non-`HttpOnly`
+  Set-Cookie-planted password is also readable via `document.cookie` in
+  the browser (`CLIENT_STORAGE`) -- both are correct, expected discovery
+  via an additional vantage point, same accepted pattern as the existing
+  EXIF+BINARY dual-reporting case in that same test. Full suite: 261
+  passed, 4 skipped (OCR/Tesseract). ruff/black/mypy clean.
 
