@@ -1651,3 +1651,59 @@ to eventually cut off *any* runaway family, trap or legitimate.
   stored `content_type` so a browser tab renders it) not requested here
   -- noted as a natural future enhancement if the auth-prompt friction
   turns out to matter in practice.
+
+## Fix: ImageExifExtractor mis-decoded UTF-16 UserComment as UTF-8
+
+- **Inputs:** same image bytes `ImageExifExtractor.extract()` already
+  receives -- no new input. Targets a specific obfuscation technique: the
+  EXIF spec's `UserComment` tag (0x9286) carries an 8-byte charset prefix
+  ahead of the actual text, and one of its three defined values is
+  `"UNICODE\0"`, meaning the remaining bytes are UTF-16 rather than
+  ASCII. A site can pick that encoding specifically because a naive
+  text-string search over the raw bytes won't find a plaintext password
+  in it -- each character is 2 (or more, with a leading zero byte for
+  ASCII-range characters) bytes wide, never appearing as a contiguous
+  ASCII run.
+- **Transformation:** `app/extractors/image_exif.py`'s
+  `_decode_exif_value()` already recognized the `"UNICODE\0"` prefix (it
+  was in `_USER_COMMENT_CHARSET_PREFIXES`) but then fell through to the
+  same `value.decode("utf-8", errors="replace")` used for every prefix --
+  silently mangling every UTF-16 character into replacement bytes, so
+  the password regex could never match. Replaced with
+  `_decode_exif_candidates()`, which special-cases the `"UNICODE\0"`
+  prefix to decode the payload as UTF-16 instead of UTF-8. Pillow doesn't
+  expose the TIFF byte-order flag (`II`/`MM`) needed to know whether a
+  given file's UTF-16 is little- or big-endian, so both `utf-16-le` and
+  `utf-16-be` decodings are returned as separate candidates for
+  `_scan_ifd()` to run `find_passwords()` against -- a real password only
+  ever matches the correctly-endianed one; the other decodes to unmatched
+  noise, so trying both carries no risk of a duplicate match. The
+  ASCII/JIS/no-prefix path is unchanged (still a single UTF-8 decode).
+- **Outputs:** no shape change -- same `PasswordMatch`
+  (`SourceType.IMAGE_METADATA`, `exif:UserComment` locator) as any other
+  EXIF find; this just makes the extractor actually locate a match that
+  was silently being missed before.
+  **Data-flow/security note (per the data-flow watchlist):** no new
+  exposure surface, same as the JS char-code fix above -- this is a
+  detection-correctness fix over data already fetched and already
+  treated as sensitive once matched. Flagged for the same reason: EXIF
+  UserComment is a third distinct obfuscation technique found in this
+  codebase now (plaintext, JS char-code arrays, UTF-16) that a site can
+  use specifically to defeat a naive scanner, reinforcing that today's
+  extractor set should keep being treated as partial, not exhaustive.
+- **Tests:** two new cases in `tests/test_image_exif_extractor.py` --
+  `test_extracts_password_from_utf16_le_user_comment` and
+  `..._be_user_comment`, each building a real UTF-16-encoded
+  `UserComment` via piexif in the nested Exif sub-IFD (the real-world
+  shape, matching the existing nested-IFD regression test's pattern) and
+  asserting the password is found. Full suite: 206 tests pass (204
+  existing + 2 new); every pre-existing EXIF case (ASCII UserComment,
+  nested sub-IFD, GPS IFD, ImageDescription, non-image content type,
+  unparseable image) still passes unchanged. ruff/black/mypy clean.
+- **Not implemented / explicitly out of scope:** the EXIF spec's third
+  charset value, `"JIS\0\0\0\0\0"` (JIS X 0208, a Japanese text
+  encoding), still falls through to a plain UTF-8 decode same as before
+  this fix -- not addressed here since it wasn't the reported issue; a
+  real JIS-encoded UserComment would need the same treatment
+  (`payload.decode("iso2022_jp", ...)` or similar) if it turns out to
+  matter in practice.
