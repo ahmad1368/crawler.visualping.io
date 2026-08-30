@@ -26,6 +26,9 @@ class SourceType(str, Enum):
     BINARY = "binary"
     CLIENT_STORAGE = "client_storage"
     REDIRECT = "redirect"
+    BASE64_HEX = "base64_hex"
+    REVERSED_TEXT = "reversed_text"
+    ROT13 = "rot13"
     CONTENT_NEGOTIATION = "content_negotiation"
 
 

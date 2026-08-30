@@ -132,23 +132,32 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
                 │   app/extractors/base.py -- dispatches to HtmlExtractor,
                 │   CssJsExtractor, ImageExifExtractor,
                 │   ImageStructuralExtractor, ImageOcrExtractor,
-                │   ImageLsbExtractor, BinaryFallbackExtractor (each
-                │   calls find_passwords() from app/matching.py;
-                │   ImageOcrExtractor runs Tesseract over the decoded
-                │   image and scans whatever text it recognizes -- reads
-                │   a password drawn as pixels rather than present as
-                │   parseable text/metadata; ImageStructuralExtractor,
-                │   issue #101, hand-parses JPEG COM segments and PNG
-                │   tEXt/zTXt/iTXt chunks -- zlib-decompresses a chunk
-                │   before searching it; ImageLsbExtractor, issue #101
-                │   Layer 3, reads the least-significant bit of every
-                │   R/G/B/A pixel channel byte -- the only extractor
-                │   that reads pixel *values* rather than pixel content
-                │   or any text-shaped field at all)
+                │   ImageLsbExtractor, Base64HexExtractor,
+                │   ReversedTextExtractor, Rot13Extractor,
+                │   BinaryFallbackExtractor (each calls find_passwords()
+                │   from app/matching.py; ImageOcrExtractor runs Tesseract
+                │   over the decoded image and scans whatever text it
+                │   recognizes -- reads a password drawn as pixels rather
+                │   than present as parseable text/metadata;
+                │   ImageStructuralExtractor, issue #101, hand-parses
+                │   JPEG COM segments and PNG tEXt/zTXt/iTXt chunks --
+                │   zlib-decompresses a chunk before searching it;
+                │   ImageLsbExtractor, issue #101 Layer 3, reads the
+                │   least-significant bit of every R/G/B/A pixel channel
+                │   byte -- the only extractor that reads pixel *values*
+                │   rather than pixel content or any text-shaped field at
+                │   all; Base64HexExtractor/ReversedTextExtractor/
+                │   Rot13Extractor, issue #98, decode/transform text
+                │   before re-running find_passwords() against the
+                │   result -- app/extractors/deobfuscation.py holds the
+                │   shared transform primitives all three (and
+                │   HeaderCookieExtractor below) reuse)
                 │
                 ├── HeaderCookieExtractor.extract(headers, cookies, url)
                 │   app/extractors/headers_cookies.py (not routed through
-                │   ExtractorRegistry -- different input shape, see issue #11)
+                │   ExtractorRegistry -- different input shape, see issue
+                │   #11; issue #98 also runs each header/cookie value
+                │   through the same Base64/hex/reversed/ROT13 transforms)
                 │
                 ├── if content_type is text/html:
                 │   BrowserFetcher.fetch(url)     app/crawler/browser_fetcher.py
@@ -2366,4 +2375,88 @@ demonstrated an actual need for it against a real image.
   via an additional vantage point, same accepted pattern as the existing
   EXIF+BINARY dual-reporting case in that same test. Full suite: 261
   passed, 4 skipped (OCR/Tesseract). ruff/black/mypy clean.
+
+## Issue #98: deep payload deobfuscation + re-scan pipeline
+
+- **Already covered, deliberately not re-touched:** JS char-code array /
+  `String.fromCharCode(...)` decoding already exists as
+  `JsCharCodeExtractor` (issue #83), registered in both `_build_
+  orchestrator()` and `/re-extract`. Re-verified it's still correctly
+  wired in both places -- it is. No changes made to it.
+- **Real, previously-unaddressed gaps:** a password Base64- or
+  hex-encoded, written backwards, or ROT13'd never matches the plain
+  password regex against raw text -- the encoded/transformed bytes don't
+  contain the literal `VISUALPING{...}` string anywhere.
+- **Transformation:** new `app/extractors/deobfuscation.py` holds the
+  shared transform primitives every new extractor (and
+  `HeaderCookieExtractor`) reuses, so the same decode/transform logic
+  isn't duplicated four times:
+  - `base64_hex_candidates(text)` -- finds length-gated candidate runs
+    (20+ chars, mirroring `JsCharCodeExtractor`'s own minimum-length
+    reasoning: shorter than that is far more likely to be unrelated data
+    than an obfuscated ~28-char flag) matching the Base64 alphabet
+    (standard and URL-safe together) or a hex byte stream, decodes each,
+    skips anything that fails to decode rather than raising.
+  - `reverse_text(text)` / `rot13_text(text)` -- whole-string transforms,
+    no candidate pre-filtering needed since both are a single O(n) pass
+    regardless of content.
+  - `is_text_like(content_type)` -- scopes all of the above to
+    text-shaped content (HTML/CSS/JS/JSON/XML/plain text), deliberately
+    excluding images/binary: `BinaryFallbackExtractor` already raw-scans
+    those, and reversing/ROT13-transforming a multi-MB image as "text"
+    on every fetch would add real per-page cost for a technique that's a
+    text-obfuscation trick, not a pixel one.
+  New `Base64HexExtractor`, `ReversedTextExtractor`, `Rot13Extractor`
+  (`app/extractors/base64_hex.py`, `reversed_text.py`, `rot13.py`) --
+  one class per technique, following this project's established
+  Strategy+Registry pattern (see `js_charcode.py`/`image_ocr.py` for
+  recent precedent) rather than a monolithic "deobfuscator" module.
+  Registered in **both** `_build_orchestrator()` and `/re-extract` in
+  `app/api/routes.py` (issue #93's own lesson, double-checked here).
+  `HeaderCookieExtractor` also gained a `_transform_matches_for()` step
+  applying all three transforms to every header/cookie value -- the
+  spec's "pass... header values through all deobfuscators" requirement,
+  fulfilled by reusing the same shared primitives rather than a second
+  execution path.
+- **Outputs:** new `SourceType.BASE64_HEX`/`REVERSED_TEXT`/`ROT13`
+  values (each a genuinely distinct technique, matching how
+  `IMAGE_OCR`/`IMAGE_LSB`/`CLIENT_STORAGE` etc. each got their own
+  value). Added to `NON_TEXT_SOURCE_TYPES` in `app/static/index.html` --
+  the plaintext match value never literally appears in the raw stored
+  snapshot for any of these three (only its encoded/reversed/rotated
+  form does), so the snapshot viewer's `indexOf()` search would never
+  find it; the locator+context fallback applies. `locator` values note
+  which transform found the match and, for Base64/hex, that the offset
+  is into the *decoded* candidate (there's no single stable position in
+  the still-encoded raw bytes to point at); reversed-text locators are
+  offsets into the *reversed* string for the same reason.
+  **Data-flow/security note (per the data-flow watchlist):** no new
+  exposure surface -- same storage/REST/WebSocket path and trust
+  boundary as every other extractor; a decoded/transformed candidate
+  string is held only in memory long enough to run `find_passwords()`
+  against it, never persisted itself (only a resulting `PasswordMatch`
+  is, same as everywhere else).
+- **Tests:** new `tests/test_deobfuscation.py` (9, the shared primitives
+  in isolation), `tests/test_base64_hex_extractor.py` (7),
+  `tests/test_reversed_text_extractor.py` (4),
+  `tests/test_rot13_extractor.py` (4), plus 3 new cases added to the
+  existing `tests/test_headers_cookies_extractor.py` covering the
+  transform-scanning addition there. Each extractor's fixture confirms
+  the raw text never contains the password literally (proving the
+  obfuscation is genuine, not accidentally already-plaintext), that
+  decode+match works, and that malformed/short input degrades to no
+  match without raising -- same shape as `tests/test_js_charcode_
+  extractor.py`. Full suite: 288 passed (27 new), 4 skipped
+  (OCR/Tesseract). ruff/black/mypy clean.
+- **Not implemented / explicitly out of scope:** combined/stacked
+  obfuscation (e.g. Base64-then-ROT13, or reversed-then-hex) -- each
+  transform is tried independently against the original text, not
+  chained against each other's output; the spec asked for four
+  independent techniques, not a general obfuscation-chain solver, and
+  the combinatorial candidate space of chaining all four would grow
+  quickly for uncertain real-world benefit. Base64/hex candidate
+  detection is regex-based pattern-matching, not exhaustive -- a
+  candidate broken up by intervening non-alphabet characters (e.g. an
+  encoded value split across multiple lines with other text between)
+  would not be reassembled and decoded as one run.
 
