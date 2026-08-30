@@ -322,7 +322,7 @@
     // shown as a readable locator + context fallback instead. image_ocr
     // matches are text OCR'd out of image pixels: the password was never
     // parseable text in the raw image bytes to indexOf-search for.
-    const NON_TEXT_SOURCE_TYPES = new Set(["image_metadata", "binary", "image_ocr"]);
+    const NON_TEXT_SOURCE_TYPES = new Set(["image_metadata", "binary", "image_ocr", "image_lsb"]);
 
     let currentCrawlId = null;
     // All matches known so far (live WebSocket rows or the final report),

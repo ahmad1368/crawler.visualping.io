@@ -258,3 +258,12 @@ backfilling #1-28/#61/#63, which that report already covers in full).
   fetched page's stored text for `/static/...` references structural
   link discovery might have missed, fetches any gap, and reports
   coverage on `CrawlSummary.asset_completeness`.
+- #101: New `ImageStructuralExtractor` hand-parses JPEG `COM` segments
+  and PNG `tEXt`/`zTXt`/`iTXt` chunks, decompressing zlib-compressed
+  chunks and trying UTF-16/UTF-8/ASCII decodings -- finds passwords no
+  existing extractor could reach (a compressed chunk is invisible to any
+  plain-text scan until decompressed). Issue expanded mid-flight into a
+  unified multi-layer pipeline: Layer 2 (visual OCR) was already
+  shipped; new `ImageLsbExtractor` (Layer 3) reads the least-significant
+  bit of every pixel color channel to detect classic LSB steganography
+  -- a message hidden nowhere as text at all, only in raw pixel values.
