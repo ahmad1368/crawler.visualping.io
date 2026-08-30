@@ -42,6 +42,12 @@ app = FastAPI()
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
+# How many characters of surrounding text each extractor captures around a
+# match. Previously a per-crawl request field ("Context length" in the UI)
+# -- removed as a user-facing setting (not useful in practice), fixed at
+# its old default instead.
+_CONTEXT_CHARS = 80
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
@@ -61,7 +67,6 @@ class CrawlRequest(BaseModel):
     url: HttpUrl
     username: str = Field(min_length=1)
     password: str = Field(min_length=1)
-    context_chars: int = 80
     # Both None by default (issue #71): completion is the frontier
     # actually emptying, not a guessed page count -- see
     # Orchestrator's module docstring. Either can still be set as an
@@ -100,18 +105,13 @@ class SnapshotResponse(BaseModel):
 
 
 class _CrawlState:
-    def __init__(self, context_chars: int = 80) -> None:
+    def __init__(self) -> None:
         self.status = CrawlStatus.RUNNING
         self.report: CrawlSummary | None = None
         self.error: str | None = None
         self.event_bus = EventBus()
         self.repository: Repository | None = None
         self.orchestrator: Orchestrator | None = None
-        # Kept so a later /re-extract (issue #72) builds extractors with
-        # the same context_chars the original crawl used, instead of
-        # silently reverting to a default and producing inconsistent
-        # context strings.
-        self.context_chars = context_chars
 
 
 _crawls: dict[str, _CrawlState] = {}
@@ -131,12 +131,12 @@ async def _build_orchestrator(request: CrawlRequest, event_bus: EventBus):
 
     frontier = UrlFrontier(str(request.url))
     registry = ExtractorRegistry()
-    registry.register(HtmlExtractor(context_chars=request.context_chars))
-    registry.register(CssJsExtractor(context_chars=request.context_chars))
-    registry.register(JsCharCodeExtractor(context_chars=request.context_chars))
-    registry.register(ImageExifExtractor(context_chars=request.context_chars))
-    registry.register(ImageOcrExtractor(context_chars=request.context_chars))
-    registry.register(BinaryFallbackExtractor(context_chars=request.context_chars))
+    registry.register(HtmlExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(CssJsExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(JsCharCodeExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ImageExifExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ImageOcrExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(BinaryFallbackExtractor(context_chars=_CONTEXT_CHARS))
 
     repository = SqliteRepository(sqlite3.connect(f"crawl_{uuid.uuid4().hex}.db"))
     orchestrator = Orchestrator(
@@ -144,7 +144,7 @@ async def _build_orchestrator(request: CrawlRequest, event_bus: EventBus):
         http_fetcher=HttpFetcher(client, request.username, request.password),
         browser_fetcher=BrowserFetcher(browser, request.username, request.password),
         extractor_registry=registry,
-        header_cookie_extractor=HeaderCookieExtractor(context_chars=request.context_chars),
+        header_cookie_extractor=HeaderCookieExtractor(context_chars=_CONTEXT_CHARS),
         repository=repository,
         max_pages=request.max_pages,
         max_duration_seconds=request.max_duration_seconds,
@@ -192,7 +192,7 @@ async def start_crawl(
     request: CrawlRequest, background_tasks: BackgroundTasks
 ) -> CrawlCreatedResponse:
     crawl_id = str(uuid.uuid4())
-    _crawls[crawl_id] = _CrawlState(context_chars=request.context_chars)
+    _crawls[crawl_id] = _CrawlState()
     background_tasks.add_task(_run_crawl, crawl_id, request)
     return CrawlCreatedResponse(crawl_id=crawl_id)
 
@@ -282,13 +282,13 @@ async def re_extract_crawl(crawl_id: str) -> CrawlReportResponse:
         raise HTTPException(status_code=409, detail="crawl has not started yet")
 
     registry = ExtractorRegistry()
-    registry.register(HtmlExtractor(context_chars=state.context_chars))
-    registry.register(CssJsExtractor(context_chars=state.context_chars))
-    registry.register(JsCharCodeExtractor(context_chars=state.context_chars))
-    registry.register(ImageExifExtractor(context_chars=state.context_chars))
-    registry.register(ImageOcrExtractor(context_chars=state.context_chars))
-    registry.register(BinaryFallbackExtractor(context_chars=state.context_chars))
-    header_cookie_extractor = HeaderCookieExtractor(context_chars=state.context_chars)
+    registry.register(HtmlExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(CssJsExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(JsCharCodeExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ImageExifExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ImageOcrExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(BinaryFallbackExtractor(context_chars=_CONTEXT_CHARS))
+    header_cookie_extractor = HeaderCookieExtractor(context_chars=_CONTEXT_CHARS)
 
     summary, matches = replay_extraction(state.repository, registry, header_cookie_extractor)
     return CrawlReportResponse(summary=summary, matches=_build_match_rows(matches))

@@ -239,9 +239,6 @@
       <label for="password">Password</label>
       <input id="password" name="password" type="password" required autocomplete="off" />
 
-      <label for="context_chars">Context length</label>
-      <input id="context_chars" name="context_chars" type="number" min="0" value="80" />
-
       <div id="controls">
         <button id="run-button" type="submit">Run</button>
         <button id="pause-button" class="secondary" type="button" disabled>Pause</button>
@@ -626,7 +623,6 @@
         url: document.getElementById("url").value,
         username: document.getElementById("username").value,
         password: document.getElementById("password").value,
-        context_chars: Number(document.getElementById("context_chars").value || 80),
       };
 
       let response;

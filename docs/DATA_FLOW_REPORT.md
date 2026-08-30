@@ -1846,3 +1846,29 @@ to eventually cut off *any* runaway family, trap or legitimate.
 - **Outputs / data-flow:** unchanged from #72's original section --
   same at-rest trust boundary for headers/cookies, no new exposure.
 
+## Issue #96: remove the "Context length" field
+
+- **Inputs:** removes one -- `context_chars` is no longer accepted on
+  `POST /crawls` (`CrawlRequest`) or read from the UI form. Direct user
+  request: the per-crawl setting wasn't useful in practice.
+- **Transformation:** every extractor-construction call site in
+  `app/api/routes.py` (`_build_orchestrator()` and `/re-extract`, six
+  `registry.register(...)` calls plus `HeaderCookieExtractor` each) now
+  passes a fixed module constant `_CONTEXT_CHARS = 80` (the field's old
+  default) instead of a per-request value. `_CrawlState` no longer
+  carries a `context_chars` attribute -- there's only one value now, so
+  `/re-extract` doesn't need to remember what the original crawl used.
+  `Settings.context_chars`/`CONTEXT_CHARS` removed too (already the last
+  consumer, per the existing note that the REST API path doesn't read
+  `Settings` for url/credentials either). The extractors' own
+  `context_chars` constructor parameter is unchanged -- that's an
+  internal implementation detail every extractor already had, not the
+  user-facing setting being removed here.
+- **Outputs:** `PasswordMatch.context_before`/`context_after` are
+  produced exactly as before, just always at the one fixed width instead
+  of a caller-chosen one. No data-flow/security change -- if anything,
+  one fewer user-controlled value reaching the backend.
+- **Removed:** the "Context length" label/input from
+  `app/static/index.html`'s form, and the corresponding
+  `context_chars: Number(...)` line building the `POST /crawls` body.
+
