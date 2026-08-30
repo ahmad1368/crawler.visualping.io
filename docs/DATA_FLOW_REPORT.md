@@ -43,7 +43,11 @@ Browser: GET /                                app/api/routes.py + app/static/ind
     "password-cell-click" DOM event) that opens a modal showing the raw
     snapshot with the match `<mark>`ed and scrolled into view -- or, for
     image_metadata/binary, a locator + context fallback instead of trying
-    to search a non-text body. Once crawl_finished arrives, GET
+    to search a non-text body. A search box above the table (issue #86)
+    filters the rendered rows client-side, case-insensitive substring
+    match against page_url only -- no new request, applied to whatever
+    rows are already in the browser (live or reconciled) and re-applied
+    on every subsequent row update. Once crawl_finished arrives, GET
     /crawls/{id}/report is still fetched as the authoritative
     reconciliation pass and its `matches` replace the live-built table
     wholesale -- the live version is never treated as final. A
@@ -1726,3 +1730,43 @@ to eventually cut off *any* runaway family, trap or legitimate.
   right before the `image_to_string()` call. Bounding-box locators
   (`image_to_data` instead of `image_to_string`) are also left for later,
   noted above.
+
+## Issue #86: search/filter input above the results table
+
+- **Inputs:** no new backend input or endpoint -- purely a client-side
+  filter over data `app/static/index.html` already holds: `match_found`
+  WebSocket rows during a live crawl, and `report.matches` from
+  `GET /crawls/{id}/report` after `crawl_finished`.
+- **Transformation:** new `#results-filter` `<input type="search">`
+  above `#results-table`. `renderResultsTable(matches)` -- the one
+  function every row producer already calls -- now stashes its argument
+  in `currentMatches` and calls `applyResultsFilter()` instead of
+  rendering directly; that function filters `currentMatches` through
+  `rowMatchesFilter()` (case-insensitive `String.includes()` against
+  `row.page_url` only) and hands the result to the renamed
+  `renderMatchRows()`. An `input` listener re-runs the same filter on
+  every keystroke. Because filtering always re-derives from
+  `currentMatches` rather than mutating the DOM in place, a live match
+  arriving mid-filter is still subject to whatever term is currently
+  typed -- the filter doesn't need separate live/reconciled code paths.
+  Starting a new crawl clears `currentMatches` and the input value, so a
+  stale filter term never silently hides a new crawl's rows.
+- **Outputs:** no new persisted data shape, no new response payload --
+  same match rows, just a subset shown in the DOM based on browser-local
+  input.
+  **Data-flow/security note (per the data-flow watchlist):** no new
+  concern. Nothing new leaves the browser or gets persisted; the filter
+  term itself never leaves the client (no request carries it).
+- **Tests:** new `test_results_filter_narrows_and_restores_rows`
+  (`tests/test_ui.py`), reusing the existing `live_server_match_streaming`
+  fixture/two-distinct-pages fixture data -- types a substring matching
+  only one row's `page_url`, confirms the table narrows to one row, types
+  a non-matching term and confirms the table shows zero rows, then
+  clears the input and confirms both rows return.
+- **Implementation note:** the functional UI change described above was
+  already present on `staging` (commit `15d292f`, merged via PR #82)
+  before this issue's branch was cut from it -- this issue's own work
+  was verifying that implementation against these acceptance criteria
+  and adding the still-missing pieces the standing workflow requires:
+  this report section, the README entry, and dedicated test coverage
+  (PR #82 shipped with none of the three).
