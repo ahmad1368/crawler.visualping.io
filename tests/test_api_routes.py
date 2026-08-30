@@ -13,7 +13,6 @@ VALID_BODY = {
     "url": "https://example.com",
     "username": "alice",
     "password": "s3cret",
-    "context_chars": 40,
 }
 
 CANNED_SUMMARY = CrawlSummary(
@@ -321,7 +320,7 @@ def test_re_extract_reruns_extraction_against_stored_fetch_data(client):
         content=f"<html>secret: {password}</html>".encode(),
         content_type="text/html",
     )
-    state = _CrawlState(context_chars=40)
+    state = _CrawlState()
     state.repository = FakeRepository(page_fetch_data=[page_data])
     routes._crawls["c1"] = state
 

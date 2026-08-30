@@ -44,9 +44,7 @@ WebSocket route onto the shared FastAPI app before the server starts.
 
 ### Using the UI
 
-1. Fill in the target URL, the site's Basic Auth username/password, and a
-   context length (how many characters of surrounding text to capture
-   around each match).
+1. Fill in the target URL and the site's Basic Auth username/password.
 2. Click **Run**. The button stays disabled and a live log streams one
    line per page/resource fetched and per password found, over the
    `/ws/crawls/{id}` WebSocket.
@@ -248,9 +246,5 @@ backfilling #1-28/#61/#63, which that report already covers in full).
 - #87: Re-verified the cache/replay path (#72); found and fixed #93 in
   the process (`JsCharCodeExtractor` was used but never imported,
   breaking every real crawl and `/re-extract` call).
-- #88: Re-verified `PaginationGuard` (#78); found and fixed a real
-  coverage regression -- an index/listing family with no direct password
-  matches was wrongly treated as unproductive and cut off, silently
-  dropping every content page its later listing pages would have
-  surfaced. `PaginationGuard` now also counts new links to content
-  outside the family as productive.
+- #96: Removed the "Context length" field -- no longer user-configurable,
+  fixed internally at its old default (80 characters).

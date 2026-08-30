@@ -1846,63 +1846,29 @@ to eventually cut off *any* runaway family, trap or legitimate.
 - **Outputs / data-flow:** unchanged from #72's original section --
   same at-rest trust boundary for headers/cookies, no new exposure.
 
-## Issue #88: re-verification of PaginationGuard (issue #78) -- a real coverage regression
+## Issue #96: remove the "Context length" field
 
-- **Inputs:** none new -- re-checks `PaginationGuard` (`app/crawler/
-  pagination_guard.py`) and its wiring into `Orchestrator._process_url`
-  (`app/crawler/orchestrator.py`) against issue #78's own acceptance
-  criteria, from scratch.
-- **Finding -- a real regression, reported directly by the user:** a
-  real-target crawl's coverage dropped from roughly 680 pages to roughly
-  480 after #78 shipped. Root cause: #78's fix keyed a pagination
-  family's productivity streak on `new_matches` alone (deliberately, to
-  defeat an adversarial family that always discovers a "new" next-page
-  link) -- but that wrongly treats an index/listing family as
-  unproductive whenever the index pages themselves carry no password
-  directly, which is the overwhelmingly common real shape: a listing
-  page links out to individual content pages, and only those carry the
-  secret. `PaginationGuard.is_stopped()` gates every future fetch in
-  that family once tripped (`Orchestrator`'s worker `continue`s past it
-  without ever fetching), so once a legitimate index family got marked
-  unproductive after just `pagination_family_limit` (10 by default)
-  pages, every link its later pages would have surfaced was silently
-  and permanently lost -- not delayed, dropped.
-- **Fix:** `PaginationGuard.record()` gains a second, independent
-  productivity signal, `new_external_links` -- links discovered on this
-  page leading somewhere *other than* this same pagination family. The
-  streak now resets on `new_matches or new_external_links`, not matches
-  alone. Crucially, a same-family link (e.g. this page's own "next page"
-  link) is excluded from that count entirely, so the original #78 defeat
-  (ordinary sequential pagination always "discovers" its own next link,
-  trap or not) still holds -- `Orchestrator._process_url` now partitions
-  every discovered link (DOM + network + click-interaction) by
-  `pagination_family_key()` before adding to the frontier, feeding only
-  the cross-family count into the guard. `max_family_pages` (the
-  unconditional hard ceiling, independent of the streak) is also raised
-  from 50 to 200, extra headroom for a legitimate large index now that
-  the streak logic itself is no longer the primary driver of premature
-  cutoff.
-- **Verified:** existing #78 regression tests
-  (`test_pagination_guard_terminates_an_adversarial_trap_that_always_looks_productive`,
-  `test_pagination_guard_stops_a_runaway_family_but_still_finds_real_content`)
-  still pass unchanged -- their fixtures never produce cross-family
-  links, so the adversarial-trap defense is intact. New test
-  `test_pagination_guard_does_not_cut_off_a_legitimate_index_with_no_direct_matches`
-  (`tests/test_orchestrator.py`) simulates the reported shape directly:
-  20 index pages (more than the default `pagination_family_limit` of
-  10), each with zero direct matches, each linking to one brand-new
-  content page that does have a match, using the orchestrator's actual
-  shipped defaults (no test-only override) -- confirmed this test fails
-  against the pre-fix code (`10 == 20` -- exactly the class of loss
-  reported) and passes with the fix. Two new `PaginationGuard`-level
-  unit tests in `tests/test_pagination_guard.py` cover the
-  `new_external_links` signal in isolation.
-- **Not verified against the real target:** as with every crawler-level
-  fix in this project's history, the exact 680-vs-480 numbers can't be
-  reproduced in this session (no target URL/credentials available) --
-  the fix is verified against a synthetic fixture that reproduces the
-  same *mechanism* (an index family with no direct matches linking out
-  to real content), not the real site itself.
-- **Outputs / data-flow:** no new data captured or persisted -- purely a
-  crawl-completeness fix. No data-flow/security concerns.
+- **Inputs:** removes one -- `context_chars` is no longer accepted on
+  `POST /crawls` (`CrawlRequest`) or read from the UI form. Direct user
+  request: the per-crawl setting wasn't useful in practice.
+- **Transformation:** every extractor-construction call site in
+  `app/api/routes.py` (`_build_orchestrator()` and `/re-extract`, six
+  `registry.register(...)` calls plus `HeaderCookieExtractor` each) now
+  passes a fixed module constant `_CONTEXT_CHARS = 80` (the field's old
+  default) instead of a per-request value. `_CrawlState` no longer
+  carries a `context_chars` attribute -- there's only one value now, so
+  `/re-extract` doesn't need to remember what the original crawl used.
+  `Settings.context_chars`/`CONTEXT_CHARS` removed too (already the last
+  consumer, per the existing note that the REST API path doesn't read
+  `Settings` for url/credentials either). The extractors' own
+  `context_chars` constructor parameter is unchanged -- that's an
+  internal implementation detail every extractor already had, not the
+  user-facing setting being removed here.
+- **Outputs:** `PasswordMatch.context_before`/`context_after` are
+  produced exactly as before, just always at the one fixed width instead
+  of a caller-chosen one. No data-flow/security change -- if anything,
+  one fewer user-controlled value reaching the backend.
+- **Removed:** the "Context length" label/input from
+  `app/static/index.html`'s form, and the corresponding
+  `context_chars: Number(...)` line building the `POST /crawls` body.
 
