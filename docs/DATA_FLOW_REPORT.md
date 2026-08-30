@@ -96,7 +96,15 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
          or abort the rest of the crawl, issue #24; each worker also
          awaits an asyncio.Event before popping its next URL and checks a
          stop flag right after, issue #68 -- pause()/resume()/stop()
-         control that Event/flag from outside an in-flight run())
+         control that Event/flag from outside an in-flight run(); once
+         the frontier genuinely empties -- not an early/bounded stop --
+         runs app/crawler/asset_scanner.py::audit_static_assets() as a
+         final completeness pass, issue #99: re-scans every already-
+         fetched page's stored text for /static/... references missed by
+         structural link discovery, fetches whatever's missing through
+         the same extractor pipeline, and attaches a
+         StaticAssetCompletenessReport to the returned CrawlSummary
+         (CrawlSummary.asset_completeness, None when skipped))
         │
         ├── UrlFrontier                          app/crawler/frontier.py
         │   (queue + visited-set seeded from the request URL; normalizes
@@ -1846,6 +1854,72 @@ to eventually cut off *any* runaway family, trap or legitimate.
 - **Outputs / data-flow:** unchanged from #72's original section --
   same at-rest trust boundary for headers/cookies, no new exposure.
 
+## Issue #88: re-verification of PaginationGuard (issue #78) -- a real coverage regression
+
+*(Restored 2026-08-30: this section was lost from `staging` when PR #97
+merged less than a minute after PR #95, apparently overwriting it rather
+than appending alongside it -- the code fix itself was never affected,
+confirmed intact in `app/crawler/orchestrator.py`/`pagination_guard.py`
+throughout. Content below is the original section, unchanged.)*
+
+- **Inputs:** none new -- re-checks `PaginationGuard` (`app/crawler/
+  pagination_guard.py`) and its wiring into `Orchestrator._process_url`
+  (`app/crawler/orchestrator.py`) against issue #78's own acceptance
+  criteria, from scratch.
+- **Finding -- a real regression, reported directly by the user:** a
+  real-target crawl's coverage dropped from roughly 680 pages to roughly
+  480 after #78 shipped. Root cause: #78's fix keyed a pagination
+  family's productivity streak on `new_matches` alone (deliberately, to
+  defeat an adversarial family that always discovers a "new" next-page
+  link) -- but that wrongly treats an index/listing family as
+  unproductive whenever the index pages themselves carry no password
+  directly, which is the overwhelmingly common real shape: a listing
+  page links out to individual content pages, and only those carry the
+  secret. `PaginationGuard.is_stopped()` gates every future fetch in
+  that family once tripped (`Orchestrator`'s worker `continue`s past it
+  without ever fetching), so once a legitimate index family got marked
+  unproductive after just `pagination_family_limit` (10 by default)
+  pages, every link its later pages would have surfaced was silently
+  and permanently lost -- not delayed, dropped.
+- **Fix:** `PaginationGuard.record()` gains a second, independent
+  productivity signal, `new_external_links` -- links discovered on this
+  page leading somewhere *other than* this same pagination family. The
+  streak now resets on `new_matches or new_external_links`, not matches
+  alone. Crucially, a same-family link (e.g. this page's own "next page"
+  link) is excluded from that count entirely, so the original #78 defeat
+  (ordinary sequential pagination always "discovers" its own next link,
+  trap or not) still holds -- `Orchestrator._process_url` now partitions
+  every discovered link (DOM + network + click-interaction) by
+  `pagination_family_key()` before adding to the frontier, feeding only
+  the cross-family count into the guard. `max_family_pages` (the
+  unconditional hard ceiling, independent of the streak) is also raised
+  from 50 to 200, extra headroom for a legitimate large index now that
+  the streak logic itself is no longer the primary driver of premature
+  cutoff.
+- **Verified:** existing #78 regression tests
+  (`test_pagination_guard_terminates_an_adversarial_trap_that_always_looks_productive`,
+  `test_pagination_guard_stops_a_runaway_family_but_still_finds_real_content`)
+  still pass unchanged -- their fixtures never produce cross-family
+  links, so the adversarial-trap defense is intact. New test
+  `test_pagination_guard_does_not_cut_off_a_legitimate_index_with_no_direct_matches`
+  (`tests/test_orchestrator.py`) simulates the reported shape directly:
+  20 index pages (more than the default `pagination_family_limit` of
+  10), each with zero direct matches, each linking to one brand-new
+  content page that does have a match, using the orchestrator's actual
+  shipped defaults (no test-only override) -- confirmed this test fails
+  against the pre-fix code (`10 == 20` -- exactly the class of loss
+  reported) and passes with the fix. Two new `PaginationGuard`-level
+  unit tests in `tests/test_pagination_guard.py` cover the
+  `new_external_links` signal in isolation.
+- **Not verified against the real target:** as with every crawler-level
+  fix in this project's history, the exact 680-vs-480 numbers can't be
+  reproduced in this session (no target URL/credentials available) --
+  the fix is verified against a synthetic fixture that reproduces the
+  same *mechanism* (an index family with no direct matches linking out
+  to real content), not the real site itself.
+- **Outputs / data-flow:** no new data captured or persisted -- purely a
+  crawl-completeness fix. No data-flow/security concerns.
+
 ## Issue #96: remove the "Context length" field
 
 - **Inputs:** removes one -- `context_chars` is no longer accepted on
@@ -1871,4 +1945,92 @@ to eventually cut off *any* runaway family, trap or legitimate.
 - **Removed:** the "Context length" label/input from
   `app/static/index.html`'s form, and the corresponding
   `context_chars: Number(...)` line building the `POST /crawls` body.
+
+## Issue #99: static-asset completeness & verification scanner
+
+- **Inputs:** none new from the caller -- reuses data the primary crawl
+  already produces: every stored page's raw content/content_type
+  (`Repository.get_all_page_fetch_data()`, issue #72) and the set of
+  URLs already fetched (`Repository.get_visited_urls()`).
+- **Why:** structural link discovery (`BrowserFetcher`'s rendered-DOM
+  links, captured network requests, and click-interaction discovery,
+  issues #5/#67) can still miss a `/static/...` asset that's only ever
+  referenced as a string literal -- built up in JS and never actually
+  requested during the crawl's own page loads (a conditional/lazy code
+  path, a URL only used by a feature the crawl's automated clicks never
+  triggered). This is a safety net specifically for that gap, not a
+  replacement for structural discovery.
+- **Transformation:** new `app/crawler/asset_scanner.py`:
+  - `find_static_asset_references(text)` -- combines tag-attribute
+    extraction (`<script src>`, `<link href>`, `<img src>`,
+    `<source src>`, `<embed src>`) with a fallback whole-text regex
+    (`/static/[a-zA-Z0-9_\-./]+(?:\?...)?`) that also catches a
+    reference used purely in JS (e.g. `fetch('/static/x.json')`), never
+    present as a real tag attribute at all. This project has no HTML
+    parser dependency (BeautifulSoup/lxml) -- follows the existing
+    lightweight regex-over-raw-source style already used by
+    `HtmlExtractor`/`CssJsExtractor` rather than adding one.
+  - `MasterAssetRegistry` -- tracks every discovered asset URL with
+    `status` (fetched/pending/failed), `content_type`, `origin_page`.
+    An `asyncio.Lock`, not a threading lock, matching `Orchestrator`'s
+    own shared-state pattern (this codebase has no real threads in the
+    crawl path).
+  - `audit_static_assets()` -- scans every stored page whose
+    content_type looks text-like, resolves each raw reference against
+    its origin page's URL (`urljoin`), diffs the resulting set against
+    `get_visited_urls()`, and fetches whatever's missing through the
+    crawl's own `HttpFetcher` (Basic Auth included, same as any other
+    page), `ExtractorRegistry`, and `HeaderCookieExtractor` -- so any
+    extractor registered today (or added later, e.g. issue #98's
+    deobfuscation processors once built) is automatically applied to a
+    recovered asset, no special-casing. A failed fetch is marked
+    `failed` and skipped, same per-URL isolation as the primary crawl's
+    own failure handling -- never aborts the audit.
+  - Wired into `Orchestrator.run()` as an automatic final phase, but
+    *only* when the frontier genuinely emptied (`queue_empty`) -- an
+    operator-bounded crawl (`stop()`, `max_pages`, `max_duration_seconds`)
+    deliberately limited how much gets fetched, and this audit's own
+    fetches would silently defeat that bound if it ran anyway.
+- **Outputs:** new `StaticAssetCompletenessReport` (`app/models.py`):
+  `total_pages_scanned`, `total_static_references_found`,
+  `missing_assets_count`, `completeness_percentage`, and the full list
+  of `AssetRecord`s. Attached to `CrawlSummary.asset_completeness`
+  (`None` when the audit was skipped), so it flows through the existing
+  `GET /crawls/{id}/report` and `CRAWL_FINISHED` WebSocket payload with
+  no new endpoint needed. Any password found on a recovered asset is
+  persisted via the same `Repository.save_page()` call every other page
+  uses, and folded into the crawl's own `unique_passwords_found` count.
+  Also logs `"Static-asset completeness scan: audited X pages for
+  '/static/...' references -- found N missing assets."`
+  **Data-flow/security note (per the data-flow watchlist):** no new
+  exposure surface -- a recovered asset's content/matches go through the
+  exact same storage and extractor pipeline as any other page, same
+  trust boundary. `missing_assets_count`/`completeness_percentage`
+  describe the *primary* crawl's coverage specifically (the gap before
+  this audit's own remediation), not whether the remediation fetch
+  itself succeeded -- a deliberate choice so the metric answers "how
+  complete was structural discovery," not "how complete is the crawl
+  after this safety net ran," which would always trend toward 100%
+  regardless of how much the primary crawl actually missed.
+- **Tests:** new `tests/test_asset_scanner.py` (7 tests) -- the
+  tag-attribute and fallback-regex extraction patterns in isolation,
+  including the case a real `<script src>`-only pattern would miss (a
+  reference built inside a JS string). New end-to-end orchestrator test
+  `test_static_asset_audit_finds_a_password_on_an_asset_never_
+  structurally_discovered` (`tests/test_orchestrator.py`) -- an asset
+  present only as a JS string in SEED's body, never in `dom_links`/
+  `network_urls`/`interaction_urls`, is still fetched by the audit and
+  its password recovered and persisted. A second new test confirms the
+  audit is skipped when `max_pages` ends the crawl early. Full suite:
+  227 passed, 4 skipped (OCR/Tesseract). ruff/black/mypy clean.
+- **Not implemented / explicitly out of scope:** concurrent fetching of
+  missing assets during the audit (sequential, like the rest of this
+  function) -- the audit is expected to be a small tail-end gap-fill,
+  not the bulk of crawl work, so the added complexity of a bounded
+  semaphore wasn't judged worth it here; revisit if a real target turns
+  out to have a large number of missed assets. `resources_checked`/
+  `pages_visited` on `CrawlSummary` are unchanged by the audit (left
+  scoped to the primary worker loop, as before) -- audit-specific counts
+  live entirely in `StaticAssetCompletenessReport` instead, to avoid
+  redefining what those two existing fields have always meant.
 

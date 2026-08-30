@@ -451,6 +451,7 @@ def test_response_payload_shapes_match_the_full_contract(monkeypatch, client):
         "queue_empty",
         "started_at",
         "finished_at",
+        "asset_completeness",
     }
     assert len(report["matches"]) == 1
     assert set(report["matches"][0].keys()) == {

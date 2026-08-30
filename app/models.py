@@ -41,6 +41,36 @@ class PageResult(BaseModel):
     matches: list[PasswordMatch] = []
 
 
+class AssetStatus(str, Enum):
+    FETCHED = "fetched"
+    PENDING = "pending"
+    FAILED = "failed"
+
+
+class AssetRecord(BaseModel):
+    """One `/static/...` URL tracked by `MasterAssetRegistry` (issue #99)."""
+
+    url: str
+    status: AssetStatus
+    content_type: str | None = None
+    origin_page: str
+
+
+class StaticAssetCompletenessReport(BaseModel):
+    """Result of the post-crawl static-asset audit (issue #99): compares
+    every `/static/...` reference found across stored pages against what
+    the primary crawl actually fetched, then fetches any gap. `missing_
+    assets_count`/`completeness_percentage` describe the *primary crawl's*
+    coverage -- the number found missing before this audit's own fetch
+    tried to close the gap, not whether that remediation succeeded."""
+
+    total_pages_scanned: int
+    total_static_references_found: int
+    missing_assets_count: int
+    completeness_percentage: float
+    records: list[AssetRecord] = []
+
+
 class CrawlSummary(BaseModel):
     pages_visited: int
     resources_checked: int
@@ -48,6 +78,7 @@ class CrawlSummary(BaseModel):
     queue_empty: bool
     started_at: datetime
     finished_at: datetime | None = None
+    asset_completeness: StaticAssetCompletenessReport | None = None
 
 
 class PageFetchData(BaseModel):
