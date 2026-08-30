@@ -24,6 +24,9 @@ class SourceType(str, Enum):
     IMAGE_OCR = "image_ocr"
     IMAGE_LSB = "image_lsb"
     BINARY = "binary"
+    CLIENT_STORAGE = "client_storage"
+    REDIRECT = "redirect"
+    CONTENT_NEGOTIATION = "content_negotiation"
 
 
 class PasswordMatch(BaseModel):
@@ -72,6 +75,18 @@ class StaticAssetCompletenessReport(BaseModel):
     records: list[AssetRecord] = []
 
 
+class ContentNegotiationReport(BaseModel):
+    """Result of the post-crawl content-negotiation probe (issue #103):
+    re-requests a bounded, representative sample of already-crawled HTML
+    pages with alternate Accept/X-Requested-With headers, looking for a
+    payload only served under a specific negotiation -- an alternate
+    representation a normal crawl would never see."""
+
+    pages_probed: int
+    headers_tested: list[str]
+    matches_found: int
+
+
 class CrawlSummary(BaseModel):
     pages_visited: int
     resources_checked: int
@@ -80,6 +95,7 @@ class CrawlSummary(BaseModel):
     started_at: datetime
     finished_at: datetime | None = None
     asset_completeness: StaticAssetCompletenessReport | None = None
+    content_negotiation: ContentNegotiationReport | None = None
 
 
 class PageFetchData(BaseModel):

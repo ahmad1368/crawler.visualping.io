@@ -267,3 +267,10 @@ backfilling #1-28/#61/#63, which that report already covers in full).
   shipped; new `ImageLsbExtractor` (Layer 3) reads the least-significant
   bit of every pixel color channel to detect classic LSB steganography
   -- a message hidden nowhere as text at all, only in raw pixel values.
+- #103: New `RedirectExtractor` scans intermediate redirect `Location`
+  headers (previously discarded once the final page loaded);
+  `ClientStorageExtractor` snapshots each page's `document.cookie`/
+  `localStorage`/`sessionStorage`; a post-crawl content-negotiation
+  probe re-requests a sample of pages with alternate `Accept`/
+  `X-Requested-With` headers looking for an alternate representation
+  with a hidden payload.
