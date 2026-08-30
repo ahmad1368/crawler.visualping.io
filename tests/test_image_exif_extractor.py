@@ -81,6 +81,39 @@ def test_extracts_password_from_user_comment_in_nested_exif_subifd():
     assert matches[0].locator == "exif:UserComment"
 
 
+def test_extracts_password_from_utf16_le_user_comment():
+    """UserComment's "UNICODE\\0" charset prefix (EXIF spec) means the
+    payload is UTF-16, not UTF-8 -- decoding it as UTF-8 mangles every
+    character, which is exactly why a site would pick UTF-16 for a
+    UserComment password: it defeats a naive text-string search."""
+    content = _make_jpeg_with_nested_exif(
+        exif_ifd_tags={piexif.ExifIFD.UserComment: b"UNICODE\x00" + PASSWORD.encode("utf-16-le")}
+    )
+    extractor = ImageExifExtractor()
+
+    matches = extractor.extract(content, "image/jpeg", "https://example.com/photo.jpg")
+
+    assert len(matches) == 1
+    assert matches[0].value == PASSWORD
+    assert matches[0].source_type == SourceType.IMAGE_METADATA
+    assert matches[0].locator == "exif:UserComment"
+
+
+def test_extracts_password_from_utf16_be_user_comment():
+    """Same as above but big-endian -- Pillow doesn't expose the TIFF
+    byte-order flag needed to know which endianness a given file used, so
+    both must be tried."""
+    content = _make_jpeg_with_nested_exif(
+        exif_ifd_tags={piexif.ExifIFD.UserComment: b"UNICODE\x00" + PASSWORD.encode("utf-16-be")}
+    )
+    extractor = ImageExifExtractor()
+
+    matches = extractor.extract(content, "image/jpeg", "https://example.com/photo.jpg")
+
+    assert len(matches) == 1
+    assert matches[0].value == PASSWORD
+
+
 def test_extracts_password_from_gps_ifd():
     content = _make_jpeg_with_nested_exif(
         gps_ifd_tags={piexif.GPSIFD.GPSProcessingMethod: PASSWORD.encode("ascii")}
