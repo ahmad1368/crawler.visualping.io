@@ -116,13 +116,17 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
                 │
                 ├── ExtractorRegistry.run_all(content, content_type, url)
                 │   app/extractors/base.py -- dispatches to HtmlExtractor,
-                │   CssJsExtractor, ImageExifExtractor, ImageOcrExtractor,
+                │   CssJsExtractor, ImageExifExtractor,
+                │   ImageStructuralExtractor, ImageOcrExtractor,
                 │   BinaryFallbackExtractor (each calls find_passwords()
                 │   from app/matching.py; ImageOcrExtractor runs Tesseract
                 │   over the decoded image and scans whatever text it
                 │   recognizes -- the only extractor that reads a password
                 │   drawn as pixels rather than present as parseable
-                │   text/metadata anywhere in the file)
+                │   text/metadata anywhere in the file; ImageStructuralExtractor,
+                │   issue #101, hand-parses JPEG COM segments and PNG
+                │   tEXt/zTXt/iTXt chunks -- the only extractor that
+                │   zlib-decompresses a chunk before searching it)
                 │
                 ├── HeaderCookieExtractor.extract(headers, cookies, url)
                 │   app/extractors/headers_cookies.py (not routed through
@@ -2033,4 +2037,85 @@ throughout. Content below is the original section, unchanged.)*
   scoped to the primary worker loop, as before) -- audit-specific counts
   live entirely in `StaticAssetCompletenessReport` instead, to avoid
   redefining what those two existing fields have always meant.
+
+## Issue #101: JPEG/PNG structural chunk & EXIF metadata parser
+
+- **Already covered, deliberately not re-touched:** `ImageExifExtractor`
+  (issue #12 + PR #65/#84) already reads JPEG APP1/EXIF via Pillow --
+  IFD0, the nested Exif sub-IFD, GPS IFD, and UTF-16LE/BE decoding
+  specifically for `UserComment`'s charset-prefixed value.
+  `BinaryFallbackExtractor` (issue #66) already runs a raw `latin-1`
+  scan over every image's bytes. Re-implementing JPEG APP1/TIFF-IFD
+  parsing by hand for this issue would duplicate complex,
+  already-correct logic for no new coverage -- this extractor
+  deliberately skips APP1 entirely.
+- **Real, previously-unreachable gap:** a JPEG `COM` segment encoded in
+  something other than plain ASCII (a raw `latin-1` scan can't see a
+  UTF-16 value -- the interleaved null bytes break the password regex's
+  contiguous-character match even though the bytes are right there), and
+  a PNG `zTXt` chunk (or an `iTXt` chunk with its compression flag set)
+  -- these are **zlib-compressed**, completely invisible to any
+  plain-text scan, raw fallback included, until actually decompressed.
+- **Transformation:** new `app/extractors/image_structural.py` ->
+  `ImageStructuralExtractor`, registered into `ExtractorRegistry`
+  alongside `ImageExifExtractor` (both call sites: `_build_orchestrator`
+  for a live crawl and the `/re-extract` replay path in
+  `app/api/routes.py` -- issue #93 was exactly a registration gap
+  between these two call sites).
+  - `_parse_jpeg_com_segments()` walks JPEG markers from SOI, extracting
+    every `COM` (`0xFFFE`) segment's payload; stops at SOS/EOI (COM
+    always precedes SOS) rather than attempting to walk entropy-coded
+    scan data. A malformed/truncated marker stream just stops parsing
+    early instead of reading garbage.
+  - `_parse_png_text_chunks()` walks the chunk stream after the 8-byte
+    signature (4-byte length, 4-byte type, data, 4-byte CRC -- CRC not
+    verified, not needed for extraction); `tEXt` splits on the first NUL
+    for keyword/text, `zTXt` additionally `zlib.decompress()`s the
+    payload after its compression-method byte, `iTXt` parses
+    keyword/compression-flag/compression-method/language-tag/
+    translated-keyword/text and decompresses `text` when the
+    compression flag is set.
+  - `_decode_all_encodings()` tries UTF-16LE, UTF-16BE, UTF-8, and ASCII
+    (the four named in the request) against every extracted payload,
+    stripping a leading BOM first if present -- same "try every
+    plausible encoding, let `find_passwords()` sort out which one
+    actually matches" approach `ImageExifExtractor`'s own
+    `_decode_exif_candidates()` already uses for `UserComment`.
+  - Reuses `SourceType.IMAGE_METADATA` (already used by
+    `ImageExifExtractor`) rather than adding a new enum value -- same
+    category (container-format metadata, not pixel content), so the
+    UI's snapshot-viewer fallback path (`NON_TEXT_SOURCE_TYPES` in
+    `app/static/index.html`) already handles it with zero frontend
+    changes needed. `locator` values: `jpeg:COM`,
+    `png:{tEXt,zTXt,iTXt}:{keyword}`.
+  - Any parse failure (malformed image, truncated chunk) is caught and
+    logged at debug level, degrading to whatever matches were already
+    found (often none) rather than raising -- same defensive pattern as
+    every existing extractor. A structural hit logs a summary line:
+    chunk types found, encodings tried, flags extracted.
+- **Outputs:** `PasswordMatch` rows shaped like any other extractor's --
+  same storage, REST/WebSocket delivery, snapshot-viewer handling.
+  **Data-flow/security note (per the data-flow watchlist):** no new
+  exposure surface -- same trust boundary as the existing EXIF/binary
+  extraction this complements; worth noting as another concrete example
+  (alongside OCR, issue #85) of why the extractor set must keep being
+  treated as partial, since a zlib-compressed metadata chunk is a
+  reasonable thing for a site to assume is safe from a naive scanner.
+- **Tests:** new `tests/test_image_structural_extractor.py` (11 tests)
+  -- real JPEG/PNG fixtures built via Pillow (`Image.save(...,
+  comment=...)` for JPEG COM, `PngInfo`/`add_text`/`add_itxt` with
+  `zip=True` for PNG chunks, confirming the `zTXt`/compressed-`iTXt`
+  fixtures are genuinely compressed -- the plaintext password bytes are
+  asserted absent from the raw file before extraction). A UTF-16-encoded
+  `tEXt` chunk (adversarial vs. the PNG spec's own Latin-1 mandate,
+  which Pillow's own writer can't produce) is built by hand to prove the
+  decode-trial actually matters. Malformed-input tests confirm graceful
+  degradation. Full suite: 238 passed, 4 skipped (OCR/Tesseract).
+  ruff/black/mypy clean.
+- **Not implemented / explicitly out of scope:** PNG `iCCP` (compressed
+  ICC profile) and other non-text ancillary chunks -- not text-shaped,
+  a password hidden there would need a different search strategy
+  entirely (the profile's own binary structure, not free text) and
+  wasn't part of the request. JPEG APP1/EXIF, as noted above, is
+  entirely out of scope here by design, not oversight.
 

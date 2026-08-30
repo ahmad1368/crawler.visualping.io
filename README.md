@@ -258,3 +258,8 @@ backfilling #1-28/#61/#63, which that report already covers in full).
   fetched page's stored text for `/static/...` references structural
   link discovery might have missed, fetches any gap, and reports
   coverage on `CrawlSummary.asset_completeness`.
+- #101: New `ImageStructuralExtractor` hand-parses JPEG `COM` segments
+  and PNG `tEXt`/`zTXt`/`iTXt` chunks, decompressing zlib-compressed
+  chunks and trying UTF-16/UTF-8/ASCII decodings -- finds passwords no
+  existing extractor could reach (a compressed chunk is invisible to any
+  plain-text scan until decompressed).
