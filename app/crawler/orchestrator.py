@@ -33,12 +33,18 @@ single URL's processing failing (e.g. a genuine HTTP redirect loop that
 makes the browser fetcher's navigation fail) is caught and skipped rather
 than aborting or hanging the whole crawl. A `PaginationGuard` stops
 following a `?page=N`-style URL family once it's gone several consecutive
-pages with no new password matches (issue #78: matches, not link
-discovery -- ordinary pagination always finds a "new" next-page link, so
-that was never a reliable signal), and unconditionally caps any one
-family at `pagination_family_page_cap` total pages regardless of
-apparent productivity, so a runaway or adversarial pagination family
-can't run forever on its own even with no `max_pages` cap in play.
+pages with no new password match *and* no genuinely new link to content
+outside the family itself (issue #88: matches alone, issue #78's
+original signal, wrongly treated an index/listing family -- one that
+never itself contains a password, only links out to individual content
+pages that do -- as unproductive after just a few pages, silently
+dropping every link its later pages would have surfaced; new same-family
+links don't count, since ordinary sequential pagination always "finds" a
+next-page link, which was the pre-#78 problem). Also unconditionally
+caps any one family at `pagination_family_page_cap` total pages
+regardless of apparent productivity, so a runaway or adversarial
+pagination family can't run forever on its own even with no `max_pages`
+cap in play.
 
 `pause()`/`resume()`/`stop()` (issue #68) give external control over an
 in-flight `run()`: `pause()` blocks every worker before it pops its next
@@ -58,7 +64,7 @@ from datetime import datetime, timezone
 from app.crawler.browser_fetcher import BrowserFetcher
 from app.crawler.fetcher import HttpFetcher
 from app.crawler.frontier import UrlFrontier
-from app.crawler.pagination_guard import PaginationGuard
+from app.crawler.pagination_guard import PaginationGuard, pagination_family_key
 from app.events import CRAWL_FINISHED, MATCH_FOUND, PAGE_FETCHED, EventBus
 from app.extractors.base import ExtractorRegistry
 from app.extractors.headers_cookies import HeaderCookieExtractor
@@ -79,7 +85,7 @@ class Orchestrator:
         max_pages: int | None = None,
         max_duration_seconds: float | None = None,
         pagination_family_limit: int = 10,
-        pagination_family_page_cap: int | None = 50,
+        pagination_family_page_cap: int | None = 200,
         event_bus: EventBus | None = None,
     ) -> None:
         self._frontier = frontier
@@ -182,17 +188,41 @@ class Orchestrator:
         )
 
         is_html = content_type.startswith("text/html")
+        new_external_links = 0
         if is_html:
             browser_result = await self._browser_fetcher.fetch(url)
-            self._frontier.add_many(browser_result.dom_links)
-            self._frontier.add_many(browser_result.network_urls)
-            self._frontier.add_many(browser_result.interaction_urls)
+            discovered = (
+                *browser_result.dom_links,
+                *browser_result.network_urls,
+                *browser_result.interaction_urls,
+            )
+            # Split same-pagination-family links (e.g. this page's own
+            # "next page" link) from everything else before adding to the
+            # frontier -- issue #88: a same-family link is *always*
+            # "new" the first time ordinary sequential pagination sees
+            # it, trap or not, so it must never count as a productivity
+            # signal on its own (that was the pre-#78 bug). A link to
+            # somewhere else, though, is real evidence this page is
+            # still surfacing content worth crawling.
+            current_family = pagination_family_key(url)
+            same_family: list[str] = []
+            other: list[str] = []
+            for link in discovered:
+                (same_family if pagination_family_key(link) == current_family else other).append(
+                    link
+                )
+            self._frontier.add_many(same_family)
+            new_external_links = self._frontier.add_many(other)
 
-        # Keyed on new_matches alone, not link discovery -- issue #78:
-        # ordinary sequential pagination always discovers a "new" next-page
-        # link, so that was never a reliable productivity signal, and an
-        # adversarial family can trivially fake it forever.
-        self._pagination_guard.record(url, new_matches=len(matches))
+        # Productive if this page yielded a new password match *or* a
+        # genuinely new link outside its own pagination family -- issue
+        # #88: matches alone (issue #78's original signal) wrongly
+        # treats an index/listing family as unproductive when it never
+        # itself contains a password, only links out to individual
+        # content pages that do.
+        self._pagination_guard.record(
+            url, new_matches=len(matches), new_external_links=new_external_links
+        )
 
         page = PageResult(
             url=url,

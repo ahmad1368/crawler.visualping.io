@@ -248,3 +248,9 @@ backfilling #1-28/#61/#63, which that report already covers in full).
 - #87: Re-verified the cache/replay path (#72); found and fixed #93 in
   the process (`JsCharCodeExtractor` was used but never imported,
   breaking every real crawl and `/re-extract` call).
+- #88: Re-verified `PaginationGuard` (#78); found and fixed a real
+  coverage regression -- an index/listing family with no direct password
+  matches was wrongly treated as unproductive and cut off, silently
+  dropping every content page its later listing pages would have
+  surfaced. `PaginationGuard` now also counts new links to content
+  outside the family as productive.

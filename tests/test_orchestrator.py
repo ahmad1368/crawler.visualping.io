@@ -555,3 +555,85 @@ def test_pagination_guard_terminates_an_adversarial_trap_that_always_looks_produ
     assert len([u for u in http_fetcher.calls if u in pagination_urls]) == 10
     assert summary.resources_checked == 11
     assert summary.queue_empty is True
+
+
+def test_pagination_guard_does_not_cut_off_a_legitimate_index_with_no_direct_matches():
+    """Regression test for issue #88: a real crawl's coverage dropped
+    from ~680 pages to ~480 because PaginationGuard's old new_matches-only
+    productivity signal (issue #78) wrongly treated an index/listing
+    family as unproductive whenever the index pages themselves never
+    contain a password directly -- the overwhelmingly common real shape,
+    where a listing page links out to individual content pages and only
+    those carry the secret. Simulated here: 20 index pages
+    (/catalog?page=1..20 -- deliberately more than the default
+    pagination_family_limit of 10, so the old bug would have cut this
+    off with 10 items undiscovered), each with zero direct matches, each
+    linking to (a) the next index page in the same family, and (b) one
+    brand-new individual content page that DOES have a match. Uses the
+    orchestrator's actual default pagination settings -- no override --
+    to prove the fix holds with real-world configuration, not just a
+    generous test-only limit."""
+    index_urls = [f"https://example.com/catalog?page={i}" for i in range(1, 21)]
+    item_urls = [f"https://example.com/item-{i}" for i in range(1, 21)]
+
+    fetch_responses = {SEED: _html_response()}
+    fetch_responses.update({url: _html_response() for url in index_urls})
+    fetch_responses.update({url: _html_response() for url in item_urls})
+
+    browser_responses = {
+        SEED: BrowserFetchResult(html="", dom_links=[index_urls[0]], network_urls=[])
+    }
+    for i, index_url in enumerate(index_urls):
+        next_index = [index_urls[i + 1]] if i + 1 < len(index_urls) else []
+        browser_responses[index_url] = BrowserFetchResult(
+            html="", dom_links=[*next_index, item_urls[i]], network_urls=[]
+        )
+        browser_responses[item_urls[i]] = BrowserFetchResult(html="", dom_links=[], network_urls=[])
+
+    frontier = UrlFrontier(SEED)
+    http_fetcher = FakeHttpFetcher(fetch_responses)
+    browser_fetcher = FakeBrowserFetcher(browser_responses)
+
+    # A distinct password value per item page (not SelectiveExtractor's
+    # single fixed value) proves all 20 are actually found individually,
+    # not deduped down to "the same password."
+    class _PerItemExtractor:
+        def extract(self, content: bytes, content_type: str, url: str):
+            if url not in item_urls:
+                return []
+            return [
+                PasswordMatch(
+                    value=f"VISUALPING{{item{item_urls.index(url):04d}deadbeef00}}",
+                    source_type=SourceType.HTML_TEXT,
+                    source_url=url,
+                    context_before="",
+                    context_after="",
+                    locator="x",
+                )
+            ]
+
+    registry = ExtractorRegistry()
+    registry.register(_PerItemExtractor())
+    repository = SqliteRepository(sqlite3.connect(":memory:"))
+
+    orchestrator = Orchestrator(
+        frontier=frontier,
+        http_fetcher=http_fetcher,
+        browser_fetcher=browser_fetcher,
+        extractor_registry=registry,
+        header_cookie_extractor=NoOpHeaderCookieExtractor(),
+        repository=repository,
+        concurrency=1,
+        # Deliberately no pagination_family_limit/pagination_family_page_cap
+        # override -- proves the fix holds with the orchestrator's actual
+        # shipped defaults.
+    )
+
+    summary = run(asyncio.wait_for(orchestrator.run(), timeout=5))
+
+    # All 20 index pages were followed (not cut off after 10), and all 20
+    # item pages they link to were discovered and fetched.
+    assert len([u for u in http_fetcher.calls if u in index_urls]) == 20
+    assert len([u for u in http_fetcher.calls if u in item_urls]) == 20
+    assert summary.unique_passwords_found == 20
+    assert summary.queue_empty is True
