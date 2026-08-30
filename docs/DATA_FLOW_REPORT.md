@@ -104,8 +104,13 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
                 │
                 ├── ExtractorRegistry.run_all(content, content_type, url)
                 │   app/extractors/base.py -- dispatches to HtmlExtractor,
-                │   CssJsExtractor, ImageExifExtractor, BinaryFallbackExtractor
-                │   (each calls find_passwords() from app/matching.py)
+                │   CssJsExtractor, ImageExifExtractor, ImageOcrExtractor,
+                │   BinaryFallbackExtractor (each calls find_passwords()
+                │   from app/matching.py; ImageOcrExtractor runs Tesseract
+                │   over the decoded image and scans whatever text it
+                │   recognizes -- the only extractor that reads a password
+                │   drawn as pixels rather than present as parseable
+                │   text/metadata anywhere in the file)
                 │
                 ├── HeaderCookieExtractor.extract(headers, cookies, url)
                 │   app/extractors/headers_cookies.py (not routed through
@@ -1651,3 +1656,73 @@ to eventually cut off *any* runaway family, trap or legitimate.
   stored `content_type` so a browser tab renders it) not requested here
   -- noted as a natural future enhancement if the auth-prompt friction
   turns out to matter in practice.
+
+## Feature: read passwords drawn as image pixels (OCR)
+
+- **Inputs:** same fetched image bytes `ExtractorRegistry.run_all()`
+  already passes to every registered extractor -- no new input, no new
+  endpoint. Targets a distinct obfuscation technique from every prior
+  extractor in this file: the password isn't present as parseable
+  text or metadata anywhere in the file at all -- it's drawn as pixels
+  (a photographed whiteboard, a screenshot of a sticky note, hand- or
+  machine-lettered text baked into the image), readable only by eye or
+  by actually recognizing the glyphs. `ImageExifExtractor` reads
+  metadata *about* the image; nothing in this codebase previously read
+  what the image *shows*.
+- **Transformation:** new `app/extractors/image_ocr.py` ->
+  `ImageOcrExtractor`, registered into `ExtractorRegistry` alongside
+  `ImageExifExtractor` (both call sites: `_build_orchestrator` for a
+  live crawl and the `/re-extract` replay path in `app/api/routes.py`).
+  Opens the image with Pillow (same `Image.open()` + `OSError`/
+  `DecompressionBombError` guard as `ImageExifExtractor`, for the same
+  malformed-input reason) and runs `pytesseract.image_to_string()` --
+  a thin wrapper around the Tesseract OCR engine binary -- over the
+  decoded image, then hands whatever text it recognizes to the same
+  `find_passwords()` every other extractor uses, so the password format
+  and the `KNOWN_EXAMPLE` exclusion (`app/matching.py`) stay identical.
+  A new `SourceType.IMAGE_OCR` (`app/models.py`) marks these matches.
+  Tesseract is a system binary, not a pip package -- `pytesseract` (added
+  to `pyproject.toml`) just shells out to it; if it's missing or errors
+  on a given image (`TesseractNotFoundError`/`TesseractError`), `extract()`
+  degrades to no matches rather than raising, so one broken/exotic image
+  never aborts a crawl. CI (`.github/workflows/ci.yml`) now installs it
+  via `apt-get install tesseract-ocr` before running tests; local Setup
+  in `README.md` documents the equivalent for macOS/Windows.
+- **Outputs:** `PasswordMatch` rows shaped like any other extractor's,
+  with `locator` as `ocr:offset:N` -- an offset into the *OCR'd text*,
+  not a pixel position in the image (getting an actual bounding box
+  would mean requesting Tesseract's per-word layout data via
+  `image_to_data` instead of plain `image_to_string`, not done here since
+  nothing consumes it yet). The UI's snapshot viewer
+  (`app/static/index.html`) already has a fallback path for source types
+  whose match value can't be found via `indexOf` in the raw fetched body
+  (previously `image_metadata`/`binary`); `image_ocr` is added to that
+  `NON_TEXT_SOURCE_TYPES` set for the same reason -- the raw image bytes
+  never literally contain the password as text to search for.
+  **Data-flow/security note (per the data-flow watchlist):** no new
+  exposure surface -- same `PasswordMatch`/context/locator shape, same
+  SQLite storage, same REST/WebSocket delivery as every other extractor;
+  worth flagging because it's the strongest example yet of why this
+  tool's extractor set must keep being treated as partial: a site could
+  reasonably assume a password baked into an image as *pixels* is safe
+  from any automated scanner, and until now that assumption held.
+- **Tests:** new `tests/test_image_ocr_extractor.py` (4 tests) -- draws a
+  password onto a blank image with Pillow's bundled default font (no
+  system-font dependency, so the fixture renders identically on any OS)
+  and confirms OCR reads it back byte-for-byte, plus ignores non-image
+  content types, returns no matches for a genuinely blank image, and
+  degrades gracefully on unparseable image bytes. The whole file is
+  `pytest.mark.skipif`-guarded on Tesseract actually being importable/
+  runnable (`pytesseract.get_tesseract_version()`), so a dev machine
+  without the binary installed sees 4 skips, not 4 failures, rather than
+  silently passing on a broken assumption. Full suite (with Tesseract
+  installed): 208 tests pass (204 existing + 4 new). ruff/black/mypy
+  clean.
+- **Not implemented / explicitly out of scope:** no image preprocessing
+  (deskew, threshold/contrast boost, upscaling) before handing the image
+  to Tesseract -- real-world low-contrast or angled photos may OCR worse
+  than this feature's clean synthetic test fixture; if that turns out to
+  matter, preprocessing would slot into `ImageOcrExtractor.extract()`
+  right before the `image_to_string()` call. Bounding-box locators
+  (`image_to_data` instead of `image_to_string`) are also left for later,
+  noted above.
