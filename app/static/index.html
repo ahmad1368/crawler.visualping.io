@@ -323,8 +323,11 @@
     const snapshotClose = document.getElementById("snapshot-close");
 
     // Source types with no meaningful text body to search/highlight --
-    // shown as a readable locator + context fallback instead.
-    const NON_TEXT_SOURCE_TYPES = new Set(["image_metadata", "binary"]);
+    // shown as a readable locator + context fallback instead. js_charcode
+    // matches are decoded from numeric char codes: the plaintext password
+    // never appears literally in the raw JS source, so an indexOf search
+    // against it would always fail.
+    const NON_TEXT_SOURCE_TYPES = new Set(["image_metadata", "binary", "js_charcode"]);
 
     let currentCrawlId = null;
     // All matches known so far (live WebSocket rows or the final report),
