@@ -1798,3 +1798,51 @@ to eventually cut off *any* runaway family, trap or legitimate.
   and after the crawl finishes. Existing filter test
   (`test_results_filter_narrows_and_restores_rows`) still passes
   unchanged, confirming filtering behavior itself wasn't affected.
+
+## Issue #87: re-verification of the cache/replay path (issue #72)
+
+- **Inputs:** none new -- re-checks the existing cache/replay data path
+  (`Repository.get_all_page_fetch_data()`, `app/crawler/replay.py`,
+  `POST /crawls/{id}/re-extract`) against its own issue #72 acceptance
+  criteria, from scratch, after several later PRs (#78, #80, #86, #91,
+  and the direct-to-staging #83/#84/#85) touched adjacent code.
+- **Finding -- a real regression, not just confirmation:** `/re-extract`
+  and `_build_orchestrator()` (the live-crawl path too) were both
+  completely broken by the pre-existing bug tracked as issue #93:
+  `app/api/routes.py` called `JsCharCodeExtractor(...)` in both
+  registry-construction blocks without importing it, so *every* call to
+  either path raised `NameError` immediately -- not a subtle behavioral
+  drift, a hard crash. Confirmed via the 5 tests already failing on
+  `staging` (`test_re_extract_*` x3, `test_build_orchestrator_*` x2).
+  Fixed here (single missing import line) since #87's own acceptance
+  criteria can't be verified against code that doesn't run; this also
+  resolves #93 as a side effect -- see PR description for the
+  dedicated-issue bookkeeping.
+- **Verified, with the fix in place:**
+  - Stored snapshots (content, content_type, headers, cookies) round-trip
+    correctly through `replay_extraction()` with zero network/browser
+    calls -- already covered by existing `tests/test_replay.py` and
+    `tests/test_sqlite_repository.py` (headers/cookies persistence +
+    replay-data exclusion tests), all passing.
+  - `/re-extract`'s registry construction (`app/api/routes.py`) mirrors
+    `_build_orchestrator()`'s exactly -- same six extractors
+    (`Html`, `CssJs`, `JsCharCode`, `ImageExif`, `ImageOcr`,
+    `BinaryFallback`), same `context_chars` source (the crawl's own
+    `state.context_chars` / `request.context_chars`) -- so results are
+    structurally consistent with a fresh live crawl of the same data.
+  - No regressions from `Repository`/`Orchestrator` changes in #78/#80/
+    #86/#91 -- none of them touch the replay/re-extract code paths;
+    confirmed by the full suite passing (215 passed, 4 skipped -- OCR
+    tests skip without a local Tesseract install).
+- **New coverage added:** `test_re_extract_finds_js_charcode_obfuscated_password`
+  (`tests/test_api_routes.py`) -- a password only present as a JS
+  char-code array/`fromCharCode` call, findable exclusively via
+  `JsCharCodeExtractor`, run through the *real* `/re-extract` endpoint
+  (not a hand-built registry). This is the specific coverage gap that
+  let #93 ship unnoticed: every existing re-extract test used plain HTML
+  text, which every other extractor already covers, so none of them
+  actually proved `JsCharCodeExtractor` was reachable through the
+  route's registry construction.
+- **Outputs / data-flow:** unchanged from #72's original section --
+  same at-rest trust boundary for headers/cookies, no new exposure.
+
