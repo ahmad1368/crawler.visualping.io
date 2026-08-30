@@ -33,6 +33,7 @@ from app.extractors.headers_cookies import HeaderCookieExtractor
 from app.extractors.html import HtmlExtractor
 from app.extractors.image_exif import ImageExifExtractor
 from app.extractors.image_ocr import ImageOcrExtractor
+from app.extractors.js_charcode import JsCharCodeExtractor
 from app.models import CrawlSummary, PasswordMatch
 from app.storage.repository import Repository
 from app.storage.sqlite import SqliteRepository

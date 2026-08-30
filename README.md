@@ -245,3 +245,6 @@ backfilling #1-28/#61/#63, which that report already covers in full).
   a case-insensitive substring match against the page URL.
 - #91: That search box now always stays visible above the results list,
   regardless of whether any matches exist yet.
+- #87: Re-verified the cache/replay path (#72); found and fixed #93 in
+  the process (`JsCharCodeExtractor` was used but never imported,
+  breaking every real crawl and `/re-extract` call).

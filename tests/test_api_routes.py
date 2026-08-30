@@ -373,6 +373,41 @@ def test_re_extract_is_idempotent_across_repeated_calls(client):
     assert len(first["matches"]) == 1
 
 
+def test_re_extract_finds_js_charcode_obfuscated_password(client):
+    """Regression test (issue #87 re-verification, issue #93 root cause):
+    `/re-extract` builds its own `ExtractorRegistry` from scratch
+    (`app/api/routes.py`, mirroring `_build_orchestrator`'s registry) --
+    a password only present as a JS char-code array, findable exclusively
+    via `JsCharCodeExtractor`, proves that extractor is actually wired
+    into the real endpoint, not just unit-tested in isolation. This is
+    the exact class of gap that let a missing import
+    (`JsCharCodeExtractor` referenced but never imported) ship
+    unnoticed: existing re-extract tests all used plain HTML text, which
+    every other extractor already covers, so none of them exercised this
+    specific extractor's presence in the registry."""
+    password = "VISUALPING{aabbccddeeff0011}"
+    codes = ", ".join(str(ord(c)) for c in password)
+    js_source = f"const secret = [{codes}].map(c => String.fromCharCode(c)).join('');"
+    assert password not in js_source  # only decodable, never present literally
+
+    page_data = PageFetchData(
+        url="https://example.com/app.js",
+        content=js_source.encode(),
+        content_type="application/javascript",
+    )
+    state = _CrawlState()
+    state.repository = FakeRepository(page_fetch_data=[page_data])
+    routes._crawls["c1"] = state
+
+    response = client.post("/crawls/c1/re-extract")
+
+    assert response.status_code == 200
+    matches = response.json()["matches"]
+    assert len(matches) == 1
+    assert matches[0]["value"] == password
+    assert matches[0]["source_type"] == "js_charcode"
+
+
 def test_response_payload_shapes_match_the_full_contract(monkeypatch, client):
     """Exhaustive key-set checks for every REST response shape -- the
     other tests in this file spot-check individual fields; this one
