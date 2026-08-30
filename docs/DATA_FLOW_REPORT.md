@@ -104,8 +104,13 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
                 │
                 ├── ExtractorRegistry.run_all(content, content_type, url)
                 │   app/extractors/base.py -- dispatches to HtmlExtractor,
-                │   CssJsExtractor, ImageExifExtractor, BinaryFallbackExtractor
-                │   (each calls find_passwords() from app/matching.py)
+                │   CssJsExtractor, JsCharCodeExtractor, ImageExifExtractor,
+                │   BinaryFallbackExtractor (each calls find_passwords() from
+                │   app/matching.py; JsCharCodeExtractor decodes numeric
+                │   char-code arrays/fromCharCode() calls in JS bodies into a
+                │   string first, since the plaintext password never appears
+                │   in that raw source for CssJsExtractor's plain-text scan
+                │   to find)
                 │
                 ├── HeaderCookieExtractor.extract(headers, cookies, url)
                 │   app/extractors/headers_cookies.py (not routed through
@@ -1652,58 +1657,73 @@ to eventually cut off *any* runaway family, trap or legitimate.
   -- noted as a natural future enhancement if the auth-prompt friction
   turns out to matter in practice.
 
-## Fix: ImageExifExtractor mis-decoded UTF-16 UserComment as UTF-8
+## Feature: detect passwords obfuscated as JS char-code arrays
 
-- **Inputs:** same image bytes `ImageExifExtractor.extract()` already
-  receives -- no new input. Targets a specific obfuscation technique: the
-  EXIF spec's `UserComment` tag (0x9286) carries an 8-byte charset prefix
-  ahead of the actual text, and one of its three defined values is
-  `"UNICODE\0"`, meaning the remaining bytes are UTF-16 rather than
-  ASCII. A site can pick that encoding specifically because a naive
-  text-string search over the raw bytes won't find a plaintext password
-  in it -- each character is 2 (or more, with a leading zero byte for
-  ASCII-range characters) bytes wide, never appearing as a contiguous
-  ASCII run.
-- **Transformation:** `app/extractors/image_exif.py`'s
-  `_decode_exif_value()` already recognized the `"UNICODE\0"` prefix (it
-  was in `_USER_COMMENT_CHARSET_PREFIXES`) but then fell through to the
-  same `value.decode("utf-8", errors="replace")` used for every prefix --
-  silently mangling every UTF-16 character into replacement bytes, so
-  the password regex could never match. Replaced with
-  `_decode_exif_candidates()`, which special-cases the `"UNICODE\0"`
-  prefix to decode the payload as UTF-16 instead of UTF-8. Pillow doesn't
-  expose the TIFF byte-order flag (`II`/`MM`) needed to know whether a
-  given file's UTF-16 is little- or big-endian, so both `utf-16-le` and
-  `utf-16-be` decodings are returned as separate candidates for
-  `_scan_ifd()` to run `find_passwords()` against -- a real password only
-  ever matches the correctly-endianed one; the other decodes to unmatched
-  noise, so trying both carries no risk of a duplicate match. The
-  ASCII/JIS/no-prefix path is unchanged (still a single UTF-8 decode).
-- **Outputs:** no shape change -- same `PasswordMatch`
-  (`SourceType.IMAGE_METADATA`, `exif:UserComment` locator) as any other
-  EXIF find; this just makes the extractor actually locate a match that
-  was silently being missed before.
+- **Inputs:** same fetched JS bodies `ExtractorRegistry.run_all()` already
+  passes to every registered extractor (`content: bytes`, `content_type:
+  str`, `url: str`) -- no new input, no new endpoint. Targets a specific
+  obfuscation technique where the password is never written as a literal
+  string in the JS source: it's spelled out as a decimal/hex array
+  literal (e.g. `[86, 73, 83, ...]`) or a `String.fromCharCode(86, 73,
+  83, ...)` call, and only becomes the real string once the browser
+  evaluates it at runtime. `CssJsExtractor`'s plain-text regex scan
+  (`app/matching.py`'s `VISUALPING{16 hex}` pattern) can never match this
+  -- the pattern's characters simply aren't present in the raw bytes.
+- **Transformation:** new `app/extractors/js_charcode.py` ->
+  `JsCharCodeExtractor`, registered into the same `ExtractorRegistry`
+  alongside `CssJsExtractor` (both call sites: `_build_orchestrator` for
+  a live crawl and the `/re-extract` replay path in `app/api/routes.py`,
+  so re-extracting an already-crawled site with this new extractor works
+  without a live re-fetch). For each JS/CSS-adjacent content type it
+  scans the decoded text for two literal shapes -- a numeric array
+  (`\[...\]`) or a `fromCharCode(...)` call -- each with at least 6
+  comma-separated numbers (decimal or `0x` hex) to skip short, unrelated
+  numeric literals (RGB triples, id lists) cheaply. Every candidate
+  sequence is decoded with `chr()` into the string it would evaluate to
+  at runtime, and that decoded string -- not the raw source -- is handed
+  to the same `find_passwords()` used everywhere else, so the password
+  format and the "known worked example is excluded" rule
+  (`KNOWN_EXAMPLE` in `app/matching.py`) stay identical to every other
+  extractor. A new `SourceType.JS_CHARCODE` (`app/models.py`) marks these
+  matches so they're distinguishable from a plaintext `JS` find further
+  downstream.
+- **Outputs:** `PasswordMatch` rows shaped exactly like any other
+  extractor's, with one deliberate difference: `context_before`/
+  `context_after`/`locator` describe the *raw source* around the
+  array/call literal (not the decoded string), since that's what an
+  operator reviewing the finding actually needs to see -- the obfuscated
+  code, not just the password it decodes to. The UI's snapshot viewer
+  (`app/static/index.html`) already has a fallback path for source types
+  whose match value can't be found via `indexOf` in the raw page/file
+  body (previously `image_metadata`/`binary`); `js_charcode` is added to
+  that `NON_TEXT_SOURCE_TYPES` set for the same reason -- the decoded
+  password is never literally present in the JS source to search for.
   **Data-flow/security note (per the data-flow watchlist):** no new
-  exposure surface, same as the JS char-code fix above -- this is a
-  detection-correctness fix over data already fetched and already
-  treated as sensitive once matched. Flagged for the same reason: EXIF
-  UserComment is a third distinct obfuscation technique found in this
-  codebase now (plaintext, JS char-code arrays, UTF-16) that a site can
-  use specifically to defeat a naive scanner, reinforcing that today's
-  extractor set should keep being treated as partial, not exhaustive.
-- **Tests:** two new cases in `tests/test_image_exif_extractor.py` --
-  `test_extracts_password_from_utf16_le_user_comment` and
-  `..._be_user_comment`, each building a real UTF-16-encoded
-  `UserComment` via piexif in the nested Exif sub-IFD (the real-world
-  shape, matching the existing nested-IFD regression test's pattern) and
-  asserting the password is found. Full suite: 206 tests pass (204
-  existing + 2 new); every pre-existing EXIF case (ASCII UserComment,
-  nested sub-IFD, GPS IFD, ImageDescription, non-image content type,
-  unparseable image) still passes unchanged. ruff/black/mypy clean.
-- **Not implemented / explicitly out of scope:** the EXIF spec's third
-  charset value, `"JIS\0\0\0\0\0"` (JIS X 0208, a Japanese text
-  encoding), still falls through to a plain UTF-8 decode same as before
-  this fix -- not addressed here since it wasn't the reported issue; a
-  real JIS-encoded UserComment would need the same treatment
-  (`payload.decode("iso2022_jp", ...)` or similar) if it turns out to
-  matter in practice.
+  exposure surface -- this is a new *detection* path over data the
+  crawler already fetches and already treats as sensitive once matched
+  (same `PasswordMatch`/context/locator shape, same SQLite storage, same
+  REST/WebSocket delivery as every other extractor). Worth flagging
+  precisely because it demonstrates the opposite risk this tool exists
+  to catch: a site can hide a leaked credential from a naive
+  text-searching scanner via one extra layer of encoding, so any future
+  extractor work should keep asking "what's the next transformation a
+  site could apply that this still wouldn't see" (e.g. base64, XOR,
+  split-and-concatenated strings) rather than treating today's extractor
+  set as exhaustive.
+- **Tests:** new `tests/test_js_charcode_extractor.py` (6 tests) --
+  decodes a password from both the array-literal and `fromCharCode`
+  forms, asserts the raw fixture text never contains either password
+  literally (the premise a plain regex would miss it), ignores short
+  numeric arrays and unrelated content types, and checks the locator
+  points at the literal's position in the source. Full suite: 210 tests
+  pass (204 existing + 6 new) -- the existing `CssJsExtractor`,
+  `test_extractor_fixtures.py`, and `test_e2e_crawl.py` coverage for
+  plaintext-embedded passwords is untouched and still green, so this is
+  additive, not a replacement for the existing plaintext scan.
+  ruff/black/mypy clean.
+- **Not implemented / explicitly out of scope:** only ASCII/Unicode code
+  points via a flat numeric array or a single `fromCharCode(...)` call
+  are decoded -- codes split across multiple statements/variables, built
+  via a loop, or obfuscated further (base64, XOR, hex-encoded strings,
+  `unescape`/`atob`) are not detected. Each would need its own decoder in
+  the same spirit as this one if it turns out sites actually use it.

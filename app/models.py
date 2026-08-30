@@ -17,6 +17,7 @@ class SourceType(str, Enum):
     HTML_COMMENT = "html_comment"
     CSS = "css"
     JS = "js"
+    JS_CHARCODE = "js_charcode"
     HTTP_HEADER = "http_header"
     COOKIE = "cookie"
     IMAGE_METADATA = "image_metadata"
