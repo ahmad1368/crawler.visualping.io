@@ -1703,6 +1703,20 @@ to eventually cut off *any* runaway family, trap or legitimate.
   -- noted as a natural future enhancement if the auth-prompt friction
   turns out to matter in practice.
 
+### Issue #89: re-verification (no code change needed)
+
+Re-checked from scratch after `app/static/index.html` was touched by six
+later issues sharing the same file (#86, #91, #96, #99, #101, #103).
+`appendPageLink()` still builds the same real `<a target="_blank"
+rel="noopener noreferrer">`, is still the sole handler for `page_fetched`
+messages (no other log message type routes through it), and the
+accepted Basic-Auth-re-prompt UX wrinkle documented above is unchanged
+-- still accurate, not silently regressed into something worse.
+Verification-only: no production code change, existing test
+(`test_run_button_disables_during_crawl_and_log_updates_live`) already
+covers `href`/`target`/`rel` and still passes. Full suite: 261 passed,
+4 skipped (OCR/Tesseract). No data-flow/security concerns.
+
 ## Feature: read passwords drawn as image pixels (OCR)
 
 - **Inputs:** same fetched image bytes `ExtractorRegistry.run_all()`

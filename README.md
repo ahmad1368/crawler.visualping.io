@@ -274,3 +274,6 @@ backfilling #1-28/#61/#63, which that report already covers in full).
   probe re-requests a sample of pages with alternate `Accept`/
   `X-Requested-With` headers looking for an alternate representation
   with a hidden payload.
+- #89: Re-verified the clickable fetched-page log links (#80) after six
+  later issues touched the same file -- still correct, no code change
+  needed.
