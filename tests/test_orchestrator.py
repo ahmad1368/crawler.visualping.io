@@ -557,6 +557,102 @@ def test_pagination_guard_terminates_an_adversarial_trap_that_always_looks_produ
     assert summary.queue_empty is True
 
 
+def test_static_asset_audit_finds_a_password_on_an_asset_never_structurally_discovered():
+    """Regression/feature test for issue #99: a `/static/...` asset that
+    is never a real `<a href>`, never a rendered-DOM link, never a
+    captured network request -- only present as a JS *string literal*
+    inside SEED's own body -- is invisible to every existing discovery
+    mechanism (BrowserFetcher's dom_links/network_urls/interaction_urls,
+    issues #5/#67). The post-crawl static-asset audit must still find and
+    fetch it by re-scanning SEED's stored text, recovering the password
+    it contains."""
+    hidden_asset = "https://example.com/static/js/secret.js"
+    password = "VISUALPING{aabbccddeeff0011}"
+
+    seed_content = (
+        b"<html><body><script>"
+        b"const u = '/static/js/secret.js'; // never a real <script src>, never in dom/network\n"
+        b"</script></body></html>"
+    )
+
+    fetch_responses = {
+        SEED: FetchResult(
+            content=seed_content,
+            content_type="text/html",
+            status_code=200,
+            headers={},
+            cookies={},
+        ),
+        hidden_asset: FetchResult(
+            content=f"const secret = '{password}';".encode(),
+            content_type="application/javascript",
+            status_code=200,
+            headers={},
+            cookies={},
+        ),
+    }
+    browser_responses = {
+        # No dom_links/network_urls/interaction_urls at all -- structural
+        # discovery genuinely never sees hidden_asset.
+        SEED: BrowserFetchResult(html="", dom_links=[], network_urls=[]),
+    }
+
+    frontier = UrlFrontier(SEED)
+    http_fetcher = FakeHttpFetcher(fetch_responses)
+    browser_fetcher = FakeBrowserFetcher(browser_responses)
+    registry = ExtractorRegistry()
+    registry.register(SelectiveExtractor(value=password, urls_with_match={hidden_asset}))
+    repository = SqliteRepository(sqlite3.connect(":memory:"))
+
+    orchestrator = Orchestrator(
+        frontier=frontier,
+        http_fetcher=http_fetcher,
+        browser_fetcher=browser_fetcher,
+        extractor_registry=registry,
+        header_cookie_extractor=NoOpHeaderCookieExtractor(),
+        repository=repository,
+        concurrency=1,
+    )
+
+    summary = run(asyncio.wait_for(orchestrator.run(), timeout=5))
+
+    assert hidden_asset in http_fetcher.calls
+    assert summary.unique_passwords_found == 1
+    assert summary.asset_completeness is not None
+    assert summary.asset_completeness.total_static_references_found == 1
+    assert summary.asset_completeness.missing_assets_count == 1
+    assert summary.asset_completeness.completeness_percentage == 0.0
+    assert len(summary.asset_completeness.records) == 1
+    assert summary.asset_completeness.records[0].url == hidden_asset
+    assert summary.asset_completeness.records[0].status == "fetched"
+
+    # The asset's match is actually persisted, same as any other page.
+    matches = repository.get_matches()
+    assert len(matches) == 1
+    assert matches[0].value == password
+    assert matches[0].source_url == hidden_asset
+
+
+def test_static_asset_audit_is_skipped_when_the_crawl_ends_early():
+    """An operator-bounded crawl (max_pages here) deliberately limited how
+    much gets fetched -- the audit must not silently defeat that bound by
+    fetching more anyway."""
+    urls = [SEED] + [f"https://example.com/p{i}" for i in range(5)]
+    fetch_responses = {url: _html_response() for url in urls}
+    browser_responses = {
+        SEED: BrowserFetchResult(html="", dom_links=urls[1:], network_urls=[]),
+        **{url: BrowserFetchResult(html="", dom_links=[], network_urls=[]) for url in urls[1:]},
+    }
+    orchestrator, http_fetcher, _, _ = _build_orchestrator(
+        fetch_responses, browser_responses, concurrency=1, max_pages=2
+    )
+
+    summary = run(orchestrator.run())
+
+    assert summary.queue_empty is False
+    assert summary.asset_completeness is None
+
+
 def test_pagination_guard_does_not_cut_off_a_legitimate_index_with_no_direct_matches():
     """Regression test for issue #88: a real crawl's coverage dropped
     from ~680 pages to ~480 because PaginationGuard's old new_matches-only

@@ -54,6 +54,19 @@ would otherwise pop a URL, so `run()` returns early with a summary over
 whatever was actually processed -- the same `CRAWL_FINISHED` event/return
 path as a normal completion, just early. None of the three touch
 already-in-flight work.
+
+Once the frontier genuinely empties (`queue_empty`, not an early/bounded
+stop -- see below), runs `audit_static_assets()` (issue #99) as a final
+completeness pass: structural link discovery can still miss a
+`/static/...` asset only ever referenced as a string literal (never a
+real `<a href>`/network request), so this re-scans every already-fetched
+page's stored text for such references, fetches whatever's missing
+through the same extractor pipeline, and attaches a
+`StaticAssetCompletenessReport` to the returned `CrawlSummary`. Skipped
+entirely when the crawl ended early (`stop()`, `max_pages`,
+`max_duration_seconds`) -- an operator-bounded crawl deliberately limited
+how much gets fetched, and this audit's own fetches would silently defeat
+that bound.
 """
 
 from __future__ import annotations
@@ -61,6 +74,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
+from app.crawler.asset_scanner import audit_static_assets
 from app.crawler.browser_fetcher import BrowserFetcher
 from app.crawler.fetcher import HttpFetcher
 from app.crawler.frontier import UrlFrontier
@@ -166,13 +180,30 @@ class Orchestrator:
         workers = [asyncio.create_task(worker()) for _ in range(self._concurrency)]
         await asyncio.gather(*workers)
 
+        queue_empty = not self._frontier.has_next()
+        asset_completeness = None
+        if queue_empty:
+            # Only on genuine completion -- an operator-bounded crawl
+            # (stop(), max_pages, max_duration_seconds) deliberately
+            # limited how much gets fetched, and this audit's own
+            # fetches would silently defeat that bound (issue #99).
+            asset_completeness = await audit_static_assets(
+                self._repository,
+                self._http_fetcher,
+                self._extractor_registry,
+                self._header_cookie_extractor,
+                event_bus=self._event_bus,
+                unique_values=unique_values,
+            )
+
         summary = CrawlSummary(
             pages_visited=state["pages_visited"],
             resources_checked=state["resources_checked"],
             unique_passwords_found=len(unique_values),
-            queue_empty=not self._frontier.has_next(),
+            queue_empty=queue_empty,
             started_at=started_at,
             finished_at=datetime.now(timezone.utc),
+            asset_completeness=asset_completeness,
         )
         if self._event_bus is not None:
             self._event_bus.publish(CRAWL_FINISHED, summary)
