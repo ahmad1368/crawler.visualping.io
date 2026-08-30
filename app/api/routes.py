@@ -32,6 +32,7 @@ from app.extractors.css_js import CssJsExtractor
 from app.extractors.headers_cookies import HeaderCookieExtractor
 from app.extractors.html import HtmlExtractor
 from app.extractors.image_exif import ImageExifExtractor
+from app.extractors.image_lsb import ImageLsbExtractor
 from app.extractors.image_ocr import ImageOcrExtractor
 from app.extractors.image_structural import ImageStructuralExtractor
 from app.extractors.js_charcode import JsCharCodeExtractor
@@ -138,6 +139,7 @@ async def _build_orchestrator(request: CrawlRequest, event_bus: EventBus):
     registry.register(ImageExifExtractor(context_chars=_CONTEXT_CHARS))
     registry.register(ImageStructuralExtractor(context_chars=_CONTEXT_CHARS))
     registry.register(ImageOcrExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ImageLsbExtractor(context_chars=_CONTEXT_CHARS))
     registry.register(BinaryFallbackExtractor(context_chars=_CONTEXT_CHARS))
 
     repository = SqliteRepository(sqlite3.connect(f"crawl_{uuid.uuid4().hex}.db"))
@@ -290,6 +292,7 @@ async def re_extract_crawl(crawl_id: str) -> CrawlReportResponse:
     registry.register(ImageExifExtractor(context_chars=_CONTEXT_CHARS))
     registry.register(ImageStructuralExtractor(context_chars=_CONTEXT_CHARS))
     registry.register(ImageOcrExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ImageLsbExtractor(context_chars=_CONTEXT_CHARS))
     registry.register(BinaryFallbackExtractor(context_chars=_CONTEXT_CHARS))
     header_cookie_extractor = HeaderCookieExtractor(context_chars=_CONTEXT_CHARS)
 

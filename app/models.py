@@ -22,6 +22,7 @@ class SourceType(str, Enum):
     COOKIE = "cookie"
     IMAGE_METADATA = "image_metadata"
     IMAGE_OCR = "image_ocr"
+    IMAGE_LSB = "image_lsb"
     BINARY = "binary"
 
 

@@ -118,15 +118,19 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
                 │   app/extractors/base.py -- dispatches to HtmlExtractor,
                 │   CssJsExtractor, ImageExifExtractor,
                 │   ImageStructuralExtractor, ImageOcrExtractor,
-                │   BinaryFallbackExtractor (each calls find_passwords()
-                │   from app/matching.py; ImageOcrExtractor runs Tesseract
-                │   over the decoded image and scans whatever text it
-                │   recognizes -- the only extractor that reads a password
-                │   drawn as pixels rather than present as parseable
-                │   text/metadata anywhere in the file; ImageStructuralExtractor,
+                │   ImageLsbExtractor, BinaryFallbackExtractor (each
+                │   calls find_passwords() from app/matching.py;
+                │   ImageOcrExtractor runs Tesseract over the decoded
+                │   image and scans whatever text it recognizes -- reads
+                │   a password drawn as pixels rather than present as
+                │   parseable text/metadata; ImageStructuralExtractor,
                 │   issue #101, hand-parses JPEG COM segments and PNG
-                │   tEXt/zTXt/iTXt chunks -- the only extractor that
-                │   zlib-decompresses a chunk before searching it)
+                │   tEXt/zTXt/iTXt chunks -- zlib-decompresses a chunk
+                │   before searching it; ImageLsbExtractor, issue #101
+                │   Layer 3, reads the least-significant bit of every
+                │   R/G/B/A pixel channel byte -- the only extractor
+                │   that reads pixel *values* rather than pixel content
+                │   or any text-shaped field at all)
                 │
                 ├── HeaderCookieExtractor.extract(headers, cookies, url)
                 │   app/extractors/headers_cookies.py (not routed through
@@ -2038,7 +2042,16 @@ throughout. Content below is the original section, unchanged.)*
   live entirely in `StaticAssetCompletenessReport` instead, to avoid
   redefining what those two existing fields have always meant.
 
-## Issue #101: JPEG/PNG structural chunk & EXIF metadata parser
+## Issue #101: multi-layer image analysis pipeline (metadata + structural + visual OCR + LSB)
+
+*(Issue #101 was expanded mid-implementation from its original scope --
+structural JPEG/PNG parsing only -- into a unified multi-layer pipeline,
+reusing this issue/branch/PR rather than forking a new one, per explicit
+user instruction to check for and reuse related open work first. What
+follows is Layer 1 (this issue's original content, unchanged) followed
+by a Layer 2/3 addendum.)*
+
+### Layer 1: structural metadata (this issue's original scope)
 
 - **Already covered, deliberately not re-touched:** `ImageExifExtractor`
   (issue #12 + PR #65/#84) already reads JPEG APP1/EXIF via Pillow --
@@ -2118,4 +2131,92 @@ throughout. Content below is the original section, unchanged.)*
   entirely (the profile's own binary structure, not free text) and
   wasn't part of the request. JPEG APP1/EXIF, as noted above, is
   entirely out of scope here by design, not oversight.
+
+### Layer 2: visual OCR -- already shipped, no new work
+
+`ImageOcrExtractor` (`app/extractors/image_ocr.py`, a direct-to-staging
+feature predating a tracked issue number) already runs Tesseract OCR
+over every `image/*` asset -- PNG, JPEG, WebP, anything Pillow can open,
+not format-restricted -- and searches whatever text it recognizes.
+Grayscale/threshold/contrast preprocessing before OCR is a known,
+explicitly-deferred future enhancement (noted in that extractor's own
+code comments) -- not added here since nothing in this request
+demonstrated an actual need for it against a real image.
+
+### Layer 3: LSB steganography -- new work
+
+- **Inputs:** same as every image extractor -- raw image bytes +
+  content_type + url. No new data captured from the caller.
+- **Why:** every other extractor -- EXIF, structural chunks, OCR --
+  reads text the image *carries*: metadata fields or rendered pixels.
+  Classic LSB steganography hides a message by overwriting only the
+  least-significant bit of each color-channel byte, a change too small
+  to see -- the message exists nowhere as text at all, only in the
+  low-order bits of the raw pixel data itself. None of the other layers
+  can find this.
+- **Transformation:** new `app/extractors/image_lsb.py` ->
+  `ImageLsbExtractor`, registered alongside the other image extractors
+  in both `_build_orchestrator()` and `/re-extract`
+  (`app/api/routes.py`, the #93 lesson again). Extraction order is
+  fixed and documented so results are reproducible: the image is
+  converted to RGBA (so every pixel always has all four channels, even
+  if the source had none -- a synthesized alpha channel is uniformly
+  255, contributing no real signal but not corrupting the R/G/B bits
+  either), `Image.tobytes()` gives a flat byte string in row-major,
+  per-pixel R,G,B,A order, and the LSB of each byte -- in that same
+  order -- becomes one bit of the reconstructed message, packed
+  MSB-first into bytes 8 at a time. Reassembled bytes are decoded as
+  `latin-1` (never raises) and run through the same shared
+  `find_passwords()` every other extractor uses.
+  **False-positive risk:** for an ordinary image, the low-order bits of
+  real pixel data are effectively noise -- decoding noise as text and
+  matching a specific 16-hex-character pattern is astronomically
+  unlikely, so no extra heuristics were needed to keep this safe. JPEG's
+  lossy compression would generally destroy a real LSB-embedded message
+  before this extractor ever saw it -- not specifically guarded against
+  (harmless either way: it just finds nothing on a lossy-recompressed
+  carrier, the correct outcome), consistent with not format-restricting
+  any extractor in this codebase.
+  New `SourceType.IMAGE_LSB` (`app/models.py`) marks these matches --
+  a distinct pixel-level technique, not container metadata, so it gets
+  its own value the same way `IMAGE_OCR`/`JS_CHARCODE` did rather than
+  folding into `IMAGE_METADATA`. Added to `NON_TEXT_SOURCE_TYPES` in
+  `app/static/index.html` so the UI's snapshot viewer falls back to a
+  locator+context display instead of trying to search a non-text body,
+  same as the other three non-text source types.
+- **Outputs:** `PasswordMatch` rows shaped like any other extractor's --
+  `locator` is `lsb:offset:N`, the byte offset into the *reassembled*
+  message, not a pixel coordinate (recovering an actual pixel position
+  would mean tracking which channel/pixel each bit came from during
+  reconstruction, not done here since nothing consumes it yet -- noted
+  as a possible future enhancement, not a defect).
+  **Data-flow/security note (per the data-flow watchlist):** no new
+  exposure surface -- same storage/REST/WebSocket path as every other
+  extractor. Worth flagging as another concrete argument for why the
+  extractor set must stay "assumed partial" (alongside OCR, structural
+  chunks): a site could reasonably believe pixel data itself is safe
+  from a text-based scanner, and until this layer, that assumption held.
+  Log line per image: `"LSB steganography DETECTED in <url> -- N
+  flag(s) found."` at INFO on a hit, `"LSB steganography ruled out for
+  <url>."` at DEBUG otherwise -- DEBUG specifically because "ruled out"
+  is the outcome for nearly every image processed, and logging that at
+  INFO for every single image would flood the log for no operational
+  value.
+- **Tests:** new `tests/test_image_lsb_extractor.py` (5 tests) -- a
+  reference encoder (matching the extractor's exact bit order) embeds a
+  real flag into a 100x100 image's pixel LSBs via Pillow, saved as a
+  lossless PNG, and the extractor recovers it byte-for-byte; a plain
+  unmodified image proves no false positive; a source image with no
+  alpha channel of its own still round-trips correctly through the
+  RGBA conversion both sides use; malformed/non-image input degrades to
+  no matches without raising. Full suite: 243 passed, 4 skipped
+  (OCR/Tesseract). ruff/black/mypy clean.
+- **Not implemented / explicitly out of scope:** bit-plane analysis
+  beyond the single least-significant bit (some stego tools use 2+ bits
+  per channel, or only certain channels, or a non-sequential pixel
+  order/key-derived permutation) -- the spec asked specifically for LSB
+  across R/G/B/A in sequence, which is what's implemented; a more
+  exhaustive multi-bit-plane/permutation search would be a much larger,
+  separate feature. Recovering a pixel-coordinate locator (vs. a
+  message-byte offset) is also deferred, noted above.
 
