@@ -243,3 +243,5 @@ backfilling #1-28/#61/#63, which that report already covers in full).
   page in a new tab, so you can browse exactly what the crawl visited.
 - #86: A search box above the results table filters rows client-side by
   a case-insensitive substring match against the page URL.
+- #91: That search box now always stays visible above the results list,
+  regardless of whether any matches exist yet.

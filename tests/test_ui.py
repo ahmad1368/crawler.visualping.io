@@ -560,3 +560,42 @@ def test_results_filter_narrows_and_restores_rows(live_server_match_streaming):
             )
         finally:
             browser.close()
+
+
+def test_results_filter_bar_always_visible(live_server_pausable):
+    # live_server_pausable's crawl publishes no MATCH_FOUND events while
+    # running -- the results table stays empty/hidden (issue #86's own
+    # scope, unchanged) for that whole stretch, which is exactly the
+    # state that used to hide the search bar too (issue #91: the bar's
+    # visibility is no longer tied to match count at all). Its final
+    # GET /report does return matches (via _FakeRepository), so the table
+    # itself does populate once the crawl finishes -- that's unrelated to
+    # this test, which only asserts the search bar's own visibility.
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(live_server_pausable + "/")
+
+            # Visible before a crawl has ever run.
+            assert page.locator("#results-filter-container").is_visible()
+
+            page.fill("#url", "https://example.com")
+            page.fill("#username", "alice")
+            page.fill("#password", "s3cret")
+            page.click("#run-button")
+
+            # Visible while running, with zero matches found so far --
+            # the table itself is still hidden at this point.
+            page.wait_for_selector("#log p:has-text('Fetched')")
+            assert page.locator("#results-filter-container").is_visible()
+            assert not page.locator("#results-table").is_visible()
+
+            # Still visible once the crawl finishes and the table
+            # populates from the final report.
+            page.wait_for_function(
+                "document.getElementById('run-button').disabled === false", timeout=5000
+            )
+            assert page.locator("#results-filter-container").is_visible()
+        finally:
+            browser.close()
