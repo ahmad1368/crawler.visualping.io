@@ -21,6 +21,7 @@ class SourceType(str, Enum):
     HTTP_HEADER = "http_header"
     COOKIE = "cookie"
     IMAGE_METADATA = "image_metadata"
+    IMAGE_OCR = "image_ocr"
     BINARY = "binary"
 
 

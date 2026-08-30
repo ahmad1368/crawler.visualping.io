@@ -32,7 +32,7 @@ from app.extractors.css_js import CssJsExtractor
 from app.extractors.headers_cookies import HeaderCookieExtractor
 from app.extractors.html import HtmlExtractor
 from app.extractors.image_exif import ImageExifExtractor
-from app.extractors.js_charcode import JsCharCodeExtractor
+from app.extractors.image_ocr import ImageOcrExtractor
 from app.models import CrawlSummary, PasswordMatch
 from app.storage.repository import Repository
 from app.storage.sqlite import SqliteRepository
@@ -134,6 +134,7 @@ async def _build_orchestrator(request: CrawlRequest, event_bus: EventBus):
     registry.register(CssJsExtractor(context_chars=request.context_chars))
     registry.register(JsCharCodeExtractor(context_chars=request.context_chars))
     registry.register(ImageExifExtractor(context_chars=request.context_chars))
+    registry.register(ImageOcrExtractor(context_chars=request.context_chars))
     registry.register(BinaryFallbackExtractor(context_chars=request.context_chars))
 
     repository = SqliteRepository(sqlite3.connect(f"crawl_{uuid.uuid4().hex}.db"))
@@ -284,6 +285,7 @@ async def re_extract_crawl(crawl_id: str) -> CrawlReportResponse:
     registry.register(CssJsExtractor(context_chars=state.context_chars))
     registry.register(JsCharCodeExtractor(context_chars=state.context_chars))
     registry.register(ImageExifExtractor(context_chars=state.context_chars))
+    registry.register(ImageOcrExtractor(context_chars=state.context_chars))
     registry.register(BinaryFallbackExtractor(context_chars=state.context_chars))
     header_cookie_extractor = HeaderCookieExtractor(context_chars=state.context_chars)
 

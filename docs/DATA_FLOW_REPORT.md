@@ -104,13 +104,13 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
                 │
                 ├── ExtractorRegistry.run_all(content, content_type, url)
                 │   app/extractors/base.py -- dispatches to HtmlExtractor,
-                │   CssJsExtractor, JsCharCodeExtractor, ImageExifExtractor,
-                │   BinaryFallbackExtractor (each calls find_passwords() from
-                │   app/matching.py; JsCharCodeExtractor decodes numeric
-                │   char-code arrays/fromCharCode() calls in JS bodies into a
-                │   string first, since the plaintext password never appears
-                │   in that raw source for CssJsExtractor's plain-text scan
-                │   to find)
+                │   CssJsExtractor, ImageExifExtractor, ImageOcrExtractor,
+                │   BinaryFallbackExtractor (each calls find_passwords()
+                │   from app/matching.py; ImageOcrExtractor runs Tesseract
+                │   over the decoded image and scans whatever text it
+                │   recognizes -- the only extractor that reads a password
+                │   drawn as pixels rather than present as parseable
+                │   text/metadata anywhere in the file)
                 │
                 ├── HeaderCookieExtractor.extract(headers, cookies, url)
                 │   app/extractors/headers_cookies.py (not routed through
@@ -1657,73 +1657,72 @@ to eventually cut off *any* runaway family, trap or legitimate.
   -- noted as a natural future enhancement if the auth-prompt friction
   turns out to matter in practice.
 
-## Feature: detect passwords obfuscated as JS char-code arrays
+## Feature: read passwords drawn as image pixels (OCR)
 
-- **Inputs:** same fetched JS bodies `ExtractorRegistry.run_all()` already
-  passes to every registered extractor (`content: bytes`, `content_type:
-  str`, `url: str`) -- no new input, no new endpoint. Targets a specific
-  obfuscation technique where the password is never written as a literal
-  string in the JS source: it's spelled out as a decimal/hex array
-  literal (e.g. `[86, 73, 83, ...]`) or a `String.fromCharCode(86, 73,
-  83, ...)` call, and only becomes the real string once the browser
-  evaluates it at runtime. `CssJsExtractor`'s plain-text regex scan
-  (`app/matching.py`'s `VISUALPING{16 hex}` pattern) can never match this
-  -- the pattern's characters simply aren't present in the raw bytes.
-- **Transformation:** new `app/extractors/js_charcode.py` ->
-  `JsCharCodeExtractor`, registered into the same `ExtractorRegistry`
-  alongside `CssJsExtractor` (both call sites: `_build_orchestrator` for
-  a live crawl and the `/re-extract` replay path in `app/api/routes.py`,
-  so re-extracting an already-crawled site with this new extractor works
-  without a live re-fetch). For each JS/CSS-adjacent content type it
-  scans the decoded text for two literal shapes -- a numeric array
-  (`\[...\]`) or a `fromCharCode(...)` call -- each with at least 6
-  comma-separated numbers (decimal or `0x` hex) to skip short, unrelated
-  numeric literals (RGB triples, id lists) cheaply. Every candidate
-  sequence is decoded with `chr()` into the string it would evaluate to
-  at runtime, and that decoded string -- not the raw source -- is handed
-  to the same `find_passwords()` used everywhere else, so the password
-  format and the "known worked example is excluded" rule
-  (`KNOWN_EXAMPLE` in `app/matching.py`) stay identical to every other
-  extractor. A new `SourceType.JS_CHARCODE` (`app/models.py`) marks these
-  matches so they're distinguishable from a plaintext `JS` find further
-  downstream.
-- **Outputs:** `PasswordMatch` rows shaped exactly like any other
-  extractor's, with one deliberate difference: `context_before`/
-  `context_after`/`locator` describe the *raw source* around the
-  array/call literal (not the decoded string), since that's what an
-  operator reviewing the finding actually needs to see -- the obfuscated
-  code, not just the password it decodes to. The UI's snapshot viewer
+- **Inputs:** same fetched image bytes `ExtractorRegistry.run_all()`
+  already passes to every registered extractor -- no new input, no new
+  endpoint. Targets a distinct obfuscation technique from every prior
+  extractor in this file: the password isn't present as parseable
+  text or metadata anywhere in the file at all -- it's drawn as pixels
+  (a photographed whiteboard, a screenshot of a sticky note, hand- or
+  machine-lettered text baked into the image), readable only by eye or
+  by actually recognizing the glyphs. `ImageExifExtractor` reads
+  metadata *about* the image; nothing in this codebase previously read
+  what the image *shows*.
+- **Transformation:** new `app/extractors/image_ocr.py` ->
+  `ImageOcrExtractor`, registered into `ExtractorRegistry` alongside
+  `ImageExifExtractor` (both call sites: `_build_orchestrator` for a
+  live crawl and the `/re-extract` replay path in `app/api/routes.py`).
+  Opens the image with Pillow (same `Image.open()` + `OSError`/
+  `DecompressionBombError` guard as `ImageExifExtractor`, for the same
+  malformed-input reason) and runs `pytesseract.image_to_string()` --
+  a thin wrapper around the Tesseract OCR engine binary -- over the
+  decoded image, then hands whatever text it recognizes to the same
+  `find_passwords()` every other extractor uses, so the password format
+  and the `KNOWN_EXAMPLE` exclusion (`app/matching.py`) stay identical.
+  A new `SourceType.IMAGE_OCR` (`app/models.py`) marks these matches.
+  Tesseract is a system binary, not a pip package -- `pytesseract` (added
+  to `pyproject.toml`) just shells out to it; if it's missing or errors
+  on a given image (`TesseractNotFoundError`/`TesseractError`), `extract()`
+  degrades to no matches rather than raising, so one broken/exotic image
+  never aborts a crawl. CI (`.github/workflows/ci.yml`) now installs it
+  via `apt-get install tesseract-ocr` before running tests; local Setup
+  in `README.md` documents the equivalent for macOS/Windows.
+- **Outputs:** `PasswordMatch` rows shaped like any other extractor's,
+  with `locator` as `ocr:offset:N` -- an offset into the *OCR'd text*,
+  not a pixel position in the image (getting an actual bounding box
+  would mean requesting Tesseract's per-word layout data via
+  `image_to_data` instead of plain `image_to_string`, not done here since
+  nothing consumes it yet). The UI's snapshot viewer
   (`app/static/index.html`) already has a fallback path for source types
-  whose match value can't be found via `indexOf` in the raw page/file
-  body (previously `image_metadata`/`binary`); `js_charcode` is added to
-  that `NON_TEXT_SOURCE_TYPES` set for the same reason -- the decoded
-  password is never literally present in the JS source to search for.
+  whose match value can't be found via `indexOf` in the raw fetched body
+  (previously `image_metadata`/`binary`); `image_ocr` is added to that
+  `NON_TEXT_SOURCE_TYPES` set for the same reason -- the raw image bytes
+  never literally contain the password as text to search for.
   **Data-flow/security note (per the data-flow watchlist):** no new
-  exposure surface -- this is a new *detection* path over data the
-  crawler already fetches and already treats as sensitive once matched
-  (same `PasswordMatch`/context/locator shape, same SQLite storage, same
-  REST/WebSocket delivery as every other extractor). Worth flagging
-  precisely because it demonstrates the opposite risk this tool exists
-  to catch: a site can hide a leaked credential from a naive
-  text-searching scanner via one extra layer of encoding, so any future
-  extractor work should keep asking "what's the next transformation a
-  site could apply that this still wouldn't see" (e.g. base64, XOR,
-  split-and-concatenated strings) rather than treating today's extractor
-  set as exhaustive.
-- **Tests:** new `tests/test_js_charcode_extractor.py` (6 tests) --
-  decodes a password from both the array-literal and `fromCharCode`
-  forms, asserts the raw fixture text never contains either password
-  literally (the premise a plain regex would miss it), ignores short
-  numeric arrays and unrelated content types, and checks the locator
-  points at the literal's position in the source. Full suite: 210 tests
-  pass (204 existing + 6 new) -- the existing `CssJsExtractor`,
-  `test_extractor_fixtures.py`, and `test_e2e_crawl.py` coverage for
-  plaintext-embedded passwords is untouched and still green, so this is
-  additive, not a replacement for the existing plaintext scan.
-  ruff/black/mypy clean.
-- **Not implemented / explicitly out of scope:** only ASCII/Unicode code
-  points via a flat numeric array or a single `fromCharCode(...)` call
-  are decoded -- codes split across multiple statements/variables, built
-  via a loop, or obfuscated further (base64, XOR, hex-encoded strings,
-  `unescape`/`atob`) are not detected. Each would need its own decoder in
-  the same spirit as this one if it turns out sites actually use it.
+  exposure surface -- same `PasswordMatch`/context/locator shape, same
+  SQLite storage, same REST/WebSocket delivery as every other extractor;
+  worth flagging because it's the strongest example yet of why this
+  tool's extractor set must keep being treated as partial: a site could
+  reasonably assume a password baked into an image as *pixels* is safe
+  from any automated scanner, and until now that assumption held.
+- **Tests:** new `tests/test_image_ocr_extractor.py` (4 tests) -- draws a
+  password onto a blank image with Pillow's bundled default font (no
+  system-font dependency, so the fixture renders identically on any OS)
+  and confirms OCR reads it back byte-for-byte, plus ignores non-image
+  content types, returns no matches for a genuinely blank image, and
+  degrades gracefully on unparseable image bytes. The whole file is
+  `pytest.mark.skipif`-guarded on Tesseract actually being importable/
+  runnable (`pytesseract.get_tesseract_version()`), so a dev machine
+  without the binary installed sees 4 skips, not 4 failures, rather than
+  silently passing on a broken assumption. Full suite (with Tesseract
+  installed): 208 tests pass (204 existing + 4 new). ruff/black/mypy
+  clean.
+- **Not implemented / explicitly out of scope:** no image preprocessing
+  (deskew, threshold/contrast boost, upscaling) before handing the image
+  to Tesseract -- real-world low-contrast or angled photos may OCR worse
+  than this feature's clean synthetic test fixture; if that turns out to
+  matter, preprocessing would slot into `ImageOcrExtractor.extract()`
+  right before the `image_to_string()` call. Bounding-box locators
+  (`image_to_data` instead of `image_to_string`) are also left for later,
+  noted above.

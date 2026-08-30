@@ -11,6 +11,16 @@ that jumps straight to where each password was found.
 
 - Python 3.11+
 - A Chromium install for Playwright (see Setup)
+- The Tesseract OCR binary on `PATH` (used to read passwords drawn as
+  image pixels -- e.g. a screenshot or scanned whiteboard -- rather than
+  present as parseable text/metadata). Debian/Ubuntu:
+  `sudo apt-get install tesseract-ocr`; macOS: `brew install tesseract`;
+  Windows: install via [winget](https://github.com/UB-Mannheim/tesseract)
+  (`winget install --id UB-Mannheim.TesseractOCR`) or
+  [choco](https://community.chocolatey.org/packages/tesseract)
+  (`choco install tesseract`), then ensure the install directory is on
+  `PATH`. If it's missing, `ImageOcrExtractor` degrades to finding no
+  matches rather than failing the crawl.
 
 ## Setup
 
