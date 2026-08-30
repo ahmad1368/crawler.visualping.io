@@ -1770,3 +1770,31 @@ to eventually cut off *any* runaway family, trap or legitimate.
   and adding the still-missing pieces the standing workflow requires:
   this report section, the README entry, and dedicated test coverage
   (PR #82 shipped with none of the three).
+
+## Issue #91: keep the results filter search bar always visible
+
+- **Inputs:** none -- pure follow-up to issue #86's UI, no new data.
+- **Transformation:** `#results-filter-container` previously started
+  `style="display: none;"` and `applyResultsFilter()` toggled it between
+  `"block"`/`"none"` based on whether any matches existed at all
+  (`hasAnyMatches`), with a further reset to `"none"` on every new crawl
+  start. All three of those toggles are removed -- the container has no
+  inline `display` at all now (defaults to its normal block layout) and
+  is never hidden by JS. The results table's own visibility (hidden
+  until there's at least one match) is untouched -- still driven by
+  `currentMatches.length` in `applyResultsFilter()`, just no longer
+  bundled with the search bar's visibility. The now-unused
+  `resultsFilterContainer` DOM reference was removed along with its
+  toggling code.
+- **Outputs:** none -- still no new request/response payload, still
+  entirely client-side.
+  **Data-flow/security note (per the data-flow watchlist):** no new
+  concern, same as issue #86 -- this only changes when an already-inert
+  input element is shown, not what it does.
+- **Tests:** new `test_results_filter_bar_always_visible`
+  (`tests/test_ui.py`, reuses the `live_server_pausable` fixture) --
+  asserts the search bar is visible before any crawl has run, while a
+  crawl is running with zero matches found so far (table still hidden),
+  and after the crawl finishes. Existing filter test
+  (`test_results_filter_narrows_and_restores_rows`) still passes
+  unchanged, confirming filtering behavior itself wasn't affected.

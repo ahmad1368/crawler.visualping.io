@@ -268,7 +268,7 @@
       </div>
     </div>
     <div id="log" aria-live="polite"></div>
-    <div id="results-filter-container" style="display: none;">
+    <div id="results-filter-container">
       <label for="results-filter">Filter results</label>
       <input
         id="results-filter"
@@ -310,7 +310,6 @@
     const log = document.getElementById("log");
     const resultsTable = document.getElementById("results-table");
     const resultsBody = document.getElementById("results-body");
-    const resultsFilterContainer = document.getElementById("results-filter-container");
     const resultsFilterInput = document.getElementById("results-filter");
     const summaryPanel = document.getElementById("summary-panel");
     const summaryPagesVisited = document.getElementById("summary-pages-visited");
@@ -544,9 +543,10 @@
       const term = resultsFilterInput.value.trim().toLowerCase();
       const filtered = term ? currentMatches.filter((row) => rowMatchesFilter(row, term)) : currentMatches;
       renderMatchRows(filtered);
-      const hasAnyMatches = currentMatches.length > 0;
-      resultsFilterContainer.style.display = hasAnyMatches ? "block" : "none";
-      resultsTable.style.display = hasAnyMatches ? "table" : "none";
+      // The search bar itself always stays visible above the results
+      // list (issue #91); only the table's own show/hide (issue #86's
+      // scope) depends on whether any matches exist yet.
+      resultsTable.style.display = currentMatches.length ? "table" : "none";
     }
 
     resultsFilterInput.addEventListener("input", applyResultsFilter);
@@ -617,7 +617,6 @@
       resultsBody.innerHTML = "";
       resultsTable.style.display = "none";
       resultsFilterInput.value = "";
-      resultsFilterContainer.style.display = "none";
       currentMatches = [];
       closeSnapshotViewer();
       resetSummaryPanel();
