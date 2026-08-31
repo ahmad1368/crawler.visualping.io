@@ -63,6 +63,27 @@ that point changes. Not distinguishable from a genuine dead end without
 also inspecting page content similarity, which this guard deliberately
 doesn't do. Any links already discovered on earlier pages are still
 crawled normally as their own, independent URLs either way.
+
+Real-target verification (this session) found a second regression in
+#88's own fix: `pagination_family_key()` computed its key from the raw
+URL's path, not the same canonicalized form `UrlFrontier` uses to decide
+what's "the same page." The real target's `/report?page=N` pages are
+fetched (and thus family-keyed) without a trailing slash after
+`UrlFrontier.normalize_url()` strips it, but that same page's own
+"Prev"/"Next" pager links point to `/report/?page=N` -- *with* a
+trailing slash, an inconsistency in the target's own HTML. Two different
+raw paths ("/report" vs "/report/") produced two different family keys
+for what `UrlFrontier` already treats as the identical page, so every
+pager link on every page of the trap was misclassified as a genuinely
+new *external* link (issue #88's productivity signal) rather than the
+family's own same-family "next page" link -- resetting the unproductive
+streak on literally every page and completely defeating
+`max_unproductive`, only bounded by `max_family_pages`'s much larger
+hard ceiling instead. Fixed by computing the family key from
+`UrlFrontier.normalize_url(url)` instead of the raw URL, so both spellings
+of the same page always collapse to the same family key -- the same
+single source of truth for "is this the same page" the frontier itself
+already uses for dedup.
 """
 
 from __future__ import annotations
@@ -70,13 +91,21 @@ from __future__ import annotations
 import logging
 from urllib.parse import parse_qsl, urlsplit
 
+from app.crawler.frontier import normalize_url
+
 logger = logging.getLogger(__name__)
 
 
 def pagination_family_key(url: str) -> str | None:
     """Return a family key for a URL with exactly one purely-numeric query
-    param (e.g. `?page=7`), or None if `url` doesn't match that shape."""
-    parsed = urlsplit(url)
+    param (e.g. `?page=7`), or None if `url` doesn't match that shape.
+
+    Computed from `normalize_url(url)`, not the raw URL, so two spellings
+    of the same page (e.g. a trailing-slash inconsistency between a page's
+    own URL and its self-referential pager links) always produce the same
+    family key -- see this module's docstring for the real-target case
+    that motivated this."""
+    parsed = urlsplit(normalize_url(url))
     params = parse_qsl(parsed.query, keep_blank_values=True)
     if len(params) != 1:
         return None

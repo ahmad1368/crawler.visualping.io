@@ -298,3 +298,8 @@ backfilling #1-28/#61/#63, which that report already covers in full).
   character whitelist fixed a real-target misread (`1`/`l`, `0`/`O`
   confusion) that preprocessing tuning alone couldn't have -- verified
   against the actual target image via the #72 replay path.
+- #112: Fixed `PaginationGuard` being defeated by a trailing-slash
+  mismatch between a real page's fetched URL and its own pager links --
+  `pagination_family_key()` now canonicalizes through
+  `UrlFrontier.normalize_url()` so both spellings collapse to one family,
+  restoring the ~10-page cap on genuine no-match pagination traps.

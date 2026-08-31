@@ -17,6 +17,18 @@ def test_pagination_family_key_ignores_no_query_string():
     assert pagination_family_key("https://example.com/report") is None
 
 
+def test_pagination_family_key_unifies_a_trailing_slash_mismatch():
+    """Regression test, this session: a real target's own pager links
+    used `/report/?page=N` (trailing slash) while the crawler fetches
+    (and thus family-keys) the same page as `/report?page=N` (no
+    trailing slash, per UrlFrontier.normalize_url()). The two spellings
+    must collapse to the same family key -- see pagination_guard.py's
+    module docstring for the full real-target trap this let through."""
+    assert pagination_family_key(
+        "https://example.com/report?page=7"
+    ) == pagination_family_key("https://example.com/report/?page=7")
+
+
 def test_guard_does_not_stop_before_reaching_the_limit():
     guard = PaginationGuard(max_unproductive=3, max_family_pages=None)
 

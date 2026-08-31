@@ -1996,6 +1996,66 @@ throughout. Content below is the original section, unchanged.)*
 - **Outputs / data-flow:** no new data captured or persisted -- purely a
   crawl-completeness fix. No data-flow/security concerns.
 
+## Issue #112: PaginationGuard defeated by a trailing-slash mismatch in real pager links
+
+- **Context:** with a real live crawl against the actual target
+  available this session (not a synthetic fixture, unlike every prior
+  `PaginationGuard` fix), a genuine no-match `/report?page=N` trap --
+  exactly the shape #78 was built to stop -- ran to 91+ pages instead of
+  being capped around `pagination_family_limit` (10).
+- **Root cause:** `UrlFrontier.normalize_url()` strips a trailing slash
+  from a URL's path before it's enqueued/fetched, so these pages are
+  fetched (and thus family-keyed) as `/report?page=N` -- no trailing
+  slash. But the real target's own "Prev"/"Next" pager links on those
+  same pages point to `/report/?page=N` -- *with* a trailing slash, an
+  inconsistency in the target's own HTML that no synthetic fixture used
+  in #78/#88's own testing happened to reproduce. `pagination_family_key()`
+  computed its key from the raw URL's path, not the frontier's canonical
+  form, so the two spellings produced two different family keys for what
+  `UrlFrontier` already treats as the identical page. Every pager link on
+  every page of the trap was therefore misclassified by
+  `Orchestrator._process_url()` as a genuinely new *external* link
+  (#88's productivity signal), resetting the unproductive streak on
+  literally every single page -- completely defeating
+  `max_unproductive`, bounded only by the much larger `max_family_pages`
+  hard ceiling (200) instead of the intended ~10.
+- **Transformation (`app/crawler/pagination_guard.py`):**
+  `pagination_family_key()` now computes its key from
+  `UrlFrontier.normalize_url(url)` instead of the raw URL -- reusing the
+  frontier's own single source of truth for "is this the same page"
+  instead of a second, independently-drifting notion of it. No change to
+  `PaginationGuard`'s streak/ceiling logic itself (#78/#88's fixes are
+  untouched) -- purely a URL-canonicalization fix at the one place that
+  was skipping it.
+- **Verified:** new unit test
+  `test_pagination_family_key_unifies_a_trailing_slash_mismatch`
+  (`tests/test_pagination_guard.py`) proves both spellings now produce
+  the same key. New end-to-end test
+  `test_pagination_guard_not_defeated_by_a_trailing_slash_mismatch_in_pager_links`
+  (`tests/test_orchestrator.py`) reproduces the real shape: a 15-page
+  `/report?page=N` family (more than `pagination_family_limit`=10), zero
+  matches, each page's only links being its own trailing-slash-
+  inconsistent Prev/Next pager -- confirmed via monkeypatching the
+  pre-fix `pagination_family_key` back in that this test fetches all 15
+  pages unbounded on the old code (matching the real regression exactly)
+  and correctly caps at 10 with the fix. Existing #78/#88 tests
+  (adversarial-trap termination, legitimate-index-not-cut-off) still
+  pass unchanged -- their fixtures use consistent URL spellings
+  throughout, so neither depends on this fix. Full suite 293 passed (2
+  new); ruff/mypy clean.
+- **Not fully verified against the real target's actual crawl outcome**
+  (i.e. did fixing this recover more passwords): no Basic Auth
+  credentials available this session to re-run a genuine live crawl --
+  the mechanism itself (the trailing-slash family-key mismatch) is
+  directly confirmed against the real target's actual stored HTML from
+  an earlier live crawl this session, and the fix is verified end-to-end
+  against a fixture reproducing that exact real-world shape.
+- **Outputs / data-flow:** no new data captured or persisted -- purely a
+  crawl-completeness fix, same as #78/#88. No data-flow/security
+  concerns. **Explicitly out of scope, per this fix's own instructions:**
+  no extractor/password-matching code touched -- this change is entirely
+  contained to `app/crawler/pagination_guard.py`.
+
 ## Issue #96: remove the "Context length" field
 
 - **Inputs:** removes one -- `context_chars` is no longer accepted on
