@@ -31,12 +31,26 @@ from app.models import PasswordMatch, SourceType
 
 logger = logging.getLogger(__name__)
 
+# Every character a `VISUALPING{...}` token can ever contain. Without
+# constraining Tesseract to this alphabet, its default English-language
+# model biases ambiguous glyphs toward dictionary-shaped substitutions --
+# e.g. digit `1` read as letter `l`, `0` as `O`, plus outright hallucinated
+# extra characters -- even on an already-crisp, unambiguous preprocessed
+# image (issue #109: a real target whiteboard scan misread as
+# "VISUALPING{elc2e40cfO01c1/cc}" instead of "VISUALPING{e1c2e40cf01c17cc}").
+# This is a classifier-disambiguation fix, not an image-quality one --
+# tightening `_preprocess()` further doesn't move this number.
+_CHAR_WHITELIST = "VISUALPING{}0123456789abcdef"
+
 # --psm 6 (uniform block of text) and --psm 11 (sparse text) catch
 # different real-world layouts -- a clean paragraph vs. scattered text on
 # a diagram/whiteboard -- and a mismatched mode can silently produce
 # garbled output with no error, so both are tried and merged rather than
 # picking one.
-_PSM_CONFIGS = ("--psm 6", "--psm 11")
+_PSM_CONFIGS = (
+    f"--psm 6 -c tessedit_char_whitelist={_CHAR_WHITELIST}",
+    f"--psm 11 -c tessedit_char_whitelist={_CHAR_WHITELIST}",
+)
 
 # Global binarization threshold (0-255). A fixed threshold is a
 # deliberate simplification -- it assumes reasonably even lighting across

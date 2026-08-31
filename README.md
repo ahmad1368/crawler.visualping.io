@@ -294,4 +294,7 @@ backfilling #1-28/#61/#63, which that report already covers in full).
   low-resolution rendered flags a bare single-pass OCR call could
   misread. OCR failures are now logged instead of silently swallowed,
   and an optional (unwired by default) vision-model fallback hook exists
-  for images plain OCR can't read.
+  for images plain OCR can't read. Follow-up (same issue): a Tesseract
+  character whitelist fixed a real-target misread (`1`/`l`, `0`/`O`
+  confusion) that preprocessing tuning alone couldn't have -- verified
+  against the actual target image via the #72 replay path.
