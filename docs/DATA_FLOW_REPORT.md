@@ -2680,3 +2680,53 @@ demonstrated an actual need for it against a real image.
   addresses; a genuinely handwritten or rotated sample would still rely
   on the (currently unwired) vision-fallback extension point.
 
+### Addendum: character-whitelist fix -- verified against the real target's own image
+
+- **Context:** this session had actual access to a running crawl against
+  the real target (`crawl_5b0171a6a6a54576a4dc8396afd124de.db`, containing
+  the genuine `http://54.214.7.161/static/img/whiteboard-scan.png`
+  fetch), letting the original #109 fix be re-checked against real data
+  instead of only the synthetic fixture noted above. Two distinct
+  problems surfaced, diagnosed in order:
+  1. Tesseract wasn't resolvable on `PATH` from the running server
+     process at all -- a Windows environment-variable propagation issue
+     (`SetEnvironmentVariable(..., "Machine")` updates the registry but
+     never an already-running process's env block), not a code bug.
+     Fixed operationally by restarting the server from a freshly-spawned
+     shell; no code change.
+  2. With Tesseract actually reachable, `ImageOcrExtractor.extract()`
+     still didn't flag the real image. Root-caused by inspecting the
+     preprocessed image directly (visually crisp, high-contrast, no
+     lighting/noise issues -- preprocessing was not the problem) and the
+     raw Tesseract output: `VISUALPING{elc2e40cfO01c1/cc}` instead of
+     `VISUALPING{e1c2e40cf01c17cc}` -- `1`/`l` and `0`/`O` confusion plus
+     one hallucinated extra character. This is Tesseract's default
+     English-language model biasing ambiguous glyphs toward
+     dictionary-shaped substitutions, a classifier problem, not an image-
+     quality one.
+- **Transformation (`app/extractors/image_ocr.py`):** added
+  `_CHAR_WHITELIST = "VISUALPING{}0123456789abcdef"` -- every character a
+  `VISUALPING{...}` token can contain -- and appended
+  `-c tessedit_char_whitelist=<whitelist>` to both existing `--psm 6`/
+  `--psm 11` configs. `_preprocess()` itself is unchanged; this is purely
+  a Tesseract-classifier constraint, confirmed empirically (whitelisted
+  config alone, same preprocessed bytes, produces the exact correct
+  string on both PSM modes).
+- **Verification against real target data:** replaying extraction
+  (`app.crawler.replay.replay_extraction`, issue #72's zero-refetch path)
+  over the full 340-page stored crawl now finds `unique_passwords_found`
+  4 -> 5, the new one being
+  `VISUALPING{e1c2e40cf01c17cc}` / `image_ocr` /
+  `http://54.214.7.161/static/img/whiteboard-scan.png` -- exact match, no
+  other extractor's output changed. All 12 existing OCR unit tests still
+  pass unchanged (the whitelist is a superset of every fixture's
+  alphabet); full non-browser suite 291 passed; ruff clean. A genuine
+  fresh live re-crawl against the real target was not run this
+  session -- no Basic Auth credentials available (no `.env` in this
+  checkout) -- verification used the already-fetched, already-stored raw
+  bytes instead, which is byte-for-byte the same input a live crawl would
+  feed this extractor.
+- **Data-flow/security note:** no change to trust boundary or outbound
+  calls -- same in-process bytes-in/text-out extraction as the original
+  #109 change.
+
