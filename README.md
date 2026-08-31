@@ -289,3 +289,9 @@ backfilling #1-28/#61/#63, which that report already covers in full).
   AND together as substring matches against the URL. Password state
   updates retroactively as `match_found` events arrive for an
   already-rendered page.
+- #109: Hardened `ImageOcrExtractor` (upscale + grayscale + threshold
+  preprocessing, merged `--psm 6`/`--psm 11` passes) to catch small/
+  low-resolution rendered flags a bare single-pass OCR call could
+  misread. OCR failures are now logged instead of silently swallowed,
+  and an optional (unwired by default) vision-model fallback hook exists
+  for images plain OCR can't read.
