@@ -58,7 +58,19 @@ Browser: GET /                                app/api/routes.py + app/static/ind
     page_fetched log entry (issue #80) renders as a real `<a href>` to
     the fetched URL, target="_blank" -- opens the live target page in a
     new tab so the operator can browse exactly what the crawl visited,
-    not just a styled/JS-only click handler
+    not just a styled/JS-only click handler. These entries live in their
+    own `#pages-list` container (issue #107), separate from the plain
+    `#log` (crawl-start/pause/stop/error messages), keyed by URL in a
+    client-side Map so a page's row can be updated after the fact. A
+    filter bar above that list (issue #107) narrows it two ways, AND'd
+    together: a text box splits its value on whitespace and requires
+    every resulting term present as a substring of the URL (e.g. "js
+    secret" matches only a URL containing both), and a has-password/
+    no-password/all selector reflects whether any match_found event's
+    source_url has matched that page -- which can arrive well after the
+    page's own row first rendered (e.g. the post-crawl content-
+    negotiation probe re-checking an already-fetched URL), so a page's
+    filtered state updates retroactively, not just at render time
 
 POST /crawls (CrawlRequest: url, username, password, context_chars)
 app/api/routes.py -- validated by pydantic (HttpUrl, non-empty credentials);
@@ -2459,4 +2471,74 @@ demonstrated an actual need for it against a real image.
   candidate broken up by intervening non-alphabet characters (e.g. an
   encoded value split across multiple lines with other text between)
   would not be reassembled and decoded as one run.
+
+## Issue #107: password-found + multi-term AND filter on the crawled pages list
+
+- **Context:** the results-table filter (#86/#91) already narrows *found
+  passwords*; this issue adds a second, independent filter over the
+  *crawled pages* list (the `page_fetched` link entries, #80/#89) --
+  unrelated data, unrelated list, deliberately not touching #86's filter.
+- **Inputs:** `page_fetched` WebSocket events (`payload.url`,
+  `payload.status_code`) and `match_found` events' `payload.source_url`
+  -- both already existed and reached the browser (#16/#18); no backend
+  change.
+- **Transformation (all client-side, `app/static/index.html`):**
+  - `page_fetched` entries no longer append straight into the shared
+    `#log` div. `appendPageLink()` now records/updates an entry in a new
+    `currentPagesByUrl: Map<url, {url, statusCode, hasPassword}>` (Map
+    preserves insertion order) and calls `applyPagesFilter()`, which
+    re-renders into a new dedicated `#pages-list` container. This split
+    was necessary for the list to be filterable at all -- the old
+    approach had no backing data structure, only DOM text mixed with
+    unrelated log lines (crawl-start/pause/stop/error messages), so there
+    was nothing to filter *against* independent of what was already
+    painted on screen.
+  - New `markPageHasPassword(url)`, called from the `match_found` handler
+    alongside the existing `recordLiveMatch()`/summary-counter logic:
+    flips `hasPassword` on the matching page entry and re-renders. Since
+    a page's row can already be on screen before its own match arrives
+    (structurally guaranteed for the post-crawl content-negotiation
+    probe, #103, which re-fetches an already-crawled URL and can emit a
+    fresh `match_found` for it with no new `page_fetched`), this update
+    is retroactive by design, not just applied at initial render.
+  - New `pageMatchesFilter(pageEntry, terms, passwordState)`: the
+    password-state check (`has`/`none`/`all`) ANDs with the text check,
+    which itself ANDs every whitespace-split term as an independent
+    case-insensitive substring test against the URL -- `terms.every(...)`,
+    not `.some(...)`, so "js secret" requires both, matching neither #86's
+    single-term semantics nor a naive OR.
+- **Outputs:** new `#pages-filter-container` (text input `#pages-filter`
+  + select `#pages-password-filter`, styled after #91's always-visible
+  `#results-filter-container` pattern) rendered directly above the new
+  `#pages-list`. Both filter state resets on a new crawl start, same as
+  the existing results filter already does. No new HTTP/WebSocket
+  traffic, no new persisted data -- purely a client-side view over data
+  already in the browser.
+  **Data-flow/security note (per the data-flow watchlist):** no new
+  exposure surface. The filter terms and selector state never leave the
+  browser; the URLs/status-codes/match-correlation being filtered are the
+  same `page_fetched`/`match_found` payloads already sent to every
+  connected client since #16/#18 -- this issue only changes how they're
+  displayed, not what's transmitted or stored.
+- **Tests:** `tests/test_ui.py` gained
+  `test_pages_list_filters_by_password_state_and_and_combined_text`
+  (`live_server_pages_filter` fixture, `_PagesFilterFakeOrchestrator`) --
+  fetches three pages (`app.js`, `secret.js`, `notes.txt`), asserts every
+  entry reads "no password" before the match arrives, emits `match_found`
+  for `secret.js` only *after* all three `page_fetched` events (proving
+  the retroactive-update path, not just filtering at render time), then
+  exercises the has/none/all selector, the multi-term AND text box, and
+  both combined together. Also updated the two existing tests
+  (`test_run_button_disables_during_crawl_and_log_updates_live`,
+  `test_pause_resume_stop_controls`, plus
+  `test_results_filter_bar_always_visible`'s one incidental wait) and the
+  shared `_fetched_count()` helper to look for fetched-page entries under
+  the new `#pages-list` instead of `#log`, since that's where they now
+  render. 289 tests pass (1 new), 4 skipped (OCR/Tesseract); ruff/black/
+  mypy clean.
+- **Not implemented / explicitly out of scope:** the plain `#log` div
+  (crawl-start/pause/resume/stop/error/"Password found at ..." lines) is
+  untouched by either filter -- only `page_fetched` entries moved into
+  the new filterable list, per the issue's own scoping. No change to the
+  results-table filter (#86/#91).
 

@@ -300,24 +300,28 @@ def test_run_button_disables_during_crawl_and_log_updates_live(live_server):
 
             assert run_button.is_disabled()
 
-            page.wait_for_selector("#log p:has-text('Fetched')")
+            page.wait_for_selector("#pages-list p:has-text('Fetched')")
             assert run_button.is_disabled(), "button must stay disabled while crawl is in progress"
             assert (
                 page.locator("#summary-resources-checked").inner_text() == "1"
             ), "resources-checked stat should update live from page_fetched events"
 
             # Each fetched page is a real <a href>, not a styled button or a
-            # JS-only click handler -- opens in a new tab, no re-fetch.
-            fetched_link = page.locator("#log a").first
+            # JS-only click handler -- opens in a new tab, no re-fetch. It
+            # renders into the dedicated crawled-pages list (issue #107),
+            # not the generic log.
+            fetched_link = page.locator("#pages-list a").first
             assert fetched_link.get_attribute("href") == "https://example.com/"
             assert fetched_link.get_attribute("target") == "_blank"
             assert fetched_link.get_attribute("rel") == "noopener noreferrer"
             assert "Fetched https://example.com/" in fetched_link.inner_text()
 
-            page.wait_for_function("document.querySelectorAll('#log p').length >= 3", timeout=5000)
-            log_lines = page.locator("#log p").all_inner_texts()
-            fetched_lines = [line for line in log_lines if line.startswith("Fetched")]
+            page.wait_for_function(
+                "document.querySelectorAll('#pages-list p').length >= 2", timeout=5000
+            )
+            fetched_lines = page.locator("#pages-list p").all_inner_texts()
             assert len(fetched_lines) == 2
+            assert all(line.startswith("Fetched") for line in fetched_lines)
 
             page.wait_for_function(
                 "document.getElementById('run-button').disabled === false", timeout=5000
@@ -371,7 +375,11 @@ def test_run_button_disables_during_crawl_and_log_updates_live(live_server):
 
 def _fetched_count(page) -> int:
     return len(
-        [line for line in page.locator("#log p").all_inner_texts() if line.startswith("Fetched")]
+        [
+            line
+            for line in page.locator("#pages-list p").all_inner_texts()
+            if line.startswith("Fetched")
+        ]
     )
 
 
@@ -405,7 +413,7 @@ def test_pause_resume_stop_controls(live_server_pausable):
             page.wait_for_function("!document.getElementById('pause-button').disabled")
             assert stop_button.is_enabled()
 
-            page.wait_for_selector("#log p:has-text('Fetched')")
+            page.wait_for_selector("#pages-list p:has-text('Fetched')")
             pause_button.click()
             page.wait_for_selector("#log p:has-text('Crawl paused')")
 
@@ -433,7 +441,7 @@ def test_pause_resume_stop_controls(live_server_pausable):
             assert stop_button.is_enabled()
 
             page.wait_for_function(
-                f"Array.from(document.querySelectorAll('#log p')).filter("
+                f"Array.from(document.querySelectorAll('#pages-list p')).filter("
                 f"p => p.textContent.startsWith('Fetched')).length > {count_at_pause}",
                 timeout=3000,
             )
@@ -587,7 +595,7 @@ def test_results_filter_bar_always_visible(live_server_pausable):
 
             # Visible while running, with zero matches found so far --
             # the table itself is still hidden at this point.
-            page.wait_for_selector("#log p:has-text('Fetched')")
+            page.wait_for_selector("#pages-list p:has-text('Fetched')")
             assert page.locator("#results-filter-container").is_visible()
             assert not page.locator("#results-table").is_visible()
 
@@ -597,5 +605,143 @@ def test_results_filter_bar_always_visible(live_server_pausable):
                 "document.getElementById('run-button').disabled === false", timeout=5000
             )
             assert page.locator("#results-filter-container").is_visible()
+        finally:
+            browser.close()
+
+
+PAGES_FILTER_MATCH_VALUE = "VISUALPING{ffffffffffffffff}"
+
+
+class _PagesFilterFakeRepository:
+    def get_matches(self):
+        return []
+
+    def get_snapshot(self, url):
+        return None
+
+
+class _PagesFilterFakeOrchestrator:
+    """Fetches three pages (app.js, secret.js, notes.txt), then -- only
+    after all three page_fetched events have already fired -- emits a
+    single MATCH_FOUND for secret.js. Proves the crawled pages list's
+    password-found filter state updates retroactively on an
+    already-rendered entry, and that the text filter's multi-term AND
+    logic (e.g. "js secret") only matches the one URL containing both
+    substrings."""
+
+    def __init__(self, event_bus, base_url: str) -> None:
+        self._event_bus = event_bus
+        self._base_url = base_url
+
+    async def run(self) -> CrawlSummary:
+        pages = [
+            PageResult(
+                url=self._base_url + name, status_code=200, fetched_at=datetime.now(timezone.utc)
+            )
+            for name in ("app.js", "secret.js", "notes.txt")
+        ]
+        for page in pages:
+            await asyncio.sleep(0.15)
+            self._event_bus.publish(PAGE_FETCHED, page)
+
+        await asyncio.sleep(0.15)
+        match = PasswordMatch(
+            value=PAGES_FILTER_MATCH_VALUE,
+            source_type=SourceType.HTML_TEXT,
+            source_url=self._base_url + "secret.js",
+            context_before="before",
+            context_after="after",
+            locator="line:1,col:0",
+        )
+        self._event_bus.publish(MATCH_FOUND, match)
+
+        summary = CrawlSummary(
+            pages_visited=3,
+            resources_checked=3,
+            unique_passwords_found=1,
+            queue_empty=True,
+            started_at=datetime.now(timezone.utc),
+            finished_at=datetime.now(timezone.utc),
+        )
+        self._event_bus.publish(CRAWL_FINISHED, summary)
+        return summary
+
+
+@pytest.fixture
+def live_server_pages_filter(monkeypatch):
+    async def fake_build_orchestrator(request, event_bus):
+        orchestrator = _PagesFilterFakeOrchestrator(event_bus, str(request.url))
+
+        async def cleanup() -> None:
+            return None
+
+        return orchestrator, _PagesFilterFakeRepository(), cleanup
+
+    yield from _run_live_server(monkeypatch, fake_build_orchestrator)
+
+
+def test_pages_list_filters_by_password_state_and_and_combined_text(live_server_pages_filter):
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(live_server_pages_filter + "/")
+
+            page.fill("#url", "https://example.com")
+            page.fill("#username", "alice")
+            page.fill("#password", "s3cret")
+            page.click("#run-button")
+
+            # All three pages fetched, but the match_found for secret.js
+            # hasn't arrived yet -- every entry must count as "no password"
+            # at this point, not just "unknown."
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 3")
+            page.select_option("#pages-password-filter", "has")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 0")
+            page.select_option("#pages-password-filter", "none")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 3")
+            page.select_option("#pages-password-filter", "all")
+
+            # Crawl only finishes after the match_found for secret.js fires.
+            page.wait_for_selector("#log p:has-text('Crawl finished')", timeout=3000)
+
+            # Retroactive update: secret.js's row (already rendered before
+            # the match arrived) now counts as "has password" with no new
+            # page_fetched event needed for it.
+            page.select_option("#pages-password-filter", "has")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 1")
+            assert "secret.js" in page.locator("#pages-list p").inner_text()
+
+            page.select_option("#pages-password-filter", "none")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 2")
+            none_lines = page.locator("#pages-list p").all_inner_texts()
+            assert all("secret.js" not in line for line in none_lines)
+
+            page.select_option("#pages-password-filter", "all")
+
+            # Multi-term AND text search: "js secret" matches only the URL
+            # containing BOTH substrings -- app.js has "js" but not
+            # "secret", notes.txt has neither.
+            page.fill("#pages-filter", "js secret")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 1")
+            assert "secret.js" in page.locator("#pages-list p").inner_text()
+
+            page.fill("#pages-filter", "js")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 2")
+
+            # The two filters combine with AND: text-matches "js secret"
+            # (secret.js only) intersected with "no password" (excludes
+            # secret.js) leaves nothing.
+            page.select_option("#pages-password-filter", "none")
+            page.fill("#pages-filter", "js secret")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 0")
+
+            page.select_option("#pages-password-filter", "has")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 1")
+
+            # Clearing both filters restores every fetched page.
+            page.fill("#pages-filter", "")
+            page.select_option("#pages-password-filter", "all")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 3")
         finally:
             browser.close()
