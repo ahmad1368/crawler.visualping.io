@@ -147,10 +147,17 @@ it does not read TARGET_URL/AUTH_USERNAME/AUTH_PASSWORD from the environment)
                 │   ImageLsbExtractor, Base64HexExtractor,
                 │   ReversedTextExtractor, Rot13Extractor,
                 │   BinaryFallbackExtractor (each calls find_passwords()
-                │   from app/matching.py; ImageOcrExtractor runs Tesseract
-                │   over the decoded image and scans whatever text it
-                │   recognizes -- reads a password drawn as pixels rather
-                │   than present as parseable text/metadata;
+                │   from app/matching.py; ImageOcrExtractor upscales +
+                │   grayscales + thresholds the decoded image (issue #109),
+                │   then runs Tesseract under both --psm 6 and --psm 11 and
+                │   merges the two passes' matches -- reads a password
+                │   drawn as pixels rather than present as parseable
+                │   text/metadata, now robust to small/low-resolution
+                │   renders that a single bare OCR pass previously
+                │   mis-read; an optional vision-model fallback hook exists
+                │   (unwired by default -- would call an external API with
+                │   crawled image content, see issue #109's own section
+                │   below) for when OCR alone finds nothing;
                 │   ImageStructuralExtractor, issue #101, hand-parses
                 │   JPEG COM segments and PNG tEXt/zTXt/iTXt chunks --
                 │   zlib-decompresses a chunk before searching it;
@@ -2541,4 +2548,135 @@ demonstrated an actual need for it against a real image.
   untouched by either filter -- only `page_fetched` entries moved into
   the new filterable list, per the issue's own scoping. No change to the
   results-table filter (#86/#91).
+
+## Issue #109: OCR accuracy hardening -- preprocessing, multi-PSM, logged failures, vision-fallback hook
+
+- **Context:** `ImageOcrExtractor` (predates a tracked issue number, part
+  of the #82-85 batch) already existed and was re-confirmed present but
+  explicitly *not* hardened during #101's Layer 2 ("Grayscale/threshold/
+  contrast preprocessing before OCR is a known, explicitly-deferred
+  future enhancement... not added here since nothing in this request
+  demonstrated an actual need for it against a real image"). This issue
+  is that demonstrated need: a bare `pytesseract.image_to_string(image)`
+  call against a real target's `static/img/whiteboard-scan.png` (flag
+  `VISUALPING{e1c2e40cf01c17cc}`, drawn as rendered text with no
+  corresponding byte sequence anywhere in the file) reportedly missed it,
+  found only by eye.
+- **Inputs:** unchanged -- `content: bytes`, `content_type: str`, `url:
+  str`, same as every extractor.
+- **Transformation (`app/extractors/image_ocr.py`, rewritten):**
+  - New `_preprocess()`: converts to grayscale, upscales 4x
+    (`Image.Resampling.LANCZOS`), then binarizes with a fixed threshold
+    (150/255). A *fixed* global threshold is a deliberate simplification,
+    documented in-code -- it assumes reasonably even lighting across the
+    text region; per-region adaptive thresholding would handle a
+    shadowed/unevenly-lit photo better but is out of scope here.
+  - Runs Tesseract twice over the preprocessed image, once per page-
+    segmentation mode (`--psm 6`: uniform text block, `--psm 11`: sparse
+    text), then runs `find_passwords()` over *both* outputs and merges,
+    deduping by `match.value` so a password read identically by both
+    passes (the common case) produces one `PasswordMatch`, not two --
+    verified by `test_matching_text_found_by_both_psm_passes_is_not_
+    duplicated`, which would otherwise inflate `count_in_page` purely
+    from an internal implementation detail, not a real second occurrence
+    in the image.
+  - OCR failures are now logged (`logger.warning`, `app.extractors.
+    image_ocr`) instead of silently degrading to `[]` with no signal.
+    `TesseractNotFoundError` (binary missing entirely) short-circuits
+    after one attempt rather than retrying the second PSM config and
+    logging twice; a per-config `TesseractError` logs and lets the loop
+    continue trying the other PSM.
+  - New `VisionFallback` hook: an optional `Callable[[bytes, str, str],
+    list[str]]` constructor param, tried only when the OCR passes above
+    find nothing, its returned strings scanned with the same
+    `find_passwords()` call, results tagged `locator="vision:offset:N"`
+    (vs. `"ocr:offset:N"`) so an operator can tell how a given match was
+    found. **Deliberately not wired to any concrete vision API/model by
+    default** (`vision_fallback=None` at both `app/api/routes.py` call
+    sites, unchanged) -- doing so would send crawled, potentially
+    sensitive image content to an external third-party service, which
+    conflicts with this project's standing data-flow boundary: no
+    outbound network calls beyond the target site being crawled (see the
+    data-flow watchlist). Left as an injectable extension point instead,
+    per the issue's own framing of the vision pass as "a fallback, not
+    the primary path" and "the extensibility point if a future target
+    needs more than plain OCR" -- an operator who has evaluated and
+    approved a specific provider can wire it in at the two `routes.py`
+    call sites without touching this extractor again.
+- **Outputs:** same `SourceType.IMAGE_OCR` as before (no new source
+  type) -- both a bare-OCR hit and a vision-fallback hit are tagged
+  `image_ocr`, distinguished only by the `locator` prefix. Considered a
+  separate `SourceType` for the fallback path but didn't add one: no
+  concrete fallback implementation ships in this change, so a second
+  enum value with no reachable producer would just be UI/model surface
+  with nothing behind it; revisit if/when a real vision-fallback client
+  is actually wired in.
+  **Data-flow/security note (per the data-flow watchlist):** no new
+  outbound network calls -- the vision-fallback hook is unwired by
+  default, and calling it out explicitly above is exactly the kind of
+  hit this watchlist exists to surface, even though the shipped default
+  behavior doesn't trigger it. Preprocessing/OCR/matching all happen
+  in-process on already-fetched image bytes, same trust boundary as the
+  original `ImageOcrExtractor`.
+- **Tests:** `tests/test_image_ocr_extractor.py` expanded from 4 to 12
+  tests. Kept the original 4 (simple 48pt render, non-image content-type,
+  blank image, unparseable bytes). New: `_render_text_image()` rewritten
+  to auto-size its canvas from the font's actual text bbox instead of a
+  fixed width/height -- a fixed canvas at a small font size clips the
+  text and garbles OCR for reasons unrelated to what this suite tests
+  (caught empirically while writing the regression test below, see next
+  bullet). New:
+  - `test_preprocess_upscales_and_binarizes_to_black_and_white` --
+    `_preprocess()` in isolation, no Tesseract needed.
+  - `test_reads_small_rendered_password_via_preprocessing_and_multi_psm`
+    -- the primary regression test, using the exact real-world flag value
+    and a `whiteboard-scan.png` URL (the real target's file itself
+    wasn't available to use directly, per this project's recurring "no
+    target URL/credentials available this session" constraint, so this
+    is the closest faithful synthetic substitute). `font_size=18` was
+    chosen empirically, run locally against a real Tesseract 5.4.0
+    install with the binary temporarily added to PATH: a bare
+    `pytesseract.image_to_string()` call with no preprocessing misreads
+    a character as the Unicode replacement character on this exact
+    image, while `ImageOcrExtractor.extract()` (preprocessing + both PSM
+    passes) reads it correctly -- confirming the fixture actually
+    exercises the fix rather than just OCR's baseline accuracy on an
+    easy image. (This machine doesn't have Tesseract on PATH normally --
+    every prior test run this session showed "4 skipped (OCR/Tesseract)"
+    -- but the binary turned out to already be installed at `C:\Program
+    Files\Tesseract-OCR`, just not on PATH; added it for this session to
+    actually run and verify these tests rather than trust them unverified.
+    CI already installs `tesseract-ocr` via apt, issue #27.)
+  - `test_matching_text_found_by_both_psm_passes_is_not_duplicated` --
+    mocks `pytesseract.image_to_string` to return the same text for both
+    PSM calls, asserts exactly one merged match.
+  - `test_gradient_images_produce_no_false_positives` -- two plain
+    gradient PNGs (mirroring the real target's other, text-free images)
+    produce zero matches.
+  - `test_ocr_failure_is_logged_and_degrades_to_no_matches` /
+    `test_tesseract_not_found_is_logged_once_and_degrades_to_no_matches`
+    -- mock `pytesseract.image_to_string` to raise `TesseractError` /
+    `TesseractNotFoundError`, assert a `caplog` warning and `[]` returned
+    (the latter also asserts exactly one call, not two, proving the
+    short-circuit).
+  - `test_vision_fallback_used_only_when_ocr_finds_nothing` -- a blank
+    image (OCR finds nothing) with a fallback returning text containing
+    the password produces a `vision:offset:` match; a rendered-text image
+    (OCR already succeeds) paired with a fallback that raises if called
+    proves the fallback is never invoked when OCR already found a match.
+  - `test_vision_fallback_failure_is_logged_and_degrades_to_no_matches` --
+    a raising fallback logs a warning and degrades to `[]` rather than
+    propagating.
+  Full suite (with Tesseract available): 301 passed, 0 skipped (vs. 289
+  passed/4 skipped every prior run this session, since this file's tests
+  were the ones being skipped); ruff/black/mypy clean.
+- **Not implemented / explicitly out of scope:** no concrete vision-API
+  client is wired in (see the data-flow note above -- the hook exists,
+  nothing calls it by default). Adaptive/per-region thresholding, angle
+  correction/deskew, and handwriting-specific OCR tuning are not
+  implemented -- the issue's own acceptance criteria center on the
+  reported whiteboard-scan.png case (small/low-resolution rendered
+  monospace-looking text), which the preprocessing + multi-PSM merge
+  addresses; a genuinely handwritten or rotated sample would still rely
+  on the (currently unwired) vision-fallback extension point.
 
