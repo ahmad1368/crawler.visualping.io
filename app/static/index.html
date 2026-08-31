@@ -78,7 +78,7 @@
     border-color: var(--accent-disabled);
     cursor: not-allowed;
   }
-  #log {
+  #log, #pages-list {
     margin-top: 1.5rem;
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -89,13 +89,33 @@
     font-size: 0.8rem;
     background: #fafafa;
   }
-  #log p { margin: 0 0 0.25rem 0; }
-  #log a {
+  #log p, #pages-list p { margin: 0 0 0.25rem 0; }
+  #log a, #pages-list a {
     color: var(--accent);
     text-decoration: none;
   }
-  #log a:hover {
+  #log a:hover, #pages-list a:hover {
     text-decoration: underline;
+  }
+  #pages-filter-container {
+    margin-top: 1.5rem;
+    display: flex;
+    gap: 0.75rem;
+    align-items: flex-end;
+  }
+  #pages-filter-container > div {
+    flex: 1;
+  }
+  #pages-filter-container label {
+    margin-top: 0;
+  }
+  select {
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 0.95rem;
+    background: #fff;
   }
   #summary-panel {
     margin-top: 1.5rem;
@@ -265,6 +285,26 @@
       </div>
     </div>
     <div id="log" aria-live="polite"></div>
+    <div id="pages-filter-container">
+      <div>
+        <label for="pages-filter">Filter crawled pages</label>
+        <input
+          id="pages-filter"
+          type="search"
+          autocomplete="off"
+          placeholder="e.g. js secret"
+        />
+      </div>
+      <div>
+        <label for="pages-password-filter">Password</label>
+        <select id="pages-password-filter">
+          <option value="all">All</option>
+          <option value="has">Has password</option>
+          <option value="none">No password</option>
+        </select>
+      </div>
+    </div>
+    <div id="pages-list" aria-live="polite"></div>
     <div id="results-filter-container">
       <label for="results-filter">Filter results</label>
       <input
@@ -308,6 +348,9 @@
     const resultsTable = document.getElementById("results-table");
     const resultsBody = document.getElementById("results-body");
     const resultsFilterInput = document.getElementById("results-filter");
+    const pagesList = document.getElementById("pages-list");
+    const pagesFilterInput = document.getElementById("pages-filter");
+    const pagesPasswordFilterSelect = document.getElementById("pages-password-filter");
     const summaryPanel = document.getElementById("summary-panel");
     const summaryPagesVisited = document.getElementById("summary-pages-visited");
     const summaryResourcesChecked = document.getElementById("summary-resources-checked");
@@ -339,6 +382,12 @@
     // All matches known so far (live WebSocket rows or the final report),
     // unfiltered -- the source of truth the search box filters against.
     let currentMatches = [];
+    // Every page_fetched entry seen so far, keyed by URL (Map preserves
+    // insertion order for iteration) -- the source of truth the crawled
+    // pages filter below narrows. hasPassword starts false and can flip
+    // to true later, retroactively, when a match_found event for that
+    // URL arrives (issue #107).
+    let currentPagesByUrl = new Map();
     let liveResourcesChecked = 0;
     let livePasswordValues = new Set();
     // Mirrors the backend's (source_url, value) grouping from
@@ -519,23 +568,83 @@
       log.scrollTop = log.scrollHeight;
     }
 
-    // Same as appendLog, but for a page_fetched entry: a real <a href>
-    // to the fetched URL (not a styled button/JS-only handler), so the
-    // operator can click -- or middle-click, or right-click "open in new
-    // tab" -- to see exactly what the crawl visited. Opens in a new tab;
-    // the target site's Basic Auth prompt appears once per browser
-    // session (cached per-origin after that), not on every click.
+    // Records/updates a page_fetched entry in currentPagesByUrl and
+    // re-renders the (possibly filtered) crawled pages list. Each entry
+    // is a real <a href> to the fetched URL (not a styled button/JS-only
+    // handler), so the operator can click -- or middle-click, or
+    // right-click "open in new tab" -- to see exactly what the crawl
+    // visited. Opens in a new tab; the target site's Basic Auth prompt
+    // appears once per browser session (cached per-origin after that),
+    // not on every click.
     function appendPageLink(url, statusCode) {
-      const line = document.createElement("p");
-      const link = document.createElement("a");
-      link.href = url;
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
-      link.textContent = "Fetched " + url + " (" + statusCode + ")";
-      line.appendChild(link);
-      log.appendChild(line);
-      log.scrollTop = log.scrollHeight;
+      const existing = currentPagesByUrl.get(url);
+      currentPagesByUrl.set(url, {
+        url,
+        statusCode,
+        hasPassword: existing ? existing.hasPassword : false,
+      });
+      applyPagesFilter();
     }
+
+    // Called on each match_found WebSocket message -- flips the matching
+    // page's hasPassword state, even if that page's row was already
+    // rendered (a page can be fetched well before its own match arrives,
+    // e.g. the post-crawl content-negotiation probe re-checking an
+    // already-fetched URL). If no page_fetched entry exists yet for this
+    // URL, records one with statusCode unknown rather than dropping it.
+    function markPageHasPassword(url) {
+      const existing = currentPagesByUrl.get(url);
+      if (existing && existing.hasPassword) {
+        return;
+      }
+      currentPagesByUrl.set(url, {
+        url,
+        statusCode: existing ? existing.statusCode : null,
+        hasPassword: true,
+      });
+      applyPagesFilter();
+    }
+
+    // "Contains" AND search: the query box's value is split on whitespace
+    // into terms, and every term must be a substring of the URL for the
+    // page to match -- e.g. "js secret" only matches a URL containing
+    // both "js" and "secret" somewhere, not either alone.
+    function pageMatchesFilter(pageEntry, terms, passwordState) {
+      if (passwordState === "has" && !pageEntry.hasPassword) {
+        return false;
+      }
+      if (passwordState === "none" && pageEntry.hasPassword) {
+        return false;
+      }
+      const urlLower = pageEntry.url.toLowerCase();
+      return terms.every((term) => urlLower.includes(term));
+    }
+
+    // Re-applies the current text + password-state filters to
+    // currentPagesByUrl and re-renders. Called on every page_fetched,
+    // match_found, and filter-control change.
+    function applyPagesFilter() {
+      const terms = pagesFilterInput.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const passwordState = pagesPasswordFilterSelect.value;
+      pagesList.innerHTML = "";
+      for (const pageEntry of currentPagesByUrl.values()) {
+        if (!pageMatchesFilter(pageEntry, terms, passwordState)) {
+          continue;
+        }
+        const line = document.createElement("p");
+        const link = document.createElement("a");
+        link.href = pageEntry.url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = "Fetched " + pageEntry.url + " (" + pageEntry.statusCode + ")";
+        line.appendChild(link);
+        pagesList.appendChild(line);
+      }
+      pagesList.scrollTop = pagesList.scrollHeight;
+    }
+
+    pagesFilterInput.addEventListener("input", applyPagesFilter);
+    pagesPasswordFilterSelect.addEventListener("change", applyPagesFilter);
 
     // Case-insensitive substring ("contains") match against the page URL --
     // the column that carries the file path, e.g. entering "js" matches
@@ -626,6 +735,10 @@
       resultsTable.style.display = "none";
       resultsFilterInput.value = "";
       currentMatches = [];
+      pagesList.innerHTML = "";
+      pagesFilterInput.value = "";
+      pagesPasswordFilterSelect.value = "all";
+      currentPagesByUrl = new Map();
       closeSnapshotViewer();
       resetSummaryPanel();
       appendLog("Starting crawl...");
@@ -671,6 +784,7 @@
           livePasswordValues.add(message.payload.value);
           summaryPasswordsFound.textContent = livePasswordValues.size;
           recordLiveMatch(message.payload);
+          markPageHasPassword(message.payload.source_url);
         } else if (message.type === "crawl_finished") {
           appendLog("Crawl finished.");
           setControlsForState("idle");

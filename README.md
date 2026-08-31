@@ -283,3 +283,9 @@ backfilling #1-28/#61/#63, which that report already covers in full).
   substitution. `HeaderCookieExtractor` also gained the same three
   transforms for header/cookie values. (JS char-code decoding already
   existed, issue #83; verified still correct, untouched.)
+- #107: A second, independent filter above the crawled pages list
+  (separate from #86/#91's results-table filter) -- an all/has-password/
+  no-password selector plus a text box whose space-separated terms all
+  AND together as substring matches against the URL. Password state
+  updates retroactively as `match_found` events arrive for an
+  already-rendered page.
