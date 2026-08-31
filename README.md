@@ -11,6 +11,16 @@ that jumps straight to where each password was found.
 
 - Python 3.11+
 - A Chromium install for Playwright (see Setup)
+- The Tesseract OCR binary on `PATH` (used to read passwords drawn as
+  image pixels -- e.g. a screenshot or scanned whiteboard -- rather than
+  present as parseable text/metadata). Debian/Ubuntu:
+  `sudo apt-get install tesseract-ocr`; macOS: `brew install tesseract`;
+  Windows: install via [winget](https://github.com/UB-Mannheim/tesseract)
+  (`winget install --id UB-Mannheim.TesseractOCR`) or
+  [choco](https://community.chocolatey.org/packages/tesseract)
+  (`choco install tesseract`), then ensure the install directory is on
+  `PATH`. If it's missing, `ImageOcrExtractor` degrades to finding no
+  matches rather than failing the crawl.
 
 ## Setup
 
@@ -34,9 +44,7 @@ WebSocket route onto the shared FastAPI app before the server starts.
 
 ### Using the UI
 
-1. Fill in the target URL, the site's Basic Auth username/password, and a
-   context length (how many characters of surrounding text to capture
-   around each match).
+1. Fill in the target URL and the site's Basic Auth username/password.
 2. Click **Run**. The button stays disabled and a live log streams one
    line per page/resource fetched and per password found, over the
    `/ws/crawls/{id}` WebSocket.
@@ -207,3 +215,91 @@ about:
   They exist only in memory for the duration of a crawl (as request
   parameters, then as `httpx`/Playwright auth objects) and in the
   Authorization header sent to the target site itself.
+
+## Implemented so far
+
+A running one-line-per-issue list for work landing after the original
+28-issue backlog (see `docs/DATA_FLOW_REPORT.md` for the full history and
+per-issue detail; this list starts fresh from here rather than
+backfilling #1-28/#61/#63, which that report already covers in full).
+
+- #68: Pause, stop, and resume controls alongside Run, in the UI and via
+  three new `POST /crawls/{id}/{pause,resume,stop}` endpoints.
+- #69: Results table now populates live from `match_found` WebSocket
+  events as the crawl runs, instead of waiting for it to finish.
+- #70: Verified (no code change) that the same password on two distinct
+  pages already lists as two separate rows, not collapsed into one.
+- #71: `max_pages`/new `max_duration_seconds` now default to `None` --
+  a crawl runs until its frontier actually empties, not a guessed cap.
+- #72: New `POST /crawls/{id}/re-extract` re-runs extraction against a
+  crawl's already-stored pages -- no live re-fetch needed after tuning
+  an extractor.
+- #78: `PaginationGuard` now stops a pagination family on a lack of new
+  *matches* (not just links), plus an always-on hard per-family page cap
+  -- defeats an adversarial family that fakes novelty forever.
+- #80: Each fetched-page log entry is now a real `<a href>` opening the
+  page in a new tab, so you can browse exactly what the crawl visited.
+- #86: A search box above the results table filters rows client-side by
+  a case-insensitive substring match against the page URL.
+- #91: That search box now always stays visible above the results list,
+  regardless of whether any matches exist yet.
+- #87: Re-verified the cache/replay path (#72); found and fixed #93 in
+  the process (`JsCharCodeExtractor` was used but never imported,
+  breaking every real crawl and `/re-extract` call).
+- #88: Re-verified `PaginationGuard` (#78); found and fixed a real
+  coverage regression -- an index/listing family with no direct password
+  matches was wrongly treated as unproductive and cut off, silently
+  dropping every content page its later listing pages would have
+  surfaced. `PaginationGuard` now also counts new links to content
+  outside the family as productive.
+- #96: Removed the "Context length" field -- no longer user-configurable,
+  fixed internally at its old default (80 characters).
+- #99: A post-crawl static-asset completeness audit re-scans every
+  fetched page's stored text for `/static/...` references structural
+  link discovery might have missed, fetches any gap, and reports
+  coverage on `CrawlSummary.asset_completeness`.
+- #101: New `ImageStructuralExtractor` hand-parses JPEG `COM` segments
+  and PNG `tEXt`/`zTXt`/`iTXt` chunks, decompressing zlib-compressed
+  chunks and trying UTF-16/UTF-8/ASCII decodings -- finds passwords no
+  existing extractor could reach (a compressed chunk is invisible to any
+  plain-text scan until decompressed). Issue expanded mid-flight into a
+  unified multi-layer pipeline: Layer 2 (visual OCR) was already
+  shipped; new `ImageLsbExtractor` (Layer 3) reads the least-significant
+  bit of every pixel color channel to detect classic LSB steganography
+  -- a message hidden nowhere as text at all, only in raw pixel values.
+- #103: New `RedirectExtractor` scans intermediate redirect `Location`
+  headers (previously discarded once the final page loaded);
+  `ClientStorageExtractor` snapshots each page's `document.cookie`/
+  `localStorage`/`sessionStorage`; a post-crawl content-negotiation
+  probe re-requests a sample of pages with alternate `Accept`/
+  `X-Requested-With` headers looking for an alternate representation
+  with a hidden payload.
+- #89: Re-verified the clickable fetched-page log links (#80) after six
+  later issues touched the same file -- still correct, no code change
+  needed.
+- #98: New `Base64HexExtractor`/`ReversedTextExtractor`/`Rot13Extractor`
+  decode/transform text before re-checking it for a flag -- catches a
+  password hidden via Base64/hex encoding, written backwards, or ROT13
+  substitution. `HeaderCookieExtractor` also gained the same three
+  transforms for header/cookie values. (JS char-code decoding already
+  existed, issue #83; verified still correct, untouched.)
+- #107: A second, independent filter above the crawled pages list
+  (separate from #86/#91's results-table filter) -- an all/has-password/
+  no-password selector plus a text box whose space-separated terms all
+  AND together as substring matches against the URL. Password state
+  updates retroactively as `match_found` events arrive for an
+  already-rendered page.
+- #109: Hardened `ImageOcrExtractor` (upscale + grayscale + threshold
+  preprocessing, merged `--psm 6`/`--psm 11` passes) to catch small/
+  low-resolution rendered flags a bare single-pass OCR call could
+  misread. OCR failures are now logged instead of silently swallowed,
+  and an optional (unwired by default) vision-model fallback hook exists
+  for images plain OCR can't read. Follow-up (same issue): a Tesseract
+  character whitelist fixed a real-target misread (`1`/`l`, `0`/`O`
+  confusion) that preprocessing tuning alone couldn't have -- verified
+  against the actual target image via the #72 replay path.
+- #112: Fixed `PaginationGuard` being defeated by a trailing-slash
+  mismatch between a real page's fetched URL and its own pager links --
+  `pagination_family_key()` now canonicalizes through
+  `UrlFrontier.normalize_url()` so both spellings collapse to one family,
+  restoring the ~10-page cap on genuine no-match pagination traps.

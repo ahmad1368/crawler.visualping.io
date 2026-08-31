@@ -201,4 +201,6 @@ def test_message_envelope_and_payload_shapes_match_the_full_contract():
         "queue_empty",
         "started_at",
         "finished_at",
+        "asset_completeness",
+        "content_negotiation",
     }

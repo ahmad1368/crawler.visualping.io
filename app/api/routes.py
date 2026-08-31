@@ -24,20 +24,36 @@ from app.crawler.browser_fetcher import BrowserFetcher
 from app.crawler.fetcher import HttpFetcher
 from app.crawler.frontier import UrlFrontier
 from app.crawler.orchestrator import Orchestrator
+from app.crawler.replay import replay_extraction
 from app.events import CRAWL_FINISHED, EventBus
 from app.extractors.base import ExtractorRegistry
+from app.extractors.base64_hex import Base64HexExtractor
 from app.extractors.binary_fallback import BinaryFallbackExtractor
+from app.extractors.client_storage import ClientStorageExtractor
 from app.extractors.css_js import CssJsExtractor
 from app.extractors.headers_cookies import HeaderCookieExtractor
 from app.extractors.html import HtmlExtractor
 from app.extractors.image_exif import ImageExifExtractor
-from app.models import CrawlSummary
+from app.extractors.image_lsb import ImageLsbExtractor
+from app.extractors.image_ocr import ImageOcrExtractor
+from app.extractors.image_structural import ImageStructuralExtractor
+from app.extractors.js_charcode import JsCharCodeExtractor
+from app.extractors.redirect_chain import RedirectExtractor
+from app.extractors.reversed_text import ReversedTextExtractor
+from app.extractors.rot13 import Rot13Extractor
+from app.models import CrawlSummary, PasswordMatch
 from app.storage.repository import Repository
 from app.storage.sqlite import SqliteRepository
 
 app = FastAPI()
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
+# How many characters of surrounding text each extractor captures around a
+# match. Previously a per-crawl request field ("Context length" in the UI)
+# -- removed as a user-facing setting (not useful in practice), fixed at
+# its old default instead.
+_CONTEXT_CHARS = 80
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -47,6 +63,9 @@ async def index() -> str:
 
 class CrawlStatus(str, Enum):
     RUNNING = "running"
+    PAUSED = "paused"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
     FINISHED = "finished"
     FAILED = "failed"
 
@@ -55,7 +74,12 @@ class CrawlRequest(BaseModel):
     url: HttpUrl
     username: str = Field(min_length=1)
     password: str = Field(min_length=1)
-    context_chars: int = 80
+    # Both None by default (issue #71): completion is the frontier
+    # actually emptying, not a guessed page count -- see
+    # Orchestrator's module docstring. Either can still be set as an
+    # explicit opt-in ceiling.
+    max_pages: int | None = None
+    max_duration_seconds: float | None = None
 
 
 class CrawlCreatedResponse(BaseModel):
@@ -94,6 +118,7 @@ class _CrawlState:
         self.error: str | None = None
         self.event_bus = EventBus()
         self.repository: Repository | None = None
+        self.orchestrator: Orchestrator | None = None
 
 
 _crawls: dict[str, _CrawlState] = {}
@@ -113,10 +138,17 @@ async def _build_orchestrator(request: CrawlRequest, event_bus: EventBus):
 
     frontier = UrlFrontier(str(request.url))
     registry = ExtractorRegistry()
-    registry.register(HtmlExtractor(context_chars=request.context_chars))
-    registry.register(CssJsExtractor(context_chars=request.context_chars))
-    registry.register(ImageExifExtractor(context_chars=request.context_chars))
-    registry.register(BinaryFallbackExtractor(context_chars=request.context_chars))
+    registry.register(HtmlExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(CssJsExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(JsCharCodeExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ImageExifExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ImageStructuralExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ImageOcrExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ImageLsbExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(Base64HexExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ReversedTextExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(Rot13Extractor(context_chars=_CONTEXT_CHARS))
+    registry.register(BinaryFallbackExtractor(context_chars=_CONTEXT_CHARS))
 
     repository = SqliteRepository(sqlite3.connect(f"crawl_{uuid.uuid4().hex}.db"))
     orchestrator = Orchestrator(
@@ -124,8 +156,12 @@ async def _build_orchestrator(request: CrawlRequest, event_bus: EventBus):
         http_fetcher=HttpFetcher(client, request.username, request.password),
         browser_fetcher=BrowserFetcher(browser, request.username, request.password),
         extractor_registry=registry,
-        header_cookie_extractor=HeaderCookieExtractor(context_chars=request.context_chars),
+        header_cookie_extractor=HeaderCookieExtractor(context_chars=_CONTEXT_CHARS),
+        redirect_extractor=RedirectExtractor(context_chars=_CONTEXT_CHARS),
+        client_storage_extractor=ClientStorageExtractor(context_chars=_CONTEXT_CHARS),
         repository=repository,
+        max_pages=request.max_pages,
+        max_duration_seconds=request.max_duration_seconds,
         event_bus=event_bus,
     )
 
@@ -141,10 +177,22 @@ async def _run_crawl(crawl_id: str, request: CrawlRequest) -> None:
     state = _crawls[crawl_id]
     try:
         orchestrator, repository, cleanup = await _build_orchestrator(request, state.event_bus)
+        state.orchestrator = orchestrator
         state.repository = repository
         try:
             state.report = await orchestrator.run()
-            state.status = CrawlStatus.FINISHED
+            # A user-initiated stop (see stop_crawl()) already moved this to
+            # STOPPING before run() returned early -- finalize to STOPPED
+            # rather than clobbering it back to a plain FINISHED. The
+            # transitional STOPPING (as opposed to setting STOPPED directly
+            # in stop_crawl()) exists so GET /report's "report is set once
+            # status is terminal" guarantee holds: report is only ever
+            # assigned right here, one line before this status flip.
+            state.status = (
+                CrawlStatus.STOPPED
+                if state.status is CrawlStatus.STOPPING
+                else CrawlStatus.FINISHED
+            )
         finally:
             await cleanup()
     except Exception as exc:
@@ -171,25 +219,101 @@ async def get_crawl_status(crawl_id: str) -> CrawlStatusResponse:
     return CrawlStatusResponse(crawl_id=crawl_id, status=state.status)
 
 
+def _require_running_crawl(crawl_id: str) -> _CrawlState:
+    state = _crawls.get(crawl_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="crawl not found")
+    if state.orchestrator is None:
+        raise HTTPException(status_code=409, detail="crawl has not started yet")
+    return state
+
+
+@app.post("/crawls/{crawl_id}/pause", response_model=CrawlStatusResponse)
+async def pause_crawl(crawl_id: str) -> CrawlStatusResponse:
+    state = _require_running_crawl(crawl_id)
+    if state.status is not CrawlStatus.RUNNING:
+        raise HTTPException(status_code=409, detail=f"cannot pause a crawl that is {state.status}")
+    assert state.orchestrator is not None
+    state.orchestrator.pause()
+    state.status = CrawlStatus.PAUSED
+    return CrawlStatusResponse(crawl_id=crawl_id, status=state.status)
+
+
+@app.post("/crawls/{crawl_id}/resume", response_model=CrawlStatusResponse)
+async def resume_crawl(crawl_id: str) -> CrawlStatusResponse:
+    state = _require_running_crawl(crawl_id)
+    if state.status is not CrawlStatus.PAUSED:
+        raise HTTPException(status_code=409, detail=f"cannot resume a crawl that is {state.status}")
+    assert state.orchestrator is not None
+    state.orchestrator.resume()
+    state.status = CrawlStatus.RUNNING
+    return CrawlStatusResponse(crawl_id=crawl_id, status=state.status)
+
+
+@app.post("/crawls/{crawl_id}/stop", response_model=CrawlStatusResponse)
+async def stop_crawl(crawl_id: str) -> CrawlStatusResponse:
+    state = _require_running_crawl(crawl_id)
+    if state.status not in (CrawlStatus.RUNNING, CrawlStatus.PAUSED):
+        raise HTTPException(status_code=409, detail=f"cannot stop a crawl that is {state.status}")
+    assert state.orchestrator is not None
+    state.orchestrator.stop()
+    # Transitional, not the terminal STOPPED -- run()'s in-flight work (e.g.
+    # a URL mid-fetch on another worker) hasn't actually wound down yet.
+    # _run_crawl() finalizes to STOPPED only once run() has really returned
+    # and state.report is set, so GET /report never sees a STOPPED crawl
+    # with no report yet.
+    state.status = CrawlStatus.STOPPING
+    return CrawlStatusResponse(crawl_id=crawl_id, status=state.status)
+
+
 @app.get("/crawls/{crawl_id}/report", response_model=CrawlReportResponse)
 async def get_crawl_report(crawl_id: str) -> CrawlReportResponse:
     state = _crawls.get(crawl_id)
     if state is None:
         raise HTTPException(status_code=404, detail="crawl not found")
-    if state.status is CrawlStatus.RUNNING:
+    if state.status in (CrawlStatus.RUNNING, CrawlStatus.PAUSED, CrawlStatus.STOPPING):
         raise HTTPException(status_code=409, detail="crawl not finished yet")
     if state.status is CrawlStatus.FAILED:
         raise HTTPException(status_code=500, detail=state.error or "crawl failed")
-    assert state.report is not None  # guaranteed once status is FINISHED
+    assert state.report is not None  # guaranteed once status is FINISHED or STOPPED
 
-    return CrawlReportResponse(summary=state.report, matches=_build_match_rows(state))
+    matches = state.repository.get_matches() if state.repository is not None else []
+    return CrawlReportResponse(summary=state.report, matches=_build_match_rows(matches))
 
 
-def _build_match_rows(state: _CrawlState) -> list[MatchTableRow]:
+@app.post("/crawls/{crawl_id}/re-extract", response_model=CrawlReportResponse)
+async def re_extract_crawl(crawl_id: str) -> CrawlReportResponse:
+    """Re-run every registered extractor against this crawl's already-
+    persisted fetch data (issue #72) -- no live re-fetch, no network or
+    browser calls. Useful right after tuning an extractor/regex: see
+    updated results in well under a second instead of waiting through a
+    full re-crawl. Read-only -- doesn't touch the crawl's stored matches,
+    safe to call as many times as needed."""
+    state = _crawls.get(crawl_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="crawl not found")
     if state.repository is None:
-        return []
+        raise HTTPException(status_code=409, detail="crawl has not started yet")
 
-    matches = state.repository.get_matches()
+    registry = ExtractorRegistry()
+    registry.register(HtmlExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(CssJsExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(JsCharCodeExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ImageExifExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ImageStructuralExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ImageOcrExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ImageLsbExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(Base64HexExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(ReversedTextExtractor(context_chars=_CONTEXT_CHARS))
+    registry.register(Rot13Extractor(context_chars=_CONTEXT_CHARS))
+    registry.register(BinaryFallbackExtractor(context_chars=_CONTEXT_CHARS))
+    header_cookie_extractor = HeaderCookieExtractor(context_chars=_CONTEXT_CHARS)
+
+    summary, matches = replay_extraction(state.repository, registry, header_cookie_extractor)
+    return CrawlReportResponse(summary=summary, matches=_build_match_rows(matches))
+
+
+def _build_match_rows(matches: list[PasswordMatch]) -> list[MatchTableRow]:
     counts: dict[tuple[str, str], int] = {}
     for match in matches:
         key = (match.source_url, match.value)

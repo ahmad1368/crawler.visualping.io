@@ -8,33 +8,35 @@ def test_settings_load_from_env_vars(monkeypatch):
     monkeypatch.setenv("TARGET_URL", "https://example.com")
     monkeypatch.setenv("AUTH_USERNAME", "alice")
     monkeypatch.setenv("AUTH_PASSWORD", "s3cret")
-    monkeypatch.setenv("CONTEXT_CHARS", "40")
     monkeypatch.setenv("CONCURRENCY", "8")
     monkeypatch.setenv("MAX_PAGES", "250")
+    monkeypatch.setenv("MAX_DURATION_SECONDS", "1800")
 
     settings = Settings(_env_file=None)
 
     assert settings.target_url == "https://example.com"
     assert settings.auth_username == "alice"
     assert settings.auth_password == "s3cret"
-    assert settings.context_chars == 40
     assert settings.concurrency == 8
     assert settings.max_pages == 250
+    assert settings.max_duration_seconds == 1800
 
 
 def test_settings_use_defaults_when_optional_vars_missing(monkeypatch):
     monkeypatch.setenv("TARGET_URL", "https://example.com")
     monkeypatch.setenv("AUTH_USERNAME", "alice")
     monkeypatch.setenv("AUTH_PASSWORD", "s3cret")
-    monkeypatch.delenv("CONTEXT_CHARS", raising=False)
     monkeypatch.delenv("CONCURRENCY", raising=False)
     monkeypatch.delenv("MAX_PAGES", raising=False)
+    monkeypatch.delenv("MAX_DURATION_SECONDS", raising=False)
 
     settings = Settings(_env_file=None)
 
-    assert settings.context_chars == 80
     assert settings.concurrency == 4
-    assert settings.max_pages == 100
+    # issue #71: no default page-count cap -- completion is the frontier
+    # actually emptying, not a guessed number.
+    assert settings.max_pages is None
+    assert settings.max_duration_seconds is None
 
 
 def test_settings_missing_required_var_raises_clear_error(monkeypatch):

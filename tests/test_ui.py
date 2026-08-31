@@ -9,7 +9,7 @@ import uvicorn
 from playwright.sync_api import sync_playwright
 
 from app.api import routes
-from app.events import CRAWL_FINISHED, PAGE_FETCHED
+from app.events import CRAWL_FINISHED, MATCH_FOUND, PAGE_FETCHED
 from app.main import app  # imports app.api.websocket for /ws/crawls/{id} too
 from app.models import CrawlSummary, PageResult, PasswordMatch, SourceType
 
@@ -77,28 +77,132 @@ class _FakeOrchestrator:
         return summary
 
 
-@pytest.fixture
-def live_server(monkeypatch):
-    async def fake_build_orchestrator(request, event_bus):
-        pages = [
-            PageResult(
-                url=str(request.url),
-                status_code=200,
-                fetched_at=datetime.now(timezone.utc),
-            ),
-            PageResult(
-                url=str(request.url) + "page2",
-                status_code=200,
-                fetched_at=datetime.now(timezone.utc),
-            ),
-        ]
-        orchestrator = _FakeOrchestrator(event_bus, pages)
+class _PausableFakeOrchestrator:
+    """Like `_FakeOrchestrator`, but implements real pause()/resume()/
+    stop() semantics (an asyncio.Event gating the loop, checked before
+    each page rather than mid-page) so a browser-driven test can verify
+    actual behavior, not just button enabled/disabled state."""
 
-        async def cleanup() -> None:
-            return None
+    def __init__(self, event_bus, pages: list[PageResult], page_delay: float = 0.2) -> None:
+        self._event_bus = event_bus
+        self._pages = pages
+        self._page_delay = page_delay
+        self._pause_event = asyncio.Event()
+        self._pause_event.set()
+        self._stop_requested = False
 
-        return orchestrator, _FakeRepository(), cleanup
+    def pause(self) -> None:
+        self._pause_event.clear()
 
+    def resume(self) -> None:
+        self._pause_event.set()
+
+    def stop(self) -> None:
+        self._stop_requested = True
+        self._pause_event.set()
+
+    async def run(self) -> CrawlSummary:
+        processed = 0
+        for page in self._pages:
+            await self._pause_event.wait()
+            if self._stop_requested:
+                break
+            await asyncio.sleep(self._page_delay)
+            self._event_bus.publish(PAGE_FETCHED, page)
+            processed += 1
+
+        summary = CrawlSummary(
+            pages_visited=processed,
+            resources_checked=processed,
+            unique_passwords_found=0,
+            queue_empty=processed == len(self._pages),
+            started_at=datetime.now(timezone.utc),
+            finished_at=datetime.now(timezone.utc),
+        )
+        self._event_bus.publish(CRAWL_FINISHED, summary)
+        return summary
+
+
+STREAM_MATCH_VALUE_A = "VISUALPING{aaaaaaaaaaaaaaaa}"
+STREAM_MATCH_VALUE_B = "VISUALPING{bbbbbbbbbbbbbbbb}"
+
+
+def _streamed_matches() -> list[PasswordMatch]:
+    # Two matches for the SAME (source_url, value) pair, then one for a
+    # different pair -- exercises the client's count_in_page grouping,
+    # not just "a row shows up."
+    return [
+        PasswordMatch(
+            value=STREAM_MATCH_VALUE_A,
+            source_type=SourceType.HTML_TEXT,
+            source_url="https://example.com/page-a",
+            context_before="before-a",
+            context_after="after-a",
+            locator="line:1,col:0",
+        ),
+        PasswordMatch(
+            value=STREAM_MATCH_VALUE_A,
+            source_type=SourceType.HTML_TEXT,
+            source_url="https://example.com/page-a",
+            context_before="before-a",
+            context_after="after-a",
+            locator="line:1,col:0",
+        ),
+        PasswordMatch(
+            value=STREAM_MATCH_VALUE_B,
+            source_type=SourceType.HTML_TEXT,
+            source_url="https://example.com/page-b",
+            context_before="before-b",
+            context_after="after-b",
+            locator="line:2,col:0",
+        ),
+    ]
+
+
+class _MatchStreamingFakeRepository:
+    """Backs the final GET /report reconciliation pass with the same
+    matches streamed live -- so the test can check the post-finish table
+    matches what was already shown before crawl_finished."""
+
+    def get_matches(self):
+        return _streamed_matches()
+
+    def get_snapshot(self, url):
+        return None
+
+
+class _MatchStreamingFakeOrchestrator:
+    """Publishes MATCH_FOUND events with a real delay between them, so a
+    UI test can observe the results table populate live, before
+    crawl_finished -- including two matches for the same (source_url,
+    value) pair, to prove the client groups them into one row with
+    count_in_page=2 rather than a duplicate row."""
+
+    def __init__(self, event_bus) -> None:
+        self._event_bus = event_bus
+
+    async def run(self) -> CrawlSummary:
+        for match in _streamed_matches():
+            await asyncio.sleep(0.15)
+            self._event_bus.publish(MATCH_FOUND, match)
+
+        # A real gap before crawl_finished, so the test has a reliable
+        # window to observe "all matches streamed, crawl not yet done."
+        await asyncio.sleep(0.3)
+
+        summary = CrawlSummary(
+            pages_visited=2,
+            resources_checked=2,
+            unique_passwords_found=2,
+            queue_empty=True,
+            started_at=datetime.now(timezone.utc),
+            finished_at=datetime.now(timezone.utc),
+        )
+        self._event_bus.publish(CRAWL_FINISHED, summary)
+        return summary
+
+
+def _run_live_server(monkeypatch, fake_build_orchestrator):
     monkeypatch.setattr(routes, "_build_orchestrator", fake_build_orchestrator)
 
     port = _free_port()
@@ -121,6 +225,65 @@ def live_server(monkeypatch):
         thread.join(timeout=5)
 
 
+@pytest.fixture
+def live_server(monkeypatch):
+    async def fake_build_orchestrator(request, event_bus):
+        pages = [
+            PageResult(
+                url=str(request.url),
+                status_code=200,
+                fetched_at=datetime.now(timezone.utc),
+            ),
+            PageResult(
+                url=str(request.url) + "page2",
+                status_code=200,
+                fetched_at=datetime.now(timezone.utc),
+            ),
+        ]
+        orchestrator = _FakeOrchestrator(event_bus, pages)
+
+        async def cleanup() -> None:
+            return None
+
+        return orchestrator, _FakeRepository(), cleanup
+
+    yield from _run_live_server(monkeypatch, fake_build_orchestrator)
+
+
+@pytest.fixture
+def live_server_pausable(monkeypatch):
+    async def fake_build_orchestrator(request, event_bus):
+        pages = [
+            PageResult(
+                url=str(request.url) + f"page{i}",
+                status_code=200,
+                fetched_at=datetime.now(timezone.utc),
+            )
+            for i in range(8)
+        ]
+        orchestrator = _PausableFakeOrchestrator(event_bus, pages, page_delay=0.2)
+
+        async def cleanup() -> None:
+            return None
+
+        return orchestrator, _FakeRepository(), cleanup
+
+    yield from _run_live_server(monkeypatch, fake_build_orchestrator)
+
+
+@pytest.fixture
+def live_server_match_streaming(monkeypatch):
+    async def fake_build_orchestrator(request, event_bus):
+        orchestrator = _MatchStreamingFakeOrchestrator(event_bus)
+
+        async def cleanup() -> None:
+            return None
+
+        return orchestrator, _MatchStreamingFakeRepository(), cleanup
+
+    yield from _run_live_server(monkeypatch, fake_build_orchestrator)
+
+
 def test_run_button_disables_during_crawl_and_log_updates_live(live_server):
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
@@ -137,16 +300,28 @@ def test_run_button_disables_during_crawl_and_log_updates_live(live_server):
 
             assert run_button.is_disabled()
 
-            page.wait_for_selector("#log p:has-text('Fetched')")
+            page.wait_for_selector("#pages-list p:has-text('Fetched')")
             assert run_button.is_disabled(), "button must stay disabled while crawl is in progress"
             assert (
                 page.locator("#summary-resources-checked").inner_text() == "1"
             ), "resources-checked stat should update live from page_fetched events"
 
-            page.wait_for_function("document.querySelectorAll('#log p').length >= 3", timeout=5000)
-            log_lines = page.locator("#log p").all_inner_texts()
-            fetched_lines = [line for line in log_lines if line.startswith("Fetched")]
+            # Each fetched page is a real <a href>, not a styled button or a
+            # JS-only click handler -- opens in a new tab, no re-fetch. It
+            # renders into the dedicated crawled-pages list (issue #107),
+            # not the generic log.
+            fetched_link = page.locator("#pages-list a").first
+            assert fetched_link.get_attribute("href") == "https://example.com/"
+            assert fetched_link.get_attribute("target") == "_blank"
+            assert fetched_link.get_attribute("rel") == "noopener noreferrer"
+            assert "Fetched https://example.com/" in fetched_link.inner_text()
+
+            page.wait_for_function(
+                "document.querySelectorAll('#pages-list p').length >= 2", timeout=5000
+            )
+            fetched_lines = page.locator("#pages-list p").all_inner_texts()
             assert len(fetched_lines) == 2
+            assert all(line.startswith("Fetched") for line in fetched_lines)
 
             page.wait_for_function(
                 "document.getElementById('run-button').disabled === false", timeout=5000
@@ -194,5 +369,379 @@ def test_run_button_disables_during_crawl_and_log_updates_live(live_server):
             assert "exif:UserComment" in page.locator("#snapshot-locator").inner_text()
             fallback_mark = page.locator("#snapshot-body mark")
             assert fallback_mark.inner_text() == EXIF_MATCH_VALUE
+        finally:
+            browser.close()
+
+
+def _fetched_count(page) -> int:
+    return len(
+        [
+            line
+            for line in page.locator("#pages-list p").all_inner_texts()
+            if line.startswith("Fetched")
+        ]
+    )
+
+
+def test_pause_resume_stop_controls(live_server_pausable):
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(live_server_pausable + "/")
+
+            page.fill("#url", "https://example.com")
+            page.fill("#username", "alice")
+            page.fill("#password", "s3cret")
+
+            run_button = page.locator("#run-button")
+            pause_button = page.locator("#pause-button")
+            resume_button = page.locator("#resume-button")
+            stop_button = page.locator("#stop-button")
+
+            # Idle: only Run is enabled.
+            assert run_button.is_enabled()
+            assert pause_button.is_disabled()
+            assert resume_button.is_disabled()
+            assert stop_button.is_disabled()
+
+            run_button.click()
+
+            # Running: Run/Resume disabled, Pause/Stop enabled.
+            assert run_button.is_disabled()
+            assert resume_button.is_disabled()
+            page.wait_for_function("!document.getElementById('pause-button').disabled")
+            assert stop_button.is_enabled()
+
+            page.wait_for_selector("#pages-list p:has-text('Fetched')")
+            pause_button.click()
+            page.wait_for_selector("#log p:has-text('Crawl paused')")
+
+            # Paused: Run/Pause disabled, Resume/Stop enabled.
+            assert run_button.is_disabled()
+            assert pause_button.is_disabled()
+            assert resume_button.is_enabled()
+            assert stop_button.is_enabled()
+
+            # Let any already-in-flight page settle, then prove the crawl
+            # genuinely stalls -- not just that the button looks disabled.
+            page.wait_for_timeout(300)
+            count_at_pause = _fetched_count(page)
+            page.wait_for_timeout(600)  # ~3 page-intervals worth, paused
+            assert _fetched_count(page) == count_at_pause, "no progress should happen while paused"
+
+            resume_button.click()
+            page.wait_for_selector("#log p:has-text('Crawl resumed')")
+
+            # Running again: same enabled/disabled shape as the first
+            # running check above.
+            assert run_button.is_disabled()
+            assert pause_button.is_enabled()
+            assert resume_button.is_disabled()
+            assert stop_button.is_enabled()
+
+            page.wait_for_function(
+                f"Array.from(document.querySelectorAll('#pages-list p')).filter("
+                f"p => p.textContent.startsWith('Fetched')).length > {count_at_pause}",
+                timeout=3000,
+            )
+
+            stop_button.click()
+            page.wait_for_selector("#log p:has-text('Stopping crawl')")
+
+            # Stopping: nothing re-enables until crawl_finished arrives.
+            assert run_button.is_disabled()
+            assert pause_button.is_disabled()
+            assert resume_button.is_disabled()
+            assert stop_button.is_disabled()
+
+            page.wait_for_function(
+                "document.getElementById('run-button').disabled === false", timeout=5000
+            )
+
+            # Idle again: back to only Run enabled, and the crawl stopped
+            # early -- fewer than all 8 fake pages were processed.
+            assert pause_button.is_disabled()
+            assert resume_button.is_disabled()
+            assert stop_button.is_disabled()
+            final_lines = page.locator("#log p").all_inner_texts()
+            assert any("Crawl finished" in line for line in final_lines)
+
+            page.wait_for_function(
+                "document.getElementById('summary-pages-visited').textContent !== '0'"
+            )
+            pages_visited = int(page.locator("#summary-pages-visited").inner_text())
+            assert 0 < pages_visited < 8, "stop should end the crawl before all pages are processed"
+        finally:
+            browser.close()
+
+
+def test_results_table_populates_live_before_crawl_finishes(live_server_match_streaming):
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(live_server_match_streaming + "/")
+
+            page.fill("#url", "https://example.com")
+            page.fill("#username", "alice")
+            page.fill("#password", "s3cret")
+            page.click("#run-button")
+
+            # First match_found (page-a, value A) -- a row appears
+            # immediately, well before the crawl finishes.
+            page.wait_for_function(
+                "document.querySelectorAll('#results-table tbody tr').length >= 1", timeout=3000
+            )
+            assert page.locator("#log p:has-text('Crawl finished')").count() == 0
+            rows = page.locator("#results-table tbody tr")
+            assert rows.count() == 1
+            assert rows.nth(0).locator("td").nth(2).inner_text() == STREAM_MATCH_VALUE_A
+            assert rows.nth(0).locator("td").nth(4).inner_text() == "1"
+
+            # Second match_found for the SAME (source_url, value) pair
+            # increments the existing row's count rather than adding a
+            # second row for it.
+            page.wait_for_function(
+                "document.querySelectorAll('#results-table tbody tr')[0]"
+                ".children[4].textContent === '2'",
+                timeout=3000,
+            )
+            assert page.locator("#results-table tbody tr").count() == 1
+
+            # Third match_found, a different (source_url, value) pair,
+            # adds a second row -- still before crawl_finished.
+            page.wait_for_function(
+                "document.querySelectorAll('#results-table tbody tr').length >= 2", timeout=3000
+            )
+            assert page.locator("#log p:has-text('Crawl finished')").count() == 0
+
+            # Crawl finishes; the GET /report reconciliation pass lands on
+            # the same final shape the live stream already showed.
+            page.wait_for_selector("#log p:has-text('Crawl finished')", timeout=3000)
+            page.wait_for_function(
+                "document.getElementById('run-button').disabled === false", timeout=3000
+            )
+            final_rows = page.locator("#results-table tbody tr")
+            assert final_rows.count() == 2
+            values = page.locator("#results-table tbody tr td:nth-child(3)").all_inner_texts()
+            assert set(values) == {STREAM_MATCH_VALUE_A, STREAM_MATCH_VALUE_B}
+        finally:
+            browser.close()
+
+
+def test_results_filter_narrows_and_restores_rows(live_server_match_streaming):
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(live_server_match_streaming + "/")
+
+            page.fill("#url", "https://example.com")
+            page.fill("#username", "alice")
+            page.fill("#password", "s3cret")
+            page.click("#run-button")
+
+            page.wait_for_selector("#log p:has-text('Crawl finished')", timeout=3000)
+            assert page.locator("#results-table tbody tr").count() == 2
+            assert page.locator("#results-filter-container").is_visible()
+
+            # Substring match against page_url, case-insensitive -- only
+            # the page-a row (source_url ".../page-a") should remain.
+            page.fill("#results-filter", "PAGE-A")
+            page.wait_for_function(
+                "document.querySelectorAll('#results-table tbody tr').length === 1"
+            )
+            rows = page.locator("#results-table tbody tr")
+            assert rows.nth(0).locator("td").nth(2).inner_text() == STREAM_MATCH_VALUE_A
+
+            # A term matching neither row hides the table entirely.
+            page.fill("#results-filter", "no-such-page")
+            page.wait_for_function(
+                "document.querySelectorAll('#results-table tbody tr').length === 0"
+            )
+
+            # Clearing the input restores every row.
+            page.fill("#results-filter", "")
+            page.wait_for_function(
+                "document.querySelectorAll('#results-table tbody tr').length === 2"
+            )
+        finally:
+            browser.close()
+
+
+def test_results_filter_bar_always_visible(live_server_pausable):
+    # live_server_pausable's crawl publishes no MATCH_FOUND events while
+    # running -- the results table stays empty/hidden (issue #86's own
+    # scope, unchanged) for that whole stretch, which is exactly the
+    # state that used to hide the search bar too (issue #91: the bar's
+    # visibility is no longer tied to match count at all). Its final
+    # GET /report does return matches (via _FakeRepository), so the table
+    # itself does populate once the crawl finishes -- that's unrelated to
+    # this test, which only asserts the search bar's own visibility.
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(live_server_pausable + "/")
+
+            # Visible before a crawl has ever run.
+            assert page.locator("#results-filter-container").is_visible()
+
+            page.fill("#url", "https://example.com")
+            page.fill("#username", "alice")
+            page.fill("#password", "s3cret")
+            page.click("#run-button")
+
+            # Visible while running, with zero matches found so far --
+            # the table itself is still hidden at this point.
+            page.wait_for_selector("#pages-list p:has-text('Fetched')")
+            assert page.locator("#results-filter-container").is_visible()
+            assert not page.locator("#results-table").is_visible()
+
+            # Still visible once the crawl finishes and the table
+            # populates from the final report.
+            page.wait_for_function(
+                "document.getElementById('run-button').disabled === false", timeout=5000
+            )
+            assert page.locator("#results-filter-container").is_visible()
+        finally:
+            browser.close()
+
+
+PAGES_FILTER_MATCH_VALUE = "VISUALPING{ffffffffffffffff}"
+
+
+class _PagesFilterFakeRepository:
+    def get_matches(self):
+        return []
+
+    def get_snapshot(self, url):
+        return None
+
+
+class _PagesFilterFakeOrchestrator:
+    """Fetches three pages (app.js, secret.js, notes.txt), then -- only
+    after all three page_fetched events have already fired -- emits a
+    single MATCH_FOUND for secret.js. Proves the crawled pages list's
+    password-found filter state updates retroactively on an
+    already-rendered entry, and that the text filter's multi-term AND
+    logic (e.g. "js secret") only matches the one URL containing both
+    substrings."""
+
+    def __init__(self, event_bus, base_url: str) -> None:
+        self._event_bus = event_bus
+        self._base_url = base_url
+
+    async def run(self) -> CrawlSummary:
+        pages = [
+            PageResult(
+                url=self._base_url + name, status_code=200, fetched_at=datetime.now(timezone.utc)
+            )
+            for name in ("app.js", "secret.js", "notes.txt")
+        ]
+        for page in pages:
+            await asyncio.sleep(0.15)
+            self._event_bus.publish(PAGE_FETCHED, page)
+
+        await asyncio.sleep(0.15)
+        match = PasswordMatch(
+            value=PAGES_FILTER_MATCH_VALUE,
+            source_type=SourceType.HTML_TEXT,
+            source_url=self._base_url + "secret.js",
+            context_before="before",
+            context_after="after",
+            locator="line:1,col:0",
+        )
+        self._event_bus.publish(MATCH_FOUND, match)
+
+        summary = CrawlSummary(
+            pages_visited=3,
+            resources_checked=3,
+            unique_passwords_found=1,
+            queue_empty=True,
+            started_at=datetime.now(timezone.utc),
+            finished_at=datetime.now(timezone.utc),
+        )
+        self._event_bus.publish(CRAWL_FINISHED, summary)
+        return summary
+
+
+@pytest.fixture
+def live_server_pages_filter(monkeypatch):
+    async def fake_build_orchestrator(request, event_bus):
+        orchestrator = _PagesFilterFakeOrchestrator(event_bus, str(request.url))
+
+        async def cleanup() -> None:
+            return None
+
+        return orchestrator, _PagesFilterFakeRepository(), cleanup
+
+    yield from _run_live_server(monkeypatch, fake_build_orchestrator)
+
+
+def test_pages_list_filters_by_password_state_and_and_combined_text(live_server_pages_filter):
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(live_server_pages_filter + "/")
+
+            page.fill("#url", "https://example.com")
+            page.fill("#username", "alice")
+            page.fill("#password", "s3cret")
+            page.click("#run-button")
+
+            # All three pages fetched, but the match_found for secret.js
+            # hasn't arrived yet -- every entry must count as "no password"
+            # at this point, not just "unknown."
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 3")
+            page.select_option("#pages-password-filter", "has")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 0")
+            page.select_option("#pages-password-filter", "none")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 3")
+            page.select_option("#pages-password-filter", "all")
+
+            # Crawl only finishes after the match_found for secret.js fires.
+            page.wait_for_selector("#log p:has-text('Crawl finished')", timeout=3000)
+
+            # Retroactive update: secret.js's row (already rendered before
+            # the match arrived) now counts as "has password" with no new
+            # page_fetched event needed for it.
+            page.select_option("#pages-password-filter", "has")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 1")
+            assert "secret.js" in page.locator("#pages-list p").inner_text()
+
+            page.select_option("#pages-password-filter", "none")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 2")
+            none_lines = page.locator("#pages-list p").all_inner_texts()
+            assert all("secret.js" not in line for line in none_lines)
+
+            page.select_option("#pages-password-filter", "all")
+
+            # Multi-term AND text search: "js secret" matches only the URL
+            # containing BOTH substrings -- app.js has "js" but not
+            # "secret", notes.txt has neither.
+            page.fill("#pages-filter", "js secret")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 1")
+            assert "secret.js" in page.locator("#pages-list p").inner_text()
+
+            page.fill("#pages-filter", "js")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 2")
+
+            # The two filters combine with AND: text-matches "js secret"
+            # (secret.js only) intersected with "no password" (excludes
+            # secret.js) leaves nothing.
+            page.select_option("#pages-password-filter", "none")
+            page.fill("#pages-filter", "js secret")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 0")
+
+            page.select_option("#pages-password-filter", "has")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 1")
+
+            # Clearing both filters restores every fetched page.
+            page.fill("#pages-filter", "")
+            page.select_option("#pages-password-filter", "all")
+            page.wait_for_function("document.querySelectorAll('#pages-list p').length === 3")
         finally:
             browser.close()

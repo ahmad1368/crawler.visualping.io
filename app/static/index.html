@@ -60,7 +60,25 @@
     background: var(--accent-disabled);
     cursor: not-allowed;
   }
-  #log {
+  #controls {
+    display: flex;
+    gap: 0.5rem;
+  }
+  #controls button {
+    margin-top: 1.5rem;
+  }
+  button.secondary {
+    background: #fff;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+  }
+  button.secondary:disabled {
+    background: #fff;
+    color: var(--accent-disabled);
+    border-color: var(--accent-disabled);
+    cursor: not-allowed;
+  }
+  #log, #pages-list {
     margin-top: 1.5rem;
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -71,7 +89,34 @@
     font-size: 0.8rem;
     background: #fafafa;
   }
-  #log p { margin: 0 0 0.25rem 0; }
+  #log p, #pages-list p { margin: 0 0 0.25rem 0; }
+  #log a, #pages-list a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  #log a:hover, #pages-list a:hover {
+    text-decoration: underline;
+  }
+  #pages-filter-container {
+    margin-top: 1.5rem;
+    display: flex;
+    gap: 0.75rem;
+    align-items: flex-end;
+  }
+  #pages-filter-container > div {
+    flex: 1;
+  }
+  #pages-filter-container label {
+    margin-top: 0;
+  }
+  select {
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 0.95rem;
+    background: #fff;
+  }
   #summary-panel {
     margin-top: 1.5rem;
     display: grid;
@@ -97,8 +142,14 @@
     font-weight: 600;
     color: var(--accent);
   }
-  table#results-table {
+  #results-filter-container {
     margin-top: 1.5rem;
+  }
+  #results-filter-container label {
+    margin-top: 0;
+  }
+  table#results-table {
+    margin-top: 0.75rem;
     width: 100%;
     border-collapse: collapse;
     font-size: 0.85rem;
@@ -208,10 +259,12 @@
       <label for="password">Password</label>
       <input id="password" name="password" type="password" required autocomplete="off" />
 
-      <label for="context_chars">Context length</label>
-      <input id="context_chars" name="context_chars" type="number" min="0" value="80" />
-
-      <button id="run-button" type="submit">Run</button>
+      <div id="controls">
+        <button id="run-button" type="submit">Run</button>
+        <button id="pause-button" class="secondary" type="button" disabled>Pause</button>
+        <button id="resume-button" class="secondary" type="button" disabled>Resume</button>
+        <button id="stop-button" class="secondary" type="button" disabled>Stop</button>
+      </div>
     </form>
     <div id="summary-panel" style="display: none;" aria-live="polite">
       <div class="summary-stat">
@@ -232,6 +285,35 @@
       </div>
     </div>
     <div id="log" aria-live="polite"></div>
+    <div id="pages-filter-container">
+      <div>
+        <label for="pages-filter">Filter crawled pages</label>
+        <input
+          id="pages-filter"
+          type="search"
+          autocomplete="off"
+          placeholder="e.g. js secret"
+        />
+      </div>
+      <div>
+        <label for="pages-password-filter">Password</label>
+        <select id="pages-password-filter">
+          <option value="all">All</option>
+          <option value="has">Has password</option>
+          <option value="none">No password</option>
+        </select>
+      </div>
+    </div>
+    <div id="pages-list" aria-live="polite"></div>
+    <div id="results-filter-container">
+      <label for="results-filter">Filter results</label>
+      <input
+        id="results-filter"
+        type="search"
+        autocomplete="off"
+        placeholder="e.g. js"
+      />
+    </div>
     <table id="results-table" style="display: none;">
       <thead>
         <tr>
@@ -259,9 +341,16 @@
   <script>
     const form = document.getElementById("crawl-form");
     const runButton = document.getElementById("run-button");
+    const pauseButton = document.getElementById("pause-button");
+    const resumeButton = document.getElementById("resume-button");
+    const stopButton = document.getElementById("stop-button");
     const log = document.getElementById("log");
     const resultsTable = document.getElementById("results-table");
     const resultsBody = document.getElementById("results-body");
+    const resultsFilterInput = document.getElementById("results-filter");
+    const pagesList = document.getElementById("pages-list");
+    const pagesFilterInput = document.getElementById("pages-filter");
+    const pagesPasswordFilterSelect = document.getElementById("pages-password-filter");
     const summaryPanel = document.getElementById("summary-panel");
     const summaryPagesVisited = document.getElementById("summary-pages-visited");
     const summaryResourcesChecked = document.getElementById("summary-resources-checked");
@@ -273,16 +362,116 @@
     const snapshotClose = document.getElementById("snapshot-close");
 
     // Source types with no meaningful text body to search/highlight --
-    // shown as a readable locator + context fallback instead.
-    const NON_TEXT_SOURCE_TYPES = new Set(["image_metadata", "binary"]);
+    // shown as a readable locator + context fallback instead. image_ocr
+    // matches are text OCR'd out of image pixels: the password was never
+    // parseable text in the raw image bytes to indexOf-search for.
+    const NON_TEXT_SOURCE_TYPES = new Set([
+      "image_metadata",
+      "binary",
+      "image_ocr",
+      "image_lsb",
+      "client_storage",
+      "redirect",
+      "content_negotiation",
+      "base64_hex",
+      "reversed_text",
+      "rot13",
+    ]);
 
     let currentCrawlId = null;
+    // All matches known so far (live WebSocket rows or the final report),
+    // unfiltered -- the source of truth the search box filters against.
+    let currentMatches = [];
+    // Every page_fetched entry seen so far, keyed by URL (Map preserves
+    // insertion order for iteration) -- the source of truth the crawled
+    // pages filter below narrows. hasPassword starts false and can flip
+    // to true later, retroactively, when a match_found event for that
+    // URL arrives (issue #107).
+    let currentPagesByUrl = new Map();
     let liveResourcesChecked = 0;
     let livePasswordValues = new Set();
+    // Mirrors the backend's (source_url, value) grouping from
+    // _build_match_rows -- keyed the same way, so live rows and the
+    // final GET /report reconciliation pass end up with the same shape.
+    let liveMatchesByKey = new Map();
+
+    function matchKey(sourceUrl, value) {
+      return sourceUrl + " " + value;
+    }
+
+    // Called on each match_found WebSocket message -- groups repeated
+    // (source_url, value) matches into one row with an incremented
+    // count_in_page, same as the backend does, and re-renders the table
+    // immediately rather than waiting for the crawl to finish.
+    function recordLiveMatch(payload) {
+      const key = matchKey(payload.source_url, payload.value);
+      const existing = liveMatchesByKey.get(key);
+      if (existing) {
+        existing.count_in_page += 1;
+      } else {
+        liveMatchesByKey.set(key, {
+          page_url: payload.source_url,
+          source_type: payload.source_type,
+          value: payload.value,
+          context_before: payload.context_before,
+          context_after: payload.context_after,
+          count_in_page: 1,
+          locator: payload.locator,
+        });
+      }
+      renderResultsTable(Array.from(liveMatchesByKey.values()));
+    }
+
+    // Single source of truth for the four control buttons' enabled state --
+    // "idle" (nothing started/crawl over) | "running" | "paused" |
+    // "stopping" (Stop pressed, waiting for crawl_finished).
+    function setControlsForState(controlState) {
+      runButton.disabled = controlState === "running" || controlState === "paused" || controlState === "stopping";
+      pauseButton.disabled = controlState !== "running";
+      resumeButton.disabled = controlState !== "paused";
+      stopButton.disabled = !(controlState === "running" || controlState === "paused");
+    }
+
+    async function postControlAction(action) {
+      let response;
+      try {
+        response = await fetch("/crawls/" + currentCrawlId + "/" + action, { method: "POST" });
+      } catch (err) {
+        appendLog("Failed to " + action + " crawl: " + err);
+        return false;
+      }
+      if (!response.ok) {
+        appendLog("Failed to " + action + " crawl (status " + response.status + ")");
+        return false;
+      }
+      return true;
+    }
+
+    pauseButton.addEventListener("click", async () => {
+      if (await postControlAction("pause")) {
+        setControlsForState("paused");
+        appendLog("Crawl paused.");
+      }
+    });
+
+    resumeButton.addEventListener("click", async () => {
+      if (await postControlAction("resume")) {
+        setControlsForState("running");
+        appendLog("Crawl resumed.");
+      }
+    });
+
+    stopButton.addEventListener("click", async () => {
+      if (await postControlAction("stop")) {
+        setControlsForState("stopping");
+        appendLog("Stopping crawl...");
+      }
+    });
 
     function resetSummaryPanel() {
       liveResourcesChecked = 0;
       livePasswordValues = new Set();
+      liveMatchesByKey = new Map();
       summaryPagesVisited.textContent = "0";
       summaryResourcesChecked.textContent = "0";
       summaryPasswordsFound.textContent = "0";
@@ -379,9 +568,109 @@
       log.scrollTop = log.scrollHeight;
     }
 
+    // Records/updates a page_fetched entry in currentPagesByUrl and
+    // re-renders the (possibly filtered) crawled pages list. Each entry
+    // is a real <a href> to the fetched URL (not a styled button/JS-only
+    // handler), so the operator can click -- or middle-click, or
+    // right-click "open in new tab" -- to see exactly what the crawl
+    // visited. Opens in a new tab; the target site's Basic Auth prompt
+    // appears once per browser session (cached per-origin after that),
+    // not on every click.
+    function appendPageLink(url, statusCode) {
+      const existing = currentPagesByUrl.get(url);
+      currentPagesByUrl.set(url, {
+        url,
+        statusCode,
+        hasPassword: existing ? existing.hasPassword : false,
+      });
+      applyPagesFilter();
+    }
+
+    // Called on each match_found WebSocket message -- flips the matching
+    // page's hasPassword state, even if that page's row was already
+    // rendered (a page can be fetched well before its own match arrives,
+    // e.g. the post-crawl content-negotiation probe re-checking an
+    // already-fetched URL). If no page_fetched entry exists yet for this
+    // URL, records one with statusCode unknown rather than dropping it.
+    function markPageHasPassword(url) {
+      const existing = currentPagesByUrl.get(url);
+      if (existing && existing.hasPassword) {
+        return;
+      }
+      currentPagesByUrl.set(url, {
+        url,
+        statusCode: existing ? existing.statusCode : null,
+        hasPassword: true,
+      });
+      applyPagesFilter();
+    }
+
+    // "Contains" AND search: the query box's value is split on whitespace
+    // into terms, and every term must be a substring of the URL for the
+    // page to match -- e.g. "js secret" only matches a URL containing
+    // both "js" and "secret" somewhere, not either alone.
+    function pageMatchesFilter(pageEntry, terms, passwordState) {
+      if (passwordState === "has" && !pageEntry.hasPassword) {
+        return false;
+      }
+      if (passwordState === "none" && pageEntry.hasPassword) {
+        return false;
+      }
+      const urlLower = pageEntry.url.toLowerCase();
+      return terms.every((term) => urlLower.includes(term));
+    }
+
+    // Re-applies the current text + password-state filters to
+    // currentPagesByUrl and re-renders. Called on every page_fetched,
+    // match_found, and filter-control change.
+    function applyPagesFilter() {
+      const terms = pagesFilterInput.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const passwordState = pagesPasswordFilterSelect.value;
+      pagesList.innerHTML = "";
+      for (const pageEntry of currentPagesByUrl.values()) {
+        if (!pageMatchesFilter(pageEntry, terms, passwordState)) {
+          continue;
+        }
+        const line = document.createElement("p");
+        const link = document.createElement("a");
+        link.href = pageEntry.url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = "Fetched " + pageEntry.url + " (" + pageEntry.statusCode + ")";
+        line.appendChild(link);
+        pagesList.appendChild(line);
+      }
+      pagesList.scrollTop = pagesList.scrollHeight;
+    }
+
+    pagesFilterInput.addEventListener("input", applyPagesFilter);
+    pagesPasswordFilterSelect.addEventListener("change", applyPagesFilter);
+
+    // Case-insensitive substring ("contains") match against the page URL --
+    // the column that carries the file path, e.g. entering "js" matches
+    // ".../app.js".
+    function rowMatchesFilter(row, term) {
+      return row.page_url.toLowerCase().includes(term);
+    }
+
+    // Re-applies the current search box value to currentMatches and
+    // re-renders. Called both on user input and whenever currentMatches
+    // changes (new live match, or the final report loading).
+    function applyResultsFilter() {
+      const term = resultsFilterInput.value.trim().toLowerCase();
+      const filtered = term ? currentMatches.filter((row) => rowMatchesFilter(row, term)) : currentMatches;
+      renderMatchRows(filtered);
+      // The search bar itself always stays visible above the results
+      // list (issue #91); only the table's own show/hide (issue #86's
+      // scope) depends on whether any matches exist yet.
+      resultsTable.style.display = currentMatches.length ? "table" : "none";
+    }
+
+    resultsFilterInput.addEventListener("input", applyResultsFilter);
+
     // Emits a "password-cell-click" event on window with the row's data --
     // the snapshot viewer above listens for it to jump to the match.
-    function renderResultsTable(matches) {
+    function renderMatchRows(matches) {
       resultsBody.innerHTML = "";
       for (const row of matches) {
         const tr = document.createElement("tr");
@@ -411,7 +700,14 @@
         tr.append(pageCell, typeCell, passwordCell, contextCell, countCell);
         resultsBody.appendChild(tr);
       }
-      resultsTable.style.display = matches.length ? "table" : "none";
+    }
+
+    // Updates the unfiltered match list and re-renders through the current
+    // search filter. All producers of rows (live WebSocket matches, the
+    // final report) call this instead of renderMatchRows directly.
+    function renderResultsTable(matches) {
+      currentMatches = matches;
+      applyResultsFilter();
     }
 
     async function loadReport(crawlId) {
@@ -433,10 +729,16 @@
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
-      runButton.disabled = true;
+      setControlsForState("running");
       log.innerHTML = "";
       resultsBody.innerHTML = "";
       resultsTable.style.display = "none";
+      resultsFilterInput.value = "";
+      currentMatches = [];
+      pagesList.innerHTML = "";
+      pagesFilterInput.value = "";
+      pagesPasswordFilterSelect.value = "all";
+      currentPagesByUrl = new Map();
       closeSnapshotViewer();
       resetSummaryPanel();
       appendLog("Starting crawl...");
@@ -445,7 +747,6 @@
         url: document.getElementById("url").value,
         username: document.getElementById("username").value,
         password: document.getElementById("password").value,
-        context_chars: Number(document.getElementById("context_chars").value || 80),
       };
 
       let response;
@@ -457,13 +758,13 @@
         });
       } catch (err) {
         appendLog("Failed to start crawl: " + err);
-        runButton.disabled = false;
+        setControlsForState("idle");
         return;
       }
 
       if (!response.ok) {
         appendLog("Failed to start crawl (status " + response.status + ")");
-        runButton.disabled = false;
+        setControlsForState("idle");
         return;
       }
 
@@ -475,16 +776,18 @@
       socket.addEventListener("message", (event) => {
         const message = JSON.parse(event.data);
         if (message.type === "page_fetched") {
-          appendLog("Fetched " + message.payload.url + " (" + message.payload.status_code + ")");
+          appendPageLink(message.payload.url, message.payload.status_code);
           liveResourcesChecked += 1;
           summaryResourcesChecked.textContent = liveResourcesChecked;
         } else if (message.type === "match_found") {
           appendLog("Password found at " + message.payload.source_url);
           livePasswordValues.add(message.payload.value);
           summaryPasswordsFound.textContent = livePasswordValues.size;
+          recordLiveMatch(message.payload);
+          markPageHasPassword(message.payload.source_url);
         } else if (message.type === "crawl_finished") {
           appendLog("Crawl finished.");
-          runButton.disabled = false;
+          setControlsForState("idle");
           socket.close();
           loadReport(crawl_id);
         }
@@ -492,7 +795,7 @@
 
       socket.addEventListener("error", () => {
         appendLog("WebSocket error.");
-        runButton.disabled = false;
+        setControlsForState("idle");
       });
     });
   </script>

@@ -1,45 +1,27 @@
-"""Extractor for exposed passwords in rendered/raw HTML text nodes and
-`<!-- -->` comments.
+"""Extractor for exposed passwords in raw HTML source.
 
-Matches found in visible text are tagged `SourceType.HTML_TEXT`; matches
-found inside comments are tagged `SourceType.HTML_COMMENT`, so downstream
-consumers can tell "the operator can see this on the page" apart from
-"this secret is only visible in the markup source". Content inside
-`<script>`/`<style>` tags is skipped here -- that's covered by the CSS/JS
-extractor instead.
+Scans the raw markup directly with a regex rather than DOM-extracted
+visible text, so tag attribute values (e.g. a `data-*` attribute) and any
+other markup content are covered by the same pass -- a DOM-text-only scan
+never sees attribute values at all, since they aren't part of any text
+node.
+
+Matches inside `<!-- -->` are tagged `SourceType.HTML_COMMENT`; everything
+else (visible text, attributes, inline `<script>`/`<style>` content) is
+tagged `SourceType.HTML_TEXT`, so downstream consumers can still tell "the
+operator can see this rendered" apart from "this secret is only visible in
+the markup source." Only the comment split is special-cased -- without it
+a comment's password would be double-reported as both types.
 """
 
 from __future__ import annotations
 
-from html.parser import HTMLParser
+import re
 
-from app.matching import find_passwords
+from app.matching import find_passwords, locator_for_offset
 from app.models import PasswordMatch, SourceType
 
-_SKIPPED_TAGS = {"script", "style"}
-
-
-class _HtmlChunkCollector(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.text_chunks: list[tuple[str, tuple[int, int]]] = []
-        self.comment_chunks: list[tuple[str, tuple[int, int]]] = []
-        self._skip_depth = 0
-
-    def handle_starttag(self, tag: str, attrs) -> None:
-        if tag in _SKIPPED_TAGS:
-            self._skip_depth += 1
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in _SKIPPED_TAGS and self._skip_depth > 0:
-            self._skip_depth -= 1
-
-    def handle_data(self, data: str) -> None:
-        if self._skip_depth == 0 and data.strip():
-            self.text_chunks.append((data, self.getpos()))
-
-    def handle_comment(self, data: str) -> None:
-        self.comment_chunks.append((data, self.getpos()))
+_COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
 
 
 class HtmlExtractor:
@@ -50,32 +32,27 @@ class HtmlExtractor:
         if not content_type.startswith("text/html"):
             return []
 
-        collector = _HtmlChunkCollector()
-        collector.feed(content.decode("utf-8", errors="replace"))
+        html_text = content.decode("utf-8", errors="replace")
+        comment_spans = [m.span() for m in _COMMENT_PATTERN.finditer(html_text)]
 
-        matches: list[PasswordMatch] = []
-        for data, pos in collector.text_chunks:
-            matches.extend(self._matches_for(data, pos, url, SourceType.HTML_TEXT))
-        for data, pos in collector.comment_chunks:
-            matches.extend(self._matches_for(data, pos, url, SourceType.HTML_COMMENT))
-        return matches
-
-    def _matches_for(
-        self,
-        text: str,
-        pos: tuple[int, int],
-        url: str,
-        source_type: SourceType,
-    ) -> list[PasswordMatch]:
-        line, column = pos
         return [
             PasswordMatch(
                 value=match.value,
-                source_type=source_type,
+                source_type=(
+                    SourceType.HTML_COMMENT
+                    if self._in_comment(match.start, comment_spans)
+                    else SourceType.HTML_TEXT
+                ),
                 source_url=url,
                 context_before=match.context_before,
                 context_after=match.context_after,
-                locator=f"line:{line},col:{column}",
+                locator=locator_for_offset(html_text, match.start),
             )
-            for match in find_passwords(text, before=self._context_chars, after=self._context_chars)
+            for match in find_passwords(
+                html_text, before=self._context_chars, after=self._context_chars
+            )
         ]
+
+    @staticmethod
+    def _in_comment(offset: int, spans: list[tuple[int, int]]) -> bool:
+        return any(start <= offset < end for start, end in spans)

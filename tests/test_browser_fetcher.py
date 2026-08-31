@@ -28,6 +28,22 @@ INDEX_HTML = """
 </html>
 """
 
+CLICK_DRIVEN_HTML = """
+<!doctype html>
+<html>
+<body>
+  <button onclick="location.href='/button-nav-page'">Go</button>
+  <button onclick="
+    const a = document.createElement('a');
+    a.href = '/revealed-page';
+    a.textContent = 'Revealed';
+    document.body.appendChild(a);
+  ">Reveal more</button>
+  <button onclick="location.href='/should-never-be-visited'">Delete Account</button>
+</body>
+</html>
+"""
+
 
 class BasicAuthHandler(http.server.BaseHTTPRequestHandler):
     def _authorized(self) -> bool:
@@ -47,6 +63,9 @@ class BasicAuthHandler(http.server.BaseHTTPRequestHandler):
 
         if self.path == "/":
             body = INDEX_HTML.encode()
+            content_type = "text/html"
+        elif self.path == "/click-driven":
+            body = CLICK_DRIVEN_HTML.encode()
             content_type = "text/html"
         elif self.path == "/api/data":
             body = b'{"ok": true}'
@@ -119,3 +138,31 @@ def test_fetch_applies_basic_auth_credentials_to_context():
     result = run(scenario())
 
     assert "Unauthorized" in result.html
+
+
+def test_fetch_discovers_urls_only_reachable_by_clicking():
+    """Regression test for the crawler's original passive-observation-only
+    gap: a page whose navigation and content are wired entirely to
+    non-anchor `onclick` handlers -- no `<a href>`, nothing fetched on
+    load -- so `dom_links`/`network_urls` alone would never find it."""
+
+    async def scenario():
+        with local_auth_server() as port:
+            base_url = f"http://127.0.0.1:{port}"
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch()
+                try:
+                    fetcher = BrowserFetcher(
+                        browser, username=VALID_USERNAME, password=VALID_PASSWORD
+                    )
+                    return await fetcher.fetch(base_url + "/click-driven")
+                finally:
+                    await browser.close()
+
+    result = run(scenario())
+
+    all_discovered = set(result.dom_links) | set(result.network_urls) | set(result.interaction_urls)
+
+    assert any(url.endswith("/button-nav-page") for url in result.interaction_urls)
+    assert any(url.endswith("/revealed-page") for url in result.interaction_urls)
+    assert not any(url.endswith("/should-never-be-visited") for url in all_discovered)

@@ -46,15 +46,44 @@ PASSWORD_COOKIE = "VISUALPING{e6e6e6e6e6e6e6e6}"
 PASSWORD_IMAGE_METADATA = "VISUALPING{e7e7e7e7e7e7e7e7}"
 PASSWORD_BINARY = "VISUALPING{e8e8e8e8e8e8e8e8}"
 
-EXPECTED_MATCHES = {
-    PASSWORD_HTML_TEXT: SourceType.HTML_TEXT,
-    PASSWORD_HTML_COMMENT: SourceType.HTML_COMMENT,
-    PASSWORD_CSS: SourceType.CSS,
-    PASSWORD_JS: SourceType.JS,
-    PASSWORD_HTTP_HEADER: SourceType.HTTP_HEADER,
-    PASSWORD_COOKIE: SourceType.COOKIE,
-    PASSWORD_IMAGE_METADATA: SourceType.IMAGE_METADATA,
-    PASSWORD_BINARY: SourceType.BINARY,
+EXPECTED_SOURCE_TYPES = {
+    # issue #103: the fixture server has no real content-negotiation
+    # logic -- it returns the same body regardless of Accept/
+    # X-Requested-With, so `probe_content_negotiation`'s re-requests of
+    # each HTML page legitimately (if incidentally) re-find whatever
+    # password that page already had, under CONTENT_NEGOTIATION too.
+    # Correct behavior: the probe has no way to know in advance whether a
+    # server actually negotiates, only whether re-requesting turns up a
+    # flag -- collapses into one report row downstream via
+    # (source_url, value) grouping either way.
+    PASSWORD_HTML_TEXT: {SourceType.HTML_TEXT, SourceType.CONTENT_NEGOTIATION},
+    PASSWORD_HTML_COMMENT: {SourceType.HTML_COMMENT, SourceType.CONTENT_NEGOTIATION},
+    PASSWORD_CSS: {SourceType.CSS},
+    PASSWORD_JS: {SourceType.JS},
+    PASSWORD_HTTP_HEADER: {SourceType.HTTP_HEADER, SourceType.CONTENT_NEGOTIATION},
+    # Pre-existing, out-of-scope-for-this-fix duplicate, uncovered by
+    # switching this assertion from a value->source_type dict (which
+    # silently dropped duplicates via last-write-wins) to a
+    # value->set-of-source_types one: Set-Cookie is both a raw response
+    # header HeaderCookieExtractor scans directly, and the source of the
+    # parsed `cookies` dict it scans separately -- so a password planted
+    # via Set-Cookie is genuinely found under both source types today.
+    # issue #103 adds a third: a non-HttpOnly cookie is also readable via
+    # document.cookie in the browser, which ClientStorageExtractor scans.
+    PASSWORD_COOKIE: {
+        SourceType.COOKIE,
+        SourceType.HTTP_HEADER,
+        SourceType.CLIENT_STORAGE,
+        SourceType.CONTENT_NEGOTIATION,
+    },
+    # The image's EXIF-embedded password is also literally present in the
+    # image's raw file bytes, so BinaryFallbackExtractor's byte-string scan
+    # (deliberately not excluded from image/* content -- see
+    # app/extractors/binary_fallback.py) finds it too. Both are correct;
+    # they collapse into one report row downstream via (source_url, value)
+    # grouping, see app/api/routes.py::_build_match_rows.
+    PASSWORD_IMAGE_METADATA: {SourceType.IMAGE_METADATA, SourceType.BINARY},
+    PASSWORD_BINARY: {SourceType.BINARY},
 }
 
 INDEX_HTML = f"""
@@ -186,9 +215,11 @@ def test_full_crawl_finds_every_planted_password_and_nothing_else():
 
     summary, matches = run(scenario())
 
-    found_by_value = {match.value: match.source_type for match in matches}
+    found_source_types_by_value: dict[str, set[SourceType]] = {}
+    for match in matches:
+        found_source_types_by_value.setdefault(match.value, set()).add(match.source_type)
 
-    assert found_by_value == EXPECTED_MATCHES
+    assert found_source_types_by_value == EXPECTED_SOURCE_TYPES
     assert summary.resources_checked == len(ROUTES)
     assert summary.pages_visited == 1
     assert summary.queue_empty is True

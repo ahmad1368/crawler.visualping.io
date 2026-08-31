@@ -13,6 +13,12 @@ from dataclasses import dataclass
 
 PASSWORD_PATTERN = re.compile(r"VISUALPING\{[0-9a-f]{16}\}")
 
+# The challenge's own worked-example string. It's shaped exactly like a
+# real password (so the regex alone can't tell it apart) but is explicitly
+# not one of the real finds -- excluded here, once, so every extractor
+# gets this for free rather than each hoping the regex is stricter.
+KNOWN_EXAMPLE = "VISUALPING{0000deadbeef0000}"
+
 
 @dataclass
 class RegexMatch:
@@ -26,6 +32,8 @@ class RegexMatch:
 def find_passwords(content: str, before: int, after: int) -> list[RegexMatch]:
     matches = []
     for match in PASSWORD_PATTERN.finditer(content):
+        if match.group(0) == KNOWN_EXAMPLE:
+            continue
         start, end = match.span()
         matches.append(
             RegexMatch(
@@ -37,3 +45,11 @@ def find_passwords(content: str, before: int, after: int) -> list[RegexMatch]:
             )
         )
     return matches
+
+
+def locator_for_offset(text: str, offset: int) -> str:
+    """Return a "line:N,col:M" locator string for a character offset."""
+    line = text.count("\n", 0, offset) + 1
+    last_newline = text.rfind("\n", 0, offset)
+    column = offset - last_newline - 1 if last_newline != -1 else offset
+    return f"line:{line},col:{column}"

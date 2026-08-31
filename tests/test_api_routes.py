@@ -1,17 +1,18 @@
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.api import routes
-from app.api.routes import _CrawlState, app
-from app.models import CrawlSummary, PasswordMatch, SourceType
+from app.api.routes import CrawlRequest, _CrawlState, app
+from app.events import EventBus
+from app.models import CrawlSummary, PageFetchData, PasswordMatch, SourceType
 
 VALID_BODY = {
     "url": "https://example.com",
     "username": "alice",
     "password": "s3cret",
-    "context_chars": 40,
 }
 
 CANNED_SUMMARY = CrawlSummary(
@@ -36,14 +37,18 @@ class FakeOrchestrator:
 
 
 class FakeRepository:
-    def __init__(self, snapshots=None):
+    def __init__(self, snapshots=None, page_fetch_data=None):
         self._snapshots = snapshots or {}
+        self._page_fetch_data = page_fetch_data or []
 
     def get_matches(self):
         return []
 
     def get_snapshot(self, url):
         return self._snapshots.get(url)
+
+    def get_all_page_fetch_data(self):
+        return self._page_fetch_data
 
 
 def _patch_orchestrator(monkeypatch, summary=None, error=None):
@@ -170,6 +175,74 @@ def test_report_matches_table_dedupes_and_counts_repeated_values(monkeypatch, cl
     assert other_row["count_in_page"] == 1
 
 
+def test_same_password_found_on_two_distinct_pages_lists_once_per_page(monkeypatch, client):
+    """Regression test for issue #70: the same password value found on
+    two distinct pages must produce two separate report rows -- each
+    carrying that page's own source_type/context/locator -- not collapse
+    into one row just because the value repeats. Verified end-to-end:
+    SqliteRepository has no uniqueness constraint on `value` (only an
+    autoincrement id), Orchestrator's unique_values set only feeds
+    CrawlSummary.unique_passwords_found and never filters what gets
+    saved, and _build_match_rows() groups by (source_url, value), not
+    value alone -- only an identical (page, value) pair collapses, into
+    a higher count_in_page, which is the separate scenario the test
+    above already covers."""
+    same_value = "VISUALPING{abcdef1234567890}"
+    match_on_page_y = PasswordMatch(
+        value=same_value,
+        source_type=SourceType.HTML_TEXT,
+        source_url="https://example.com/page-y",
+        context_before="found on Y: ",
+        context_after=" here",
+        locator="line:1,col:0",
+    )
+    match_on_page_b = PasswordMatch(
+        value=same_value,
+        source_type=SourceType.HTML_COMMENT,
+        source_url="https://example.com/page-b",
+        context_before="also on B: ",
+        context_after=" there",
+        locator="line:5,col:2",
+    )
+
+    class RepositoryWithSameValueOnTwoPages:
+        def get_matches(self):
+            return [match_on_page_y, match_on_page_b]
+
+    async def fake_build_orchestrator(request, event_bus):
+        async def cleanup():
+            return None
+
+        return (
+            FakeOrchestrator(summary=CANNED_SUMMARY),
+            RepositoryWithSameValueOnTwoPages(),
+            cleanup,
+        )
+
+    monkeypatch.setattr(routes, "_build_orchestrator", fake_build_orchestrator)
+
+    response = client.post("/crawls", json=VALID_BODY)
+    crawl_id = response.json()["crawl_id"]
+
+    report = client.get(f"/crawls/{crawl_id}/report").json()
+
+    assert len(report["matches"]) == 2, "same password on two distinct pages must not collapse"
+
+    row_y = next(r for r in report["matches"] if r["page_url"] == "https://example.com/page-y")
+    row_b = next(r for r in report["matches"] if r["page_url"] == "https://example.com/page-b")
+
+    assert row_y["value"] == row_b["value"] == same_value
+    assert row_y["count_in_page"] == 1
+    assert row_b["count_in_page"] == 1
+    # Each row carries its own page's details, not the other page's.
+    assert row_y["source_type"] == "html_text"
+    assert row_y["context_before"] == "found on Y: "
+    assert row_y["locator"] == "line:1,col:0"
+    assert row_b["source_type"] == "html_comment"
+    assert row_b["context_before"] == "also on B: "
+    assert row_b["locator"] == "line:5,col:2"
+
+
 def test_failed_crawl_status_and_report(monkeypatch, client):
     _patch_orchestrator(monkeypatch, error=RuntimeError("target unreachable"))
 
@@ -226,6 +299,114 @@ def test_get_snapshot_for_unknown_crawl_returns_404(client):
     assert response.status_code == 404
 
 
+def test_re_extract_for_unknown_crawl_returns_404(client):
+    response = client.post("/crawls/does-not-exist/re-extract")
+
+    assert response.status_code == 404
+
+
+def test_re_extract_before_crawl_started_returns_409(client):
+    routes._crawls["not-started"] = _CrawlState()  # repository is still None
+
+    response = client.post("/crawls/not-started/re-extract")
+
+    assert response.status_code == 409
+
+
+def test_re_extract_reruns_extraction_against_stored_fetch_data(client):
+    password = "VISUALPING{abcdef1234567890}"
+    page_data = PageFetchData(
+        url="https://example.com/page",
+        content=f"<html>secret: {password}</html>".encode(),
+        content_type="text/html",
+    )
+    state = _CrawlState()
+    state.repository = FakeRepository(page_fetch_data=[page_data])
+    routes._crawls["c1"] = state
+
+    response = client.post("/crawls/c1/re-extract")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["matches"]) == 1
+    assert body["matches"][0]["value"] == password
+    assert body["matches"][0]["page_url"] == "https://example.com/page"
+    assert body["summary"]["unique_passwords_found"] == 1
+
+
+def test_re_extract_works_while_crawl_is_still_running(client):
+    """Read-only, so it's allowed regardless of crawl status -- proves it
+    doesn't require the crawl to be FINISHED first."""
+    password = "VISUALPING{abcdef1234567890}"
+    page_data = PageFetchData(
+        url="https://example.com/page",
+        content=f"<html>secret: {password}</html>".encode(),
+        content_type="text/html",
+    )
+    state = _CrawlState()
+    state.status = routes.CrawlStatus.RUNNING
+    state.repository = FakeRepository(page_fetch_data=[page_data])
+    routes._crawls["c1"] = state
+
+    response = client.post("/crawls/c1/re-extract")
+
+    assert response.status_code == 200
+    assert len(response.json()["matches"]) == 1
+
+
+def test_re_extract_is_idempotent_across_repeated_calls(client):
+    password = "VISUALPING{abcdef1234567890}"
+    page_data = PageFetchData(
+        url="https://example.com/page",
+        content=f"<html>secret: {password}</html>".encode(),
+        content_type="text/html",
+    )
+    state = _CrawlState()
+    state.repository = FakeRepository(page_fetch_data=[page_data])
+    routes._crawls["c1"] = state
+
+    first = client.post("/crawls/c1/re-extract").json()
+    second = client.post("/crawls/c1/re-extract").json()
+
+    assert first["matches"] == second["matches"]
+    assert len(first["matches"]) == 1
+
+
+def test_re_extract_finds_js_charcode_obfuscated_password(client):
+    """Regression test (issue #87 re-verification, issue #93 root cause):
+    `/re-extract` builds its own `ExtractorRegistry` from scratch
+    (`app/api/routes.py`, mirroring `_build_orchestrator`'s registry) --
+    a password only present as a JS char-code array, findable exclusively
+    via `JsCharCodeExtractor`, proves that extractor is actually wired
+    into the real endpoint, not just unit-tested in isolation. This is
+    the exact class of gap that let a missing import
+    (`JsCharCodeExtractor` referenced but never imported) ship
+    unnoticed: existing re-extract tests all used plain HTML text, which
+    every other extractor already covers, so none of them exercised this
+    specific extractor's presence in the registry."""
+    password = "VISUALPING{aabbccddeeff0011}"
+    codes = ", ".join(str(ord(c)) for c in password)
+    js_source = f"const secret = [{codes}].map(c => String.fromCharCode(c)).join('');"
+    assert password not in js_source  # only decodable, never present literally
+
+    page_data = PageFetchData(
+        url="https://example.com/app.js",
+        content=js_source.encode(),
+        content_type="application/javascript",
+    )
+    state = _CrawlState()
+    state.repository = FakeRepository(page_fetch_data=[page_data])
+    routes._crawls["c1"] = state
+
+    response = client.post("/crawls/c1/re-extract")
+
+    assert response.status_code == 200
+    matches = response.json()["matches"]
+    assert len(matches) == 1
+    assert matches[0]["value"] == password
+    assert matches[0]["source_type"] == "js_charcode"
+
+
 def test_response_payload_shapes_match_the_full_contract(monkeypatch, client):
     """Exhaustive key-set checks for every REST response shape -- the
     other tests in this file spot-check individual fields; this one
@@ -270,6 +451,8 @@ def test_response_payload_shapes_match_the_full_contract(monkeypatch, client):
         "queue_empty",
         "started_at",
         "finished_at",
+        "asset_completeness",
+        "content_negotiation",
     }
     assert len(report["matches"]) == 1
     assert set(report["matches"][0].keys()) == {
@@ -286,3 +469,262 @@ def test_response_payload_shapes_match_the_full_contract(monkeypatch, client):
         f"/crawls/{crawl_id}/snapshot", params={"url": "https://example.com/page"}
     )
     assert set(snapshot_response.json().keys()) == {"url", "content"}
+
+
+class SpyOrchestrator:
+    """A minimal orchestrator double that just records whether
+    pause()/resume()/stop() were called -- for testing the API layer's
+    wiring to those methods without a real crawl running."""
+
+    def __init__(self):
+        self.paused = False
+        self.resumed = False
+        self.stopped = False
+
+    def pause(self):
+        self.paused = True
+
+    def resume(self):
+        self.resumed = True
+
+    def stop(self):
+        self.stopped = True
+
+
+def _running_state(orchestrator=None) -> _CrawlState:
+    state = _CrawlState()
+    state.status = routes.CrawlStatus.RUNNING
+    state.orchestrator = orchestrator if orchestrator is not None else SpyOrchestrator()
+    return state
+
+
+def test_pause_running_crawl_calls_orchestrator_and_updates_status(client):
+    orchestrator = SpyOrchestrator()
+    routes._crawls["c1"] = _running_state(orchestrator)
+
+    response = client.post("/crawls/c1/pause")
+
+    assert response.status_code == 200
+    assert response.json() == {"crawl_id": "c1", "status": "paused"}
+    assert orchestrator.paused is True
+
+
+def test_resume_paused_crawl_calls_orchestrator_and_updates_status(client):
+    orchestrator = SpyOrchestrator()
+    state = _running_state(orchestrator)
+    state.status = routes.CrawlStatus.PAUSED
+    routes._crawls["c1"] = state
+
+    response = client.post("/crawls/c1/resume")
+
+    assert response.status_code == 200
+    assert response.json() == {"crawl_id": "c1", "status": "running"}
+    assert orchestrator.resumed is True
+
+
+def test_stop_running_crawl_calls_orchestrator_and_moves_to_stopping(client):
+    orchestrator = SpyOrchestrator()
+    routes._crawls["c1"] = _running_state(orchestrator)
+
+    response = client.post("/crawls/c1/stop")
+
+    assert response.status_code == 200
+    assert response.json() == {"crawl_id": "c1", "status": "stopping"}
+    assert orchestrator.stopped is True
+
+
+def test_stop_paused_crawl_is_allowed(client):
+    orchestrator = SpyOrchestrator()
+    state = _running_state(orchestrator)
+    state.status = routes.CrawlStatus.PAUSED
+    routes._crawls["c1"] = state
+
+    response = client.post("/crawls/c1/stop")
+
+    assert response.status_code == 200
+    assert orchestrator.stopped is True
+
+
+@pytest.mark.parametrize("action", ["pause", "resume", "stop"])
+def test_control_action_for_unknown_crawl_returns_404(client, action):
+    response = client.post(f"/crawls/does-not-exist/{action}")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize("action", ["pause", "resume", "stop"])
+def test_control_action_before_crawl_started_returns_409(client, action):
+    routes._crawls["not-started"] = _CrawlState()  # orchestrator is still None
+
+    response = client.post(f"/crawls/not-started/{action}")
+
+    assert response.status_code == 409
+
+
+def test_pause_already_paused_crawl_returns_409_and_does_not_call_orchestrator(client):
+    orchestrator = SpyOrchestrator()
+    state = _running_state(orchestrator)
+    state.status = routes.CrawlStatus.PAUSED
+    routes._crawls["c1"] = state
+
+    response = client.post("/crawls/c1/pause")
+
+    assert response.status_code == 409
+    assert orchestrator.paused is False
+
+
+def test_resume_running_crawl_returns_409_and_does_not_call_orchestrator(client):
+    orchestrator = SpyOrchestrator()
+    routes._crawls["c1"] = _running_state(orchestrator)
+
+    response = client.post("/crawls/c1/resume")
+
+    assert response.status_code == 409
+    assert orchestrator.resumed is False
+
+
+def test_stop_finished_crawl_returns_409_and_does_not_call_orchestrator(client):
+    orchestrator = SpyOrchestrator()
+    state = _running_state(orchestrator)
+    state.status = routes.CrawlStatus.FINISHED
+    routes._crawls["c1"] = state
+
+    response = client.post("/crawls/c1/stop")
+
+    assert response.status_code == 409
+    assert orchestrator.stopped is False
+
+
+def test_report_returns_409_while_paused(client):
+    state = _running_state()
+    state.status = routes.CrawlStatus.PAUSED
+    routes._crawls["c1"] = state
+
+    response = client.get("/crawls/c1/report")
+
+    assert response.status_code == 409
+
+
+def test_report_returns_409_while_stopping(client):
+    state = _running_state()
+    state.status = routes.CrawlStatus.STOPPING
+    routes._crawls["c1"] = state
+
+    response = client.get("/crawls/c1/report")
+
+    assert response.status_code == 409
+
+
+def test_report_available_once_stopped(client):
+    state = _running_state()
+    state.status = routes.CrawlStatus.STOPPED
+    state.report = CANNED_SUMMARY
+    routes._crawls["c1"] = state
+
+    response = client.get("/crawls/c1/report")
+
+    assert response.status_code == 200
+    assert response.json()["summary"]["unique_passwords_found"] == 1
+
+
+def test_run_crawl_finalizes_to_stopped_not_finished_when_stop_was_requested(monkeypatch):
+    """Regression test for the race this design deliberately avoids: a
+    stop request moves status to the transitional STOPPING (not the
+    terminal STOPPED) precisely so `_run_crawl` -- not the stop endpoint
+    -- is what finalizes to STOPPED, always after `state.report` is
+    already set. Simulates stop_crawl() having flipped the status to
+    STOPPING while orchestrator.run() was still in flight."""
+    crawl_id = "c1"
+    state = _CrawlState()
+    routes._crawls[crawl_id] = state
+
+    class StoppingOrchestrator:
+        async def run(self):
+            state.status = routes.CrawlStatus.STOPPING
+            return CANNED_SUMMARY
+
+    async def fake_build_orchestrator(request, event_bus):
+        async def cleanup():
+            return None
+
+        return StoppingOrchestrator(), FakeRepository(), cleanup
+
+    monkeypatch.setattr(routes, "_build_orchestrator", fake_build_orchestrator)
+
+    request = CrawlRequest(**VALID_BODY)
+    asyncio.run(routes._run_crawl(crawl_id, request))
+
+    assert state.status == routes.CrawlStatus.STOPPED
+    assert state.report == CANNED_SUMMARY
+
+
+def test_crawl_request_max_pages_and_max_duration_default_to_none():
+    """issue #71: no default page-count/time cap -- completion is the
+    frontier actually emptying, not a guessed number."""
+    request = CrawlRequest(url="https://example.com", username="alice", password="s3cret")
+
+    assert request.max_pages is None
+    assert request.max_duration_seconds is None
+
+
+def test_crawl_request_max_pages_and_max_duration_are_overridable():
+    request = CrawlRequest(
+        url="https://example.com",
+        username="alice",
+        password="s3cret",
+        max_pages=5,
+        max_duration_seconds=120,
+    )
+
+    assert request.max_pages == 5
+    assert request.max_duration_seconds == 120
+
+
+def test_build_orchestrator_passes_request_max_pages_and_max_duration_through(monkeypatch):
+    captured_kwargs = {}
+
+    class CapturingOrchestrator:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+    monkeypatch.setattr(routes, "Orchestrator", CapturingOrchestrator)
+
+    request = CrawlRequest(
+        url="https://example.com",
+        username="alice",
+        password="s3cret",
+        max_pages=42,
+        max_duration_seconds=99,
+    )
+
+    async def scenario():
+        _orchestrator, _repository, cleanup = await routes._build_orchestrator(request, EventBus())
+        await cleanup()
+
+    asyncio.run(scenario())
+
+    assert captured_kwargs["max_pages"] == 42
+    assert captured_kwargs["max_duration_seconds"] == 99
+
+
+def test_build_orchestrator_passes_none_max_pages_and_max_duration_through_by_default(
+    monkeypatch,
+):
+    captured_kwargs = {}
+
+    class CapturingOrchestrator:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+    monkeypatch.setattr(routes, "Orchestrator", CapturingOrchestrator)
+
+    request = CrawlRequest(url="https://example.com", username="alice", password="s3cret")
+
+    async def scenario():
+        _orchestrator, _repository, cleanup = await routes._build_orchestrator(request, EventBus())
+        await cleanup()
+
+    asyncio.run(scenario())
+
+    assert captured_kwargs["max_pages"] is None
+    assert captured_kwargs["max_duration_seconds"] is None
