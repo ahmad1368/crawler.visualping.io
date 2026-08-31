@@ -733,3 +733,66 @@ def test_pagination_guard_does_not_cut_off_a_legitimate_index_with_no_direct_mat
     assert len([u for u in http_fetcher.calls if u in item_urls]) == 20
     assert summary.unique_passwords_found == 20
     assert summary.queue_empty is True
+
+
+def test_pagination_guard_not_defeated_by_a_trailing_slash_mismatch_in_pager_links():
+    """Regression test, this session: a real target's crawl reached page
+    91+ of a genuine no-match `/report?page=N` trap that should have been
+    capped at pagination_family_limit (10). Root cause: `UrlFrontier`
+    normalizes away a trailing slash before a page is fetched/family-keyed
+    (so the fetched URL is `/report?page=N`), but that same real page's
+    own "Prev"/"Next" pager links used `/report/?page=N` -- *with* a
+    trailing slash, an inconsistency in the target site's own HTML.
+    `pagination_family_key()` used to compute its key from the raw URL,
+    so the two spellings produced different family keys -- every pager
+    link on every page of the trap was misclassified as a genuinely new
+    *external* link (#88's productivity signal) rather than the family's
+    own same-family link, resetting the unproductive streak forever.
+    Simulated here: a 15-page `/report?page=N` family (deliberately more
+    than pagination_family_limit=10), zero matches, each page's only
+    links are its own trailing-slash-inconsistent Prev/Next pager --
+    genuinely no external content to discover at all. Empirically
+    confirmed via `git stash` that this fails (all 15 pages fetched) on
+    the pre-fix code and passes with the fix."""
+    n = 15
+    index_urls = [f"https://example.com/report?page={i}" for i in range(1, n + 1)]
+
+    fetch_responses = {SEED: _html_response()}
+    fetch_responses.update({url: _html_response() for url in index_urls})
+
+    browser_responses = {
+        SEED: BrowserFetchResult(html="", dom_links=[index_urls[0]], network_urls=[])
+    }
+    for i in range(n):
+        # Same page, "wrong" trailing slash -- the exact real-target shape.
+        pager_links = []
+        if i > 0:
+            pager_links.append(f"https://example.com/report/?page={i}")
+        if i + 1 < n:
+            pager_links.append(f"https://example.com/report/?page={i + 2}")
+        browser_responses[index_urls[i]] = BrowserFetchResult(
+            html="", dom_links=pager_links, network_urls=[]
+        )
+
+    frontier = UrlFrontier(SEED)
+    http_fetcher = FakeHttpFetcher(fetch_responses)
+    browser_fetcher = FakeBrowserFetcher(browser_responses)
+    registry = ExtractorRegistry()  # no extractors registered -- zero matches, ever
+    repository = SqliteRepository(sqlite3.connect(":memory:"))
+
+    orchestrator = Orchestrator(
+        frontier=frontier,
+        http_fetcher=http_fetcher,
+        browser_fetcher=browser_fetcher,
+        extractor_registry=registry,
+        header_cookie_extractor=NoOpHeaderCookieExtractor(),
+        repository=repository,
+        concurrency=1,
+        pagination_family_limit=10,
+    )
+
+    summary = run(asyncio.wait_for(orchestrator.run(), timeout=5))
+
+    fetched_index_pages = [u for u in http_fetcher.calls if u in index_urls]
+    assert len(fetched_index_pages) == 10
+    assert summary.unique_passwords_found == 0
